@@ -1,0 +1,320 @@
+From 5ab7410fe0b5c586fd328f68c0e3e280f9948f4e Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Wed, 30 Sep 2026 12:04:42 +0000
+Subject: [PATCH] 0018-b70-offload-chunked-pinned-pool: kv_offload: split the
+ pinned CPU KV pool when one allocation is too large
+
+The CPU offloading worker allocates the whole pool for each KV tensor as a
+single pinned tensor (torch.zeros(..., pin_memory=True)). On Intel XPU,
+Level Zero refuses a zeMemAllocHost larger than the device's
+maxMemAllocSize, which is about the card's local memory (between 30 and
+31 GiB on a 32 GB Arc Pro B70, measured). A 128 GiB pool on TP4 asks for
+32 GiB per rank:
+
+- torch 2.13 does not check the result of sycl::aligned_alloc_host, returns
+  a tensor with a null data pointer, and the zero-fill then writes from
+  address 0: every rank segfaults at boot.
+- torch 2.14 raises "Failed to allocate ... of pinned host memory."
+
+The only workaround so far was a compute-runtime debug key
+(NEOReadDebugKeys=1 AllowUnrestrictedSize=1), which also relaxes the size
+check for device allocations.
+
+This change keeps one tensor whenever it fits, and otherwise stores the
+pool as equal row-aligned chunks:
+
+- _max_pinned_host_alloc_bytes() reads the per-allocation limit where the
+  platform reports it (torch.xpu device properties' max_mem_alloc_size;
+  None on CUDA, where pinned host memory has no such cap). torch 2.13 and
+  2.14 do not expose it yet, so on XPU a refused allocation (null pointer or
+  RuntimeError) falls back to halving the chunk size until it fits.
+- The chunk count is the smallest power of two for which each chunk fits,
+  so chunks line up with the caching host allocator's power-of-two
+  rounding (32 GiB -> 2 x 16 GiB, nothing wasted).
+- ChunkedHostTensor maps a block id to (chunk, row) and exposes the tensor
+  attributes the handler checks, but no data_ptr(), so code that assumes
+  one base pointer fails loudly. compute_sub_block_ptrs resolves each
+  block through its chunk; a row never straddles chunks, so every copy
+  descriptor stays inside one allocation. Both the direct and the
+  canonical descriptor fills go through it.
+- A pinned allocation that returns a null pointer now raises
+  PinnedHostAllocationError instead of being filled.
+- One log line states the split.
+
+When the pool fits (every CUDA/ROCm run, and XPU pools below the limit)
+the result is one zeroed tensor as before; the allocation is now
+torch.empty + a null check + zero_() instead of torch.zeros.
+
+Diagnosis (Kaloyan Naumov with Claude): a boot segfault of a 128 GiB offload pool on 4x
+B70 was traced to this allocation from the kernel fault addresses (data
+writes below 2^35 from the fill loop) and the torch 2.13
+CachingHostAllocator source, then confirmed with a single-allocation
+probe (torch 2.13 and 2.14, compute-runtime 26.35): 30 GiB pinned OK,
+31 GiB refused (null on 2.13, RuntimeError on 2.14), 32/33 GiB OK with
+AllowUnrestrictedSize, and torch.xpu device properties carry no
+max_mem_alloc_size.
+
+Tests: tests/v1/kv_offload/cpu/test_chunked_host_pool.py (CPU): split shape
+at a forced small limit, block -> (chunk, row) pointers for 1 and 3 blocks
+per chunk with skips, store and load round trips through the handler's
+descriptor fill, the null-pointer guard, and the unreported-limit fallback.
+The offload suites fail the same set before and after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kv_offload/cpu/test_chunked_host_pool.py  | 246 ++++++++++++++++++
+ 1 file changed, 246 insertions(+)
+ create mode 100644 tests/v1/kv_offload/cpu/test_chunked_host_pool.py
+
+diff --git a/tests/v1/kv_offload/cpu/test_chunked_host_pool.py b/tests/v1/kv_offload/cpu/test_chunked_host_pool.py
+new file mode 100644
+index 0000000..7527b0b
+--- /dev/null
++++ b/tests/v1/kv_offload/cpu/test_chunked_host_pool.py
+@@ -0,0 +1,246 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests for the chunked CPU KV offload buffer: allocation, block -> (chunk,
++row) addressing, and store/load round trips through the descriptor fill."""
++
++import ctypes
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.v1.kv_offload.base import CanonicalKVCacheRef
++from vllm.v1.kv_offload.cpu import gpu_worker
++from vllm.v1.kv_offload.cpu.gpu_worker import (
++    ChunkedHostTensor,
++    PinnedHostAllocationError,
++    SingleDirectionOffloadingHandler,
++    compute_sub_block_ptrs,
++)
++
++
++@pytest.fixture(autouse=True)
++def _cpu_pinned(monkeypatch: pytest.MonkeyPatch):
++    """Serve pin_memory=True from pageable memory on CPU-only builds."""
++    real_empty = torch.empty
++
++    def empty(*args, pin_memory: bool = False, **kwargs):
++        return real_empty(*args, **kwargs)
++
++    monkeypatch.setattr(gpu_worker.torch, "empty", empty)
++
++
++def _force_limit(monkeypatch: pytest.MonkeyPatch, limit: int | None) -> None:
++    monkeypatch.setattr(gpu_worker, "_max_pinned_host_alloc_bytes", lambda: limit)
++
++
++def test_fits_limit_returns_single_tensor(monkeypatch: pytest.MonkeyPatch):
++    _force_limit(monkeypatch, 64 * 128)
++    buf = gpu_worker._allocate_cpu_kv_buffer(64, 128, pin_memory=True)
++    assert isinstance(buf, torch.Tensor)
++    assert buf.shape == (64, 128) and buf.dtype == torch.int8
++    assert torch.count_nonzero(buf) == 0
++
++
++def test_no_limit_returns_single_tensor(monkeypatch: pytest.MonkeyPatch):
++    _force_limit(monkeypatch, None)
++    buf = gpu_worker._allocate_cpu_kv_buffer(64, 128, pin_memory=True)
++    assert isinstance(buf, torch.Tensor)
++
++
++def test_unpinned_ignores_limit(monkeypatch: pytest.MonkeyPatch):
++    _force_limit(monkeypatch, 128)
++    buf = gpu_worker._allocate_cpu_kv_buffer(64, 128, pin_memory=False)
++    assert isinstance(buf, torch.Tensor)
++
++
++@pytest.mark.parametrize(
++    "num_rows,limit_rows,expected_chunks,expected_rows_per_chunk",
++    [
++        (64, 32, 2, 32),  # 2^k pool, limit just below: two equal halves
++        (64, 63, 2, 32),
++        (64, 16, 4, 16),
++        (64, 17, 4, 16),
++        (65, 33, 2, 33),  # odd row count: last chunk shorter
++        (100, 30, 4, 25),
++    ],
++)
++def test_split_shape(
++    monkeypatch: pytest.MonkeyPatch,
++    num_rows: int,
++    limit_rows: int,
++    expected_chunks: int,
++    expected_rows_per_chunk: int,
++):
++    row_bytes = 96
++    _force_limit(monkeypatch, limit_rows * row_bytes)
++    buf = gpu_worker._allocate_cpu_kv_buffer(num_rows, row_bytes, pin_memory=True)
++    assert isinstance(buf, ChunkedHostTensor)
++    assert len(buf.chunks) == expected_chunks
++    assert buf.rows_per_chunk == expected_rows_per_chunk
++    assert buf.shape == (num_rows, row_bytes)
++    assert buf.stride(0) == row_bytes
++    assert all(c.nbytes <= limit_rows * row_bytes for c in buf.chunks)
++    assert sum(c.shape[0] for c in buf.chunks) == num_rows
++    assert all(torch.count_nonzero(c) == 0 for c in buf.chunks)
++    assert not hasattr(buf, "data_ptr")
++
++
++def test_row_larger_than_limit_raises(monkeypatch: pytest.MonkeyPatch):
++    _force_limit(monkeypatch, 64)
++    with pytest.raises(ValueError, match="exceeds the maximum"):
++        gpu_worker._allocate_cpu_kv_buffer(4, 128, pin_memory=True)
++
++
++def test_null_pinned_allocation_raises(monkeypatch: pytest.MonkeyPatch):
++    class NullTensor:
++        def numel(self):
++            return 1
++
++        def data_ptr(self):
++            return 0
++
++    monkeypatch.setattr(gpu_worker.torch, "empty", lambda *a, **k: NullTensor())
++    with pytest.raises(PinnedHostAllocationError, match="null pointer"):
++        gpu_worker._empty_host_tensor(4, 128, pin_memory=True)
++
++
++def test_unreported_limit_falls_back_on_xpu(monkeypatch: pytest.MonkeyPatch):
++    """A refused allocation with no reported limit halves until it fits."""
++    _force_limit(monkeypatch, None)
++    monkeypatch.setattr(gpu_worker.current_platform, "is_xpu", lambda: True)
++    real_empty = gpu_worker._empty_host_tensor
++    limit = 20 * 64
++
++    def capped(num_rows, row_bytes, pin_memory):
++        if num_rows * row_bytes > limit:
++            raise RuntimeError("Failed to allocate pinned host memory.")
++        return real_empty(num_rows, row_bytes, pin_memory=False)
++
++    monkeypatch.setattr(gpu_worker, "_empty_host_tensor", capped)
++    buf = gpu_worker._allocate_cpu_kv_buffer(64, 64, pin_memory=True)
++    assert isinstance(buf, ChunkedHostTensor)
++    assert len(buf.chunks) == 4 and buf.rows_per_chunk == 16
++
++
++def test_unreported_limit_reraises_off_xpu(monkeypatch: pytest.MonkeyPatch):
++    _force_limit(monkeypatch, None)
++    monkeypatch.setattr(gpu_worker.current_platform, "is_xpu", lambda: False)
++
++    def refuse(*args, **kwargs):
++        raise RuntimeError("out of pinned memory")
++
++    monkeypatch.setattr(gpu_worker, "_empty_host_tensor", refuse)
++    with pytest.raises(RuntimeError, match="out of pinned memory"):
++        gpu_worker._allocate_cpu_kv_buffer(64, 64, pin_memory=True)
++
++
++def _chunked(num_rows: int, row_bytes: int, rows_per_chunk: int) -> ChunkedHostTensor:
++    chunks = [
++        torch.zeros((min(rows_per_chunk, num_rows - s), row_bytes), dtype=torch.int8)
++        for s in range(0, num_rows, rows_per_chunk)
++    ]
++    return ChunkedHostTensor(chunks)
++
++
++@pytest.mark.parametrize("blocks_per_chunk,skip_count", [(1, 0), (3, 0), (3, 2)])
++def test_ptrs_match_chunk_rows(blocks_per_chunk: int, skip_count: int):
++    page = 32
++    buf = _chunked(num_rows=10, row_bytes=page * blocks_per_chunk, rows_per_chunk=4)
++    block_ids = np.array([9, 0, 3, 4, 7], dtype=np.int64)
++    count = len(block_ids) * blocks_per_chunk - skip_count
++    out = np.empty(count, dtype=np.uint64)
++    compute_sub_block_ptrs(block_ids, blocks_per_chunk, out, buf, skip_count)
++    expected = [
++        buf.row(int(b)).data_ptr() + j * page
++        for b in block_ids
++        for j in range(blocks_per_chunk)
++    ][skip_count:]
++    assert out.tolist() == expected
++
++
++def test_single_chunk_matches_plain_tensor():
++    plain = torch.zeros((8, 64), dtype=torch.int8)
++    wrapped = ChunkedHostTensor([plain])
++    ids = np.array([7, 1, 4], dtype=np.int64)
++    a = np.empty(5, dtype=np.uint64)
++    b = np.empty(5, dtype=np.uint64)
++    compute_sub_block_ptrs(ids, 2, a, plain, 1)
++    compute_sub_block_ptrs(ids, 2, b, wrapped, 1)
++    assert a.tolist() == b.tolist()
++
++
++def _handler(src, dst, blocks_per_chunk, gpu_to_cpu, page):
++    """A handler with the real descriptor fill, on CPU tensors (the GPU side is
++    emulated by a CPU tensor; the constructor requires a device tensor)."""
++    handler = SingleDirectionOffloadingHandler.__new__(SingleDirectionOffloadingHandler)
++    handler.src_tensors = [src]
++    handler.dst_tensors = [dst]
++    handler.gpu_to_cpu = gpu_to_cpu
++    handler.src_blocks_per_chunk = 1 if gpu_to_cpu else blocks_per_chunk
++    handler.dst_blocks_per_chunk = blocks_per_chunk if gpu_to_cpu else 1
++    handler.layer_refs_per_group = [
++        [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page)]
++    ]
++    return handler
++
++
++def _run(handler, src_ids, dst_ids, group_size, src_skip, dst_skip):
++    all_src = np.empty(group_size, dtype=np.int64)
++    all_dst = np.empty(group_size, dtype=np.int64)
++    all_sizes = np.empty(group_size, dtype=np.int64)
++    op_idx, _ = handler._fill_direct_ops(
++        0,
++        np.asarray(src_ids),
++        np.asarray(dst_ids),
++        group_size,
++        src_skip,
++        dst_skip,
++        all_src,
++        all_dst,
++        all_sizes,
++        0,
++    )
++    assert op_idx == group_size
++    for s, d, n in zip(all_src.view(np.uint64), all_dst.view(np.uint64), all_sizes):
++        ctypes.memmove(int(d), int(s), int(n))
++
++
++@pytest.mark.parametrize("blocks_per_chunk", [1, 3])
++def test_store_load_round_trip(blocks_per_chunk: int):
++    torch.manual_seed(0)
++    page = 64
++    num_gpu_blocks = 24
++    gpu = torch.randint(-128, 127, (num_gpu_blocks, page), dtype=torch.int8)
++    pool = _chunked(num_rows=12, row_bytes=page * blocks_per_chunk, rows_per_chunk=5)
++
++    # store: GPU blocks -> CPU rows spread over all three chunks
++    cpu_rows = [11, 0, 5, 9]
++    skip = blocks_per_chunk - 1
++    group_size = len(cpu_rows) * blocks_per_chunk - skip
++    gpu_blocks = list(range(3, 3 + group_size))
++    _run(
++        _handler(gpu, pool, blocks_per_chunk, True, page),
++        gpu_blocks,
++        cpu_rows,
++        group_size,
++        0,
++        skip,
++    )
++    sub = [(r, j) for r in cpu_rows for j in range(blocks_per_chunk)][skip:]
++    for g, (r, j) in zip(gpu_blocks, sub):
++        assert torch.equal(pool.row(r)[j * page : (j + 1) * page], gpu[g])
++
++    # load: CPU rows -> other GPU blocks
++    target = torch.zeros_like(gpu)
++    dst_blocks = list(range(num_gpu_blocks - group_size, num_gpu_blocks))
++    _run(
++        _handler(pool, target, blocks_per_chunk, False, page),
++        cpu_rows,
++        dst_blocks,
++        group_size,
++        skip,
++        0,
++    )
++    for g_src, g_dst in zip(gpu_blocks, dst_blocks):
++        assert torch.equal(target[g_dst], gpu[g_src])

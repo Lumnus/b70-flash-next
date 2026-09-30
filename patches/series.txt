@@ -32,3 +32,5 @@
 0014d-b70-offload-empty-advance-guard                0014d-b70-offload-empty-advance-guard.patch              0014-b70-offload-tests.patch
 0014e-b70-offload-group-evict                        0014e-b70-offload-group-evict-51787.patch                0014-b70-offload-tests.patch
 0014f-b70-offload-gates                              0014f-b70-offload-gates.patch                            0014-b70-offload-tests.patch
+0018-b70-offload-chunked-pinned-pool                 0018-b70-offload-chunked-pinned-pool.patch               0018-b70-offload-chunked-pinned-pool-tests.patch
+0019-b70-qwen4exp-dense-qsa-skip-indexer             0019-b70-qwen4exp-dense-qsa-skip-indexer.patch           -

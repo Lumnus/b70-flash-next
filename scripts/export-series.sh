@@ -50,11 +50,11 @@ for c in $(git -C "$gd" rev-list --reverse "$BASE..$ref"); do
   ht=$(git -C "$gd" diff --name-only "$c^" "$c" -- tests/ | head -1)
   if [ -n "$hv" ]; then
     [ "$vf" != "-" ] || { echo "commit $c touches vllm/ but series.txt names no vllm file" >&2; exit 1; }
-    git -C "$gd" format-patch -1 --stdout --no-signature "$c" -- vllm/ > "$out/vllm/$vf"
+    git -C "$gd" -c core.abbrev=7 format-patch -1 --stdout --no-signature "$c" -- vllm/ > "$out/vllm/$vf"
   fi
   if [ -n "$ht" ]; then
     [ "$tf" != "-" ] || { echo "commit $c touches tests/ but series.txt names no tests file" >&2; exit 1; }
-    git -C "$gd" format-patch -1 --stdout --no-signature "$c" -- tests/ >> "$out/vllm-tests/$tf"
+    git -C "$gd" -c core.abbrev=7 format-patch -1 --stdout --no-signature "$c" -- tests/ >> "$out/vllm-tests/$tf"
   fi
   other=$(git -C "$gd" diff --name-only "$c^" "$c" -- . ':!vllm/' ':!tests/')
   [ -z "$other" ] || { echo "commit $c touches files outside vllm/ and tests/: $other" >&2; exit 1; }

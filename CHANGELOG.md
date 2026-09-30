@@ -17,5 +17,8 @@ First public release of the series. Image not yet built.
 - 0012: `reasoning.effort` alias, env-gated.
 - 0013, 0013b: INT8 PLE table served from NVMe, native reader, optional prefill lookahead.
 - 0014a–f: KV-offload trace, hybrid junction heal, GDN backstep, #56795 guard, vllm#51787 backport (gated).
+- 0018: the pinned CPU KV-offload pool is split into power-of-two chunks when one pinned allocation is too large
+  (Level Zero refuses a single host allocation of ~31 GiB or more; torch 2.13 then segfaulted at boot).
+- 0019: dense-QSA configs skip `self_attn.indexer` tensors that some checkpoints (e.g. an AWQ export) still ship.
 - All switches use the `B70_` prefix. The INT8 table format tag stays `lumnus-ple-int8-rowscale/v1`.
 - `patches/vllm-xpu-kernels/0001`: the 64-bit conv-state offset fix as source (untested, not used by the build).

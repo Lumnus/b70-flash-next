@@ -1,0 +1,33 @@
+From 01abfaaa549a9ef2d6b3b3c287ad766536b013d7 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Wed, 30 Sep 2026 13:05:29 +0000
+Subject: [PATCH] 0019-b70-qwen4exp-dense-qsa-skip-indexer: drop
+ *.self_attn.indexer.* weights on dense-QSA configs
+
+Dense-QSA configs (no indexer_n_heads) build no indexer module, but some
+checkpoints (e.g. the wtdcode AWQ export of Qwen3.8-Flash-Next) still ship
+the self_attn.indexer tensors inside mixed shards, so AutoWeightsLoader
+raised "There is no module or parameter named ...". Skip them the same
+way the PLE hashstats_/token_lookup columns are skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 54ee6f0..b5e3c93 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -607,6 +607,11 @@ class Qwen4ExpModel(nn.Module):
+             "token_lookup",
+             "hyper_connection_mixer.block_inject_weight",
+         )
++        # Dense-QSA configs (no indexer_n_heads) build no indexer module.
++        # Some checkpoints (e.g. AWQ exports) still ship the
++        # `*.self_attn.indexer.*` tensors; drop them instead of failing.
++        if getattr(self.config, "indexer_n_heads", None) is None:
++            skip_substrs += (".self_attn.indexer.",)
+         mapper = self.hf_to_vllm_mapper | WeightsMapper(
+             orig_to_new_substr={substr: None for substr in skip_substrs}
+         )
