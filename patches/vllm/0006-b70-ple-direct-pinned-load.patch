@@ -1,0 +1,150 @@
+From 57679613d7350777bf002838b01406008f0143aa Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Mon, 28 Sep 2026 17:16:53 +0000
+Subject: [PATCH] 0006-b70-ple-direct-pinned-load
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+L1 PLE direct-to-pinned load (Lumnus-own, NOT from wu1ff) — cuts the boot host-RAM peak by ~95 GiB
+
+Purpose:  With 0002, each TP rank loads its PLE shard in two copies at once: the weight_loader loop fills a
+          23.8 GiB PAGEABLE shard from the mmap'd ple_table_qwen4exp.pt, then _materialize_pinned_xpu_slabs
+          copies it into 2 PINNED slabs (another 23.8 GiB) before freeing the pageable one. 4 ranks in parallel
+          = ~191 GiB non-evictable at the peak (measured ~200 GB on a 4x B70 host, 2026-09-28). With
+          B70_PLE_DIRECT_PINNED=1 the slabs are filled straight from the mmap (TP-owned rows only; vocab-padding
+          rows zeroed); the pageable shard is never written, so it never becomes resident. Peak per rank =
+          the 23.8 GiB of pinned slabs that stay anyway. Logs VmRSS/MemAvailable before and after on that path.
+          Default OFF: with the env var unset the code path is wu1ff's, unchanged.
+Depends:  0002 (patches the functions 0002 adds: _materialize_pinned_xpu_slabs, _load_ple_table_from_path).
+Base:     vLLM v0.30.0 (tag commit ced6857afa0ea7b2e3f0846a62e1394e90f15607) AFTER 0001-0005, i.e. wu1ff's file
+          sha256 b714a0dc88c3ea8bef3d113f3dbd66a9087353af60fe3cf5836bb643a1a8fa24.
+          Result: sha256 d28c99b19e077d549e581015569cf604aadcac32f0cef30a2c9c3e2b7ae0f116 (verify-overlay.sh
+          accepts it as "B70-0006").
+Origin:   Lumnus (analysis of the boot host-RAM peak, 2026-09-27).
+Method:   hand-written unified diff; `patch --dry-run --fuzz=0` checked against wu1ff's extracted file.
+Apply:    patch -p1 --fuzz=0 from the directory that CONTAINS vllm/ (site-packages AND /workspace/vllm).
+          The Dockerfile applies *-b70-*.patch in a separate step AFTER the wu1ff byte-identity gate.
+Files:
+  vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../qwen4_exp/nvidia/ngram_embedding.py       | 83 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 0375bfd..8ca65a2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -61,6 +61,33 @@ def _is_xpu() -> bool:
+     return current_platform.is_xpu()
+ 
+ 
++def _ple_direct_pinned_enabled() -> bool:
++    """B70 0006 gate: fill the XPU pinned PLE slabs straight from the mmap.
++
++    Default OFF (unset or anything but "1"): the wu1ff load path runs
++    unchanged. See _materialize_pinned_xpu_slabs(source=...).
++    """
++    return os.environ.get("B70_PLE_DIRECT_PINNED", "0") == "1"
++
++
++def _host_memory_note() -> str:
++    """VmRSS of this rank and node MemAvailable, for the load log line."""
++    fields = {}
++    for path, keys in (
++        ("/proc/self/status", ("VmRSS",)),
++        ("/proc/meminfo", ("MemAvailable",)),
++    ):
++        try:
++            with open(path) as handle:
++                for line in handle:
++                    name, _, value = line.partition(":")
++                    if name in keys:
++                        fields[name] = int(value.split()[0]) / 2**20
++        except OSError:
++            pass
++    return ", ".join(f"{k}={v:.1f} GiB" for k, v in fields.items()) or "n/a"
++
++
+ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
+     """ETP-sharded PLE table shared by device and pinned-host backends."""
+ 
+@@ -507,8 +534,19 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             pin_memory=True,
+         )
+ 
+-    def _materialize_pinned_xpu_slabs(self) -> None:
+-        """Copy the loaded shard into pinned slabs with UVA views (XPU)."""
++    def _materialize_pinned_xpu_slabs(
++        self, source: torch.Tensor | None = None
++    ) -> None:
++        """Copy the loaded shard into pinned slabs with UVA views (XPU).
++
++        With ``source`` (the full mmap'd PLE table, B70 0006, gated by
++        B70_PLE_DIRECT_PINNED=1) each slab is filled straight from the
++        table's TP-owned rows, so the pageable ``self.weight`` shard is never
++        written and never becomes resident: the per-rank host peak drops from
++        pageable shard + pinned slabs to pinned slabs alone. Rows past the
++        TP-owned range (vocab padding) are zeroed, which is what the stock
++        path reads from the never-written pageable pages.
++        """
+         if self._xpu_slabs is not None:
+             return
+         shard = self.weight
+@@ -535,7 +573,17 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+                     f"PLE pinned slab {index} ({rows * dim * itemsize / 2**30:.1f}"
+                     " GiB) silently failed to pin on XPU"
+                 )
+-            slab.copy_(shard.narrow(0, start, rows))
++            if source is None:
++                slab.copy_(shard.narrow(0, start, rows))
++            else:
++                owned = self.shard_indices.org_vocab_end_index - tp_start
++                valid = max(0, min(rows, owned - start))
++                if valid:
++                    slab.narrow(0, 0, valid).copy_(
++                        source.narrow(0, tp_start + start, valid)
++                    )
++                if valid < rows:
++                    slab.narrow(0, valid, rows - valid).zero_()
+             slabs.append(slab)
+             views.append(get_accelerator_view_from_cpu_tensor(slab))
+         self._xpu_slabs = slabs
+@@ -732,6 +780,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                 f"PLE table at {table_path} has shape {tuple(table.shape)}, "
+                 f"expected >= [{org_vocab_size}, {embedding.embedding_dim}]"
+             )
++        if (
++            _is_xpu()
++            and _ple_direct_pinned_enabled()
++            and isinstance(
++                embedding.embedding_method, Qwen4ExpPLEUnquantizedEmbeddingMethod
++            )
++        ):
++            # B70 0006: the weight_loader loop below would first fill the
++            # 23.8 GiB/rank pageable shard and only then copy it into the
++            # pinned slabs (47.7 GiB/rank transient, ~191 GiB over 4 ranks
++            # at once). Copy the TP-owned rows from the mmap into the slabs
++            # directly instead. Same rows, same dtype cast (copy_), same slab
++            # layout; the pageable shard is released untouched.
++            logger.info(
++                "PLE direct-pinned load (B70_PLE_DIRECT_PINNED=1) starting: %s",
++                _host_memory_note(),
++            )
++            embedding._materialize_pinned_xpu_slabs(source=table)
++            logger.info(
++                "Loaded PLE table from %s: direct-pinned, tp rows [%d, %d) of "
++                "%d, dtype=%s, storage=pinned-host slabs; %s",
++                table_path,
++                embedding.shard_indices.org_vocab_start_index,
++                embedding.shard_indices.org_vocab_end_index,
++                org_vocab_size,
++                table.dtype,
++                _host_memory_note(),
++            )
++            return True
+         shard_size = (
+             org_vocab_size + self.split_ngram_parts - 1
+         ) // self.split_ngram_parts

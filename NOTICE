@@ -1,0 +1,54 @@
+b70-flash-next
+Copyright 2026 Lumnus
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE), except for the files listed
+under "Third-party material" below, which keep their own licenses.
+
+Third-party material
+====================
+
+1. wu1ff / B70-LLM-Controller (MIT) — https://github.com/wu1ff/B70-LLM-Controller
+   - image/files/opt/b70-flashnext/serve-config.json and image/files/opt/b70-flashnext/prepare-serve.sh are
+     wu1ff's files, unchanged (byte-identical, checked by image/verify-overlay.sh).
+   - patches/vllm/0001–0005 are wu1ff's Python changes to vLLM v0.30.0, re-derived as unified diffs from the
+     whole-file overlays in wu1ff's pack image (ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52…). Applying
+     them reproduces wu1ff's files byte-for-byte.
+   - The image build copies two binaries from that public image by digest (libgdn_index64.so and the Level Zero
+     peer-residency shim). They are not stored in this repository and are covered by wu1ff's license.
+   - patches/vllm-xpu-kernels/0001 is a source form of the fix wu1ff ships only as the prebuilt
+     libgdn_index64.so, reconstructed from wu1ff's published description.
+
+   wu1ff's license text:
+
+     MIT License
+     
+     Copyright (c) 2026 wu1ff
+     
+     Permission is hereby granted, free of charge, to any person obtaining a copy
+     of this software and associated documentation files (the "Software"), to deal
+     in the Software without restriction, including without limitation the rights
+     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+     copies of the Software, and to permit persons to whom the Software is
+     furnished to do so, subject to the following conditions:
+     
+     The above copyright notice and this permission notice shall be included in all
+     copies or substantial portions of the Software.
+     
+     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+     SOFTWARE.
+
+2. vLLM (Apache-2.0) — https://github.com/vllm-project/vllm
+   The patches in patches/vllm/ and patches/vllm-tests/ modify vLLM v0.30.0 and are distributed under vLLM's
+   license. Patch 0014e is a backport of vLLM commit f12fe10c5c (vllm-project/vllm#51787, by its authors).
+
+3. vllm-xpu-kernels (Apache-2.0) — https://github.com/vllm-project/vllm-xpu-kernels
+   patches/vllm-xpu-kernels/ modifies it and is distributed under its license.
+
+4. Model weights and data are not included. The configuration targets the checkpoint
+   devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, under its own license terms.
+   image/files/opt/b70-flashnext/serve-config.json is derived from that checkpoint's config.json.

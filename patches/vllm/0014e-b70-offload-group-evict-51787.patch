@@ -1,0 +1,883 @@
+From 11a65f29a180a38d18c2d68feca52d79675a44ec Mon Sep 17 00:00:00 2001
+From: MINJUN GIL <alswnsrlf12@naver.com>
+Date: Tue, 29 Sep 2026 21:40:54 +0000
+Subject: [PATCH] 0014e-b70-offload-group-evict: backport vllm#51787
+ request-scoped recency / tail-before-head eviction (UNGATED)
+
+Backport of upstream f12fe10c5c ([KV Offload] per-request recency, merged to
+vllm main 2026-09-16; not in our v0.30.0 base ced6857afa). Applied from the PR
+diff; it applied cleanly on the base and auto-merged over 0014a-d.
+
+The scheduler no longer touches keys on every lookup/store; the CPU manager
+records the keys a request loaded or offered, with their token positions, and
+applies one logical head-to-tail access in on_request_finished. The LRU policy
+keeps logical recency separate from transfer pinning, so eviction runs tail
+before head across all KV groups of a request, including the hybrid Mamba/GDN
+groups (a lone GDN checkpoint is no longer evicted independently of the
+full-attention chunks at the same position).
+
+NOT env-gated: it replaces the LRU policy's data structure and removes the
+scheduler's per-step touch; a gate would need both implementations side by
+side. An engine carrying 0014 therefore differs from the serving engine in
+eviction policy regardless of the B70_OFFLOAD_* flags.
+
+(cherry picked from commit f12fe10c5c, vllm-project/vllm#51787)
+---
+ .../kv_connector/v1/offloading/scheduler.py   |  70 ++++-----
+ vllm/v1/kv_offload/base.py                    |  12 ++
+ vllm/v1/kv_offload/cpu/manager.py             | 146 +++++++++++++++++-
+ vllm/v1/kv_offload/cpu/policies/arc.py        |  81 +++++++---
+ vllm/v1/kv_offload/cpu/policies/base.py       |  52 ++++++-
+ vllm/v1/kv_offload/cpu/policies/lru.py        | 142 +++++++++++++----
+ vllm/v1/kv_offload/tiering/manager.py         |  18 ++-
+ 7 files changed, 416 insertions(+), 105 deletions(-)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index b339312..6e95f05 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -407,8 +407,11 @@ class RequestOffloadState:
+                 None,
+                 group_config.hashes_per_chunk,
+             ):
+-                group_state.offload_keys.append(
+-                    make_offload_key(req_block_hash, group_config.group_idx)
++                key = make_offload_key(req_block_hash, group_config.group_idx)
++                group_state.offload_keys.append(key)
++                self.req_context.set_offload_key_position(
++                    key,
++                    len(group_state.offload_keys) * group_config.tokens_per_chunk,
+                 )
+ 
+     def update_block_id_groups(
+@@ -929,37 +932,6 @@ class OffloadingConnectorScheduler:
+                 )
+         return None if defer_lookup or pending_in_window else consecutive_hits
+ 
+-    def _touch(self, req_status: RequestOffloadState):
+-        for group_config, group_state in zip(
+-            self.config.kv_group_configs, req_status.group_states
+-        ):
+-            if group_config.sliding_window_size_in_chunks is None:
+-                self.manager.touch(group_state.offload_keys, req_status.req_context)
+-            else:
+-                # Keep only chunks needed to hit the original request, plus
+-                # decoded chunks.
+-                chunks_to_skip = max(
+-                    0,
+-                    group_state.num_hit_chunks
+-                    - group_config.sliding_window_size_in_chunks,
+-                )
+-                self.manager.touch(
+-                    group_state.offload_keys[chunks_to_skip:],
+-                    req_status.req_context,
+-                )
+-        if req_status.partial_tail_boundary is not None:
+-            self.manager.touch(
+-                tuple(
+-                    self._make_boundary_key(
+-                        req_status.req,
+-                        group.group_idx,
+-                        req_status.partial_tail_boundary,
+-                    )
+-                    for group in self.config.kv_group_configs
+-                ),
+-                req_status.req_context,
+-            )
+-
+     def _lookup_complete_chunks(
+         self,
+         req_status: RequestOffloadState,
+@@ -1189,10 +1161,16 @@ class OffloadingConnectorScheduler:
+         return num_hit_tokens
+ 
+     def _make_boundary_key(
+-        self, request: Request, group_idx: int, boundary_tokens: int
++        self,
++        request: Request,
++        group_idx: int,
++        boundary_tokens: int,
++        req_context: ReqContext,
+     ) -> OffloadKey:
+         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
+-        return make_offload_key(request.block_hashes[hash_idx], group_idx)
++        key = make_offload_key(request.block_hashes[hash_idx], group_idx)
++        req_context.set_offload_key_position(key, boundary_tokens)
++        return key
+ 
+     def _lookup(
+         self,
+@@ -1222,7 +1200,10 @@ class OffloadingConnectorScheduler:
+             boundary_keys = []
+             for group_config in self.config.kv_group_configs:
+                 key = self._make_boundary_key(
+-                    req_status.req, group_config.group_idx, boundary
++                    req_status.req,
++                    group_config.group_idx,
++                    boundary,
++                    req_status.req_context,
+                 )
+                 boundary_keys.append(key)
+                 result = self.manager.lookup(key, req_status.req_context)
+@@ -1315,8 +1296,6 @@ class OffloadingConnectorScheduler:
+                 self._maybe_observe_lookup_async_delay(req_status)
+         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+ 
+-        self._touch(req_status)
+-
+         return num_hit_tokens, bool(num_hit_tokens)
+ 
+     def update_state_after_alloc(
+@@ -1390,7 +1369,10 @@ class OffloadingConnectorScheduler:
+                 if partial_tail_boundary is not None:
+                     keys_to_load.append(
+                         self._make_boundary_key(
+-                            request, group_config.group_idx, partial_tail_boundary
++                            request,
++                            group_config.group_idx,
++                            partial_tail_boundary,
++                            req_status.req_context,
+                         )
+                     )
+ 
+@@ -1529,7 +1511,9 @@ class OffloadingConnectorScheduler:
+                 ):
+                     continue
+ 
+-                key = self._make_boundary_key(req, group_idx, boundary)
++                key = self._make_boundary_key(
++                    req, group_idx, boundary, req_status.req_context
++                )
+                 store_output = self.manager.prepare_store([key], req_status.req_context)
+                 if store_output is None:
+                     self._connector_stats.increase_counter(
+@@ -1643,7 +1627,9 @@ class OffloadingConnectorScheduler:
+             ):
+                 continue
+             keys = [
+-                self._make_boundary_key(req, group.group_idx, boundary)
++                self._make_boundary_key(
++                    req, group.group_idx, boundary, req_status.req_context
++                )
+                 for group in self.config.kv_group_configs
+             ]
+             block_ids = [
+@@ -1933,8 +1919,6 @@ class OffloadingConnectorScheduler:
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+                 continue
+ 
+-            self._touch(req_status)
+-
+             keys_to_store = set(store_output.keys_to_store)
+ 
+             group_sizes: list[int] = []
+diff --git a/vllm/v1/kv_offload/base.py b/vllm/v1/kv_offload/base.py
+index 93f8e4b..988747e 100644
+--- a/vllm/v1/kv_offload/base.py
++++ b/vllm/v1/kv_offload/base.py
+@@ -96,6 +96,12 @@ class ReqContext:
+     # kv_transfer_params once (in on_new_request) and read the result back
+     # on later calls for the same request.
+     _state: dict[type, Any] = field(default_factory=dict, repr=False, init=False)
++    # End-token position for each key in this request. The scheduler records
++    # these positions so managers can recover prefix order even when store
++    # calls arrive out of order (for example, SWA backfills).
++    _offload_key_positions: dict[OffloadKey, int] = field(
++        default_factory=dict, repr=False, init=False
++    )
+ 
+     def set_state(self, val: Any) -> None:
+         self._state[type(val)] = val
+@@ -103,6 +109,12 @@ class ReqContext:
+     def get_state(self, cls: type[_T]) -> _T | None:
+         return self._state.get(cls)
+ 
++    def set_offload_key_position(self, key: OffloadKey, end_token: int) -> None:
++        self._offload_key_positions[key] = end_token
++
++    def get_offload_key_position(self, key: OffloadKey) -> int | None:
++        return self._offload_key_positions.get(key)
++
+ 
+ class LookupResult(Enum):
+     """Result of OffloadingManager.lookup()."""
+diff --git a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+index 67b469b..9d85090 100644
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections import OrderedDict
+ from collections.abc import Collection, Iterable
++from dataclasses import dataclass, field
+ 
+ from typing_extensions import override
+ 
+@@ -18,6 +19,7 @@ from vllm.v1.kv_offload.base import (
+     PrepareStoreOutput,
+     ReqContext,
+     RequestOffloadingContext,
++    get_offload_group_idx,
+ )
+ from vllm.v1.kv_offload.cpu.common import (
+     CPULoadStoreSpec,
+@@ -27,6 +29,20 @@ from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
+ from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+ 
+ 
++@dataclass(slots=True)
++class _RequestCacheAccess:
++    """Cache keys observed by one request, grouped in prefix order."""
++
++    owner: object
++    cache_generation: int
++    key_groups: dict[int, list[OffloadKey]] = field(default_factory=dict)
++    seen_keys: set[OffloadKey] = field(default_factory=set)
++    inserted_keys: set[OffloadKey] = field(default_factory=set)
++    reused_keys: set[OffloadKey] = field(default_factory=set)
++    store_miss_keys: set[OffloadKey] = field(default_factory=set)
++    finished: bool = False
++
++
+ class CPUOffloadingManager(OffloadingManager):
+     """
+     An OffloadingManager with a pluggable CachePolicy, resolved by name via
+@@ -66,6 +82,7 @@ class CPUOffloadingManager(OffloadingManager):
+         self.max_tracker_size: int = max_tracker_size
+         self.stores_skipped_in_current_batch: int = 0
+         self.allocation_sizes_in_current_batch: list[int] = []
++        self._cache_generation = 0
+ 
+         # Number of chunk references. It is ordered so can evict the LRU entry in O(1).
+         self.counts: OrderedDict[OffloadKey, int] | None = (
+@@ -124,10 +141,48 @@ class CPUOffloadingManager(OffloadingManager):
+                 num_unprotected -= 1
+             self.counts[key] = 1
+ 
++    def _get_request_cache_access(self, req_context: ReqContext) -> _RequestCacheAccess:
++        state = req_context.get_state(_RequestCacheAccess)
++        if (
++            state is None
++            or state.owner is not self
++            or state.cache_generation != self._cache_generation
++        ):
++            state = _RequestCacheAccess(
++                owner=self, cache_generation=self._cache_generation
++            )
++            req_context.set_state(state)
++        return state
++
++    def _record_request_cache_access(
++        self,
++        keys: Iterable[OffloadKey],
++        req_context: ReqContext,
++        inserted_keys: Iterable[OffloadKey] = (),
++        reused_keys: Iterable[OffloadKey] = (),
++    ) -> None:
++        state = self._get_request_cache_access(req_context)
++        for key in keys:
++            if key in state.seen_keys:
++                continue
++            assert not state.finished, (
++                "New cache keys observed after request finalization"
++            )
++            group_idx = get_offload_group_idx(key)
++            state.key_groups.setdefault(group_idx, []).append(key)
++            state.seen_keys.add(key)
++        state.inserted_keys.update(inserted_keys)
++        # Re-reading a chunk inserted by this request is an internal transfer
++        # (for example, a tiering cascade), not a second cache access.
++        state.reused_keys.update(
++            key for key in reused_keys if key not in state.inserted_keys
++        )
++
+     # --- OffloadingManager interface ---
+ 
+     @override
+     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
++        self._get_request_cache_access(req_context)
+         return RequestOffloadingContext()
+ 
+     @override
+@@ -144,6 +199,15 @@ class CPUOffloadingManager(OffloadingManager):
+         self,
+         keys: Collection[OffloadKey],
+         req_context: ReqContext,
++    ) -> LoadStoreSpec:
++        return self._prepare_load(keys, req_context, record_access=True)
++
++    def _prepare_load(
++        self,
++        keys: Collection[OffloadKey],
++        req_context: ReqContext,
++        *,
++        record_access: bool,
+     ) -> LoadStoreSpec:
+         chunks = []
+         for key in keys:
+@@ -156,6 +220,8 @@ class CPUOffloadingManager(OffloadingManager):
+                 assert self._num_evictable_cache_chunks >= 0
+             chunk.ref_cnt += 1
+             chunks.append(chunk)
++        if record_access:
++            self._record_request_cache_access(keys, req_context, reused_keys=keys)
+         return self._get_load_store_spec(keys, chunks)
+ 
+     @override
+@@ -181,13 +247,52 @@ class CPUOffloadingManager(OffloadingManager):
+         keys: Collection[OffloadKey],
+         req_context: ReqContext,
+     ) -> PrepareStoreOutput | None:
++        keys = list(keys)
+         if self.counts is not None:
+-            num_keys = len(keys)
+             self._record_accesses(keys)
+-            keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
+-            self.stores_skipped_in_current_batch += num_keys - len(keys)
+-        # filter out chunks that are already stored
+-        keys_to_store = [k for k in keys if self._policy.get(k) is None]
++        # Partition the original offer before admission filtering. Ready
++        # resident chunks are request reuses even if their tracker entry was
++        # aged out; the threshold applies only to new store candidates.
++        keys_to_store: list[OffloadKey] = []
++        ready_existing_keys: list[OffloadKey] = []
++        for key in keys:
++            chunk = self._policy.get(key)
++            if chunk is None:
++                keys_to_store.append(key)
++            else:
++                if chunk.is_ready:
++                    ready_existing_keys.append(key)
++
++        if self.counts is not None:
++            num_store_candidates = len(keys_to_store)
++            keys_to_store = [
++                key
++                for key in keys_to_store
++                if self.counts.get(key, 0) >= self.store_threshold
++            ]
++            self.stores_skipped_in_current_batch += num_store_candidates - len(
++                keys_to_store
++            )
++
++        state = self._get_request_cache_access(req_context)
++        new_store_misses = [
++            key for key in keys_to_store if key not in state.store_miss_keys
++        ]
++        if new_store_misses:
++            # ARC learns from B1/B2 before insert() removes the ghost entry.
++            # Deduplication makes this one policy observation per request.
++            self._policy.on_store_miss(new_store_misses, req_context)
++            state.store_miss_keys.update(new_store_misses)
++
++        recorded_keys = set(keys_to_store)
++        recorded_keys.update(ready_existing_keys)
++        # Record once before any allocation-related early return. Store
++        # candidates are classified as insertions only after allocation succeeds.
++        self._record_request_cache_access(
++            (key for key in keys if key in recorded_keys),
++            req_context,
++            reused_keys=ready_existing_keys,
++        )
+ 
+         if not keys_to_store:
+             return PrepareStoreOutput(
+@@ -239,6 +344,7 @@ class CPUOffloadingManager(OffloadingManager):
+         for key, chunk in zip(keys_to_store, chunks):
+             self._policy.insert(key, chunk)
+         self._num_write_pending_chunks += len(keys_to_store)
++        state.inserted_keys.update(keys_to_store)
+ 
+         # build store specs for allocated chunks
+         store_spec = self._get_load_store_spec(keys_to_store, chunks)
+@@ -284,6 +390,35 @@ class CPUOffloadingManager(OffloadingManager):
+                 )
+             )
+ 
++    @override
++    def on_request_finished(self, req_context: ReqContext) -> None:
++        state = req_context.get_state(_RequestCacheAccess)
++        if (
++            state is None
++            or state.owner is not self
++            or state.cache_generation != self._cache_generation
++            or state.finished
++        ):
++            return
++        state.finished = True
++        key_groups = []
++        for group_idx in sorted(state.key_groups):
++            keys = state.key_groups[group_idx]
++            positions = {
++                key: position
++                for key in keys
++                if (position := req_context.get_offload_key_position(key)) is not None
++            }
++            if len(positions) == len(keys):
++                keys = sorted(keys, key=positions.__getitem__)
++            key_groups.append(tuple(keys))
++        self._policy.on_request_finished(
++            tuple(key_groups),
++            state.inserted_keys - state.reused_keys,
++            state.reused_keys,
++            req_context,
++        )
++
+     @override
+     def reset_cache(self) -> None:
+         # Clear ALL chunks unconditionally. The scheduler's _stale_job_threshold
+@@ -292,6 +427,7 @@ class CPUOffloadingManager(OffloadingManager):
+         # flushes in-flight load job IDs to the workers before any new stores
+         # can begin, preventing a cross-direction data race on reused offload chunk IDs.
+         self._policy.clear()
++        self._cache_generation += 1
+         self._num_evictable_cache_chunks = 0
+         self._num_write_pending_chunks = 0
+ 
+diff --git a/vllm/v1/kv_offload/cpu/policies/arc.py b/vllm/v1/kv_offload/cpu/policies/arc.py
+index e413bd6..882ee02 100644
+--- a/vllm/v1/kv_offload/cpu/policies/arc.py
++++ b/vllm/v1/kv_offload/cpu/policies/arc.py
+@@ -1,12 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections import OrderedDict
+-from collections.abc import Iterable, Iterator
++from collections.abc import Iterable, Iterator, Sequence
+ 
+ from typing_extensions import override
+ 
+ from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+-from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
++from vllm.v1.kv_offload.cpu.policies.base import (
++    CachePolicy,
++    ChunkStatus,
++    order_request_keys,
++)
+ 
+ 
+ class ARCCachePolicy(CachePolicy):
+@@ -24,12 +28,11 @@ class ARCCachePolicy(CachePolicy):
+            Searches T1 and T2 for chunk hashes and counts consecutive hits
+            until a miss or non-ready chunk is encountered.
+ 
+-        2. Cache touch (touch) - Adaptive Learning:
+-           For each key (in reverse order):
+-           - If in T1: Move to T2 (promotion from recent to frequent).
+-           - If in T2: Move to MRU position (end of queue).
+-           - If in B1 ghost list: Increase target_t1_size.
+-           - If in B2 ghost list: Decrease target_t1_size.
++        2. Request access - Adaptive Learning:
++           - Ready chunks reused by a request move from T1 to T2 once, or
++             move to the MRU end of T2.
++           - B1/B2 misses adjust target_t1_size once per request before
++             insertion removes their ghost entries.
+ 
+         3. Chunk eviction (evict) - Adaptive Replacement:
+            Determines eviction source based on adaptive target:
+@@ -39,7 +42,7 @@ class ARCCachePolicy(CachePolicy):
+ 
+         4. Chunk insertion (insert):
+            New chunks are always inserted into T1 and removed from B1/B2 if
+-           present. Chunks may later be promoted to T2 during touch operations.
++           present. A later request reuse may promote them to T2.
+ 
+     Adaptive Behavior:
+         The algorithm self-tunes the recency vs. frequency trade-off:
+@@ -71,6 +74,26 @@ class ARCCachePolicy(CachePolicy):
+         if self.t1.pop(key, None) is None:
+             self.t2.pop(key, None)
+ 
++    def _adapt_to_ghost_hit(self, key: OffloadKey) -> bool:
++        if key in self.b1:
++            delta = max(1, len(self.b2) / len(self.b1))
++            self.target_t1_size = min(self.target_t1_size + delta, self.cache_capacity)
++            self.b1.move_to_end(key)
++            return True
++        if key in self.b2:
++            delta = max(1, len(self.b1) / len(self.b2))
++            self.target_t1_size = max(self.target_t1_size - delta, 0)
++            self.b2.move_to_end(key)
++            return True
++        return False
++
++    @override
++    def on_store_miss(
++        self, keys: Iterable[OffloadKey], req_context: ReqContext
++    ) -> None:
++        for key in reversed(list(keys)):
++            self._adapt_to_ghost_hit(key)
++
+     @override
+     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+         for key in reversed(list(keys)):
+@@ -86,19 +109,33 @@ class ARCCachePolicy(CachePolicy):
+             elif key in self.t2:
+                 self.t2.move_to_end(key)
+ 
+-            elif key in self.b1:
+-                delta = max(1, len(self.b2) / len(self.b1))
+-                self.target_t1_size = min(
+-                    self.target_t1_size + delta, self.cache_capacity
+-                )
+-                # move to MRU position (end) to keep it fresh in the ghost list
+-                self.b1.move_to_end(key)
+-
+-            elif key in self.b2:
+-                delta = max(1, len(self.b1) / len(self.b2))
+-                self.target_t1_size = max(self.target_t1_size - delta, 0)
+-                # move to MRU position (end) to keep it fresh in the ghost list
+-                self.b2.move_to_end(key)
++            else:
++                self._adapt_to_ghost_hit(key)
++
++    @override
++    def on_request_finished(
++        self,
++        key_groups: Sequence[Sequence[OffloadKey]],
++        insertion_only_keys: set[OffloadKey],
++        reused_keys: set[OffloadKey],
++        req_context: ReqContext,
++    ) -> None:
++        for key in reversed(order_request_keys(key_groups, req_context)):
++            if key in insertion_only_keys:
++                # A store is not a frequency hit. Preserve T1 membership
++                # while still restoring tail-to-head recency.
++                if key in self.t1:
++                    self.t1.move_to_end(key)
++                elif key in self.t2:
++                    self.t2.move_to_end(key)
++                continue
++
++            # Ready chunks reused by this request count as one access.
++            if key in reused_keys and key in self.t1:
++                chunk = self.t1.pop(key)
++                self.t2[key] = chunk
++            elif key in reused_keys and key in self.t2:
++                self.t2.move_to_end(key)
+ 
+     @override
+     def clear(self) -> None:
+diff --git a/vllm/v1/kv_offload/cpu/policies/base.py b/vllm/v1/kv_offload/cpu/policies/base.py
+index 4059dd7..3efffbd 100644
+--- a/vllm/v1/kv_offload/cpu/policies/base.py
++++ b/vllm/v1/kv_offload/cpu/policies/base.py
+@@ -2,11 +2,26 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import ctypes
+ from abc import ABC, abstractmethod
+-from collections.abc import Iterable
++from collections.abc import Iterable, Sequence
+ 
+ from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+ 
+ 
++def order_request_keys(
++    key_groups: Sequence[Sequence[OffloadKey]], req_context: ReqContext
++) -> list[OffloadKey]:
++    """Return one head-to-tail order across all KV cache groups."""
++    keys = [key for group in key_groups for key in group]
++    positions = {
++        key: position
++        for key in keys
++        if (position := req_context.get_offload_key_position(key)) is not None
++    }
++    if len(positions) == len(keys):
++        keys.sort(key=positions.__getitem__)
++    return keys
++
++
+ class ChunkStatus(ctypes.Structure):
+     """
+     Offloading status for a single chunk of KV data.
+@@ -66,6 +81,41 @@ class CachePolicy(ABC):
+             req_context: Per-request context for the request touching these chunks.
+         """
+ 
++    def on_store_miss(
++        self, keys: Iterable[OffloadKey], req_context: ReqContext
++    ) -> None:
++        """Observe store misses before their cache entries are inserted.
++
++        The default delegates to ``touch`` for compatibility with external
++        policies. Policies may override this hook when a miss has distinct
++        semantics, such as ARC adapting to a ghost-list hit.
++        """
++        self.touch(keys, req_context)
++
++    def on_request_finished(
++        self,
++        key_groups: Sequence[Sequence[OffloadKey]],
++        insertion_only_keys: set[OffloadKey],
++        reused_keys: set[OffloadKey],
++        req_context: ReqContext,
++    ) -> None:
++        """Apply one request-scoped cache access in prefix order.
++
++        ``key_groups`` contains keys observed for each KV cache group in
++        head-to-tail order. ``insertion_only_keys`` and ``reused_keys``
++        distinguish chunks only created by this request from ready chunks it
++        actually reused, which matters for policies such as ARC where reuse
++        changes frequency but insertion and pending observations do not.
++
++        The default forwards one touch per group, preserving compatibility
++        for experimental out-of-tree policies while moving those touches to
++        request finalization. Policies that distinguish insertion from reuse
++        can override this hook and inspect the access classifications.
++        """
++        del insertion_only_keys, reused_keys
++        for keys in key_groups:
++            self.touch(keys, req_context)
++
+     @abstractmethod
+     def evict(
+         self, n: int, protected: set[OffloadKey]
+diff --git a/vllm/v1/kv_offload/cpu/policies/lru.py b/vllm/v1/kv_offload/cpu/policies/lru.py
+index c1dc631..5b5f65d 100644
+--- a/vllm/v1/kv_offload/cpu/policies/lru.py
++++ b/vllm/v1/kv_offload/cpu/policies/lru.py
+@@ -1,28 +1,74 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from collections import OrderedDict
+-from collections.abc import Iterable
++import heapq
++from collections.abc import Iterable, Sequence
+ 
+ from typing_extensions import override
+ 
+ from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+-from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
++from vllm.v1.kv_offload.cpu.policies.base import (
++    CachePolicy,
++    ChunkStatus,
++    order_request_keys,
++)
+ 
+ 
+ class LRUCachePolicy(CachePolicy):
+     """
+-    LRU Caching policy that keeps a dedicated evictable list for fast eviction.
++    LRU caching policy with logical recency independent of transfer pinning.
++
++    Evictable chunks live in a lazy-invalidating min-heap. A chunk's recency
++    can therefore be updated while it is pinned; when it later becomes
++    evictable, it enters the heap with the order assigned by the request
++    rather than its transfer-completion time.
++
+     A use is indicated by,
+      - First time the key is added (store).
+-     - Load job completion
+-     - touch
++     - A request-scoped access.
+     """
+ 
+     def __init__(self, cache_capacity: int):
+         super().__init__(cache_capacity)
+-        # Chunks with ref_cnt 0 (not participating in any loads/stores) ordered in LRU
+-        self.evictable_chunks: OrderedDict[OffloadKey, None] = OrderedDict()
+         self.chunks: dict[OffloadKey, ChunkStatus] = {}
++        self._ranks: dict[OffloadKey, int] = {}
++        self._evictable: set[OffloadKey] = set()
++        self._heap: list[tuple[int, OffloadKey]] = []
++        self._next_rank = 0
++
++    def _assign_new_rank(self, key: OffloadKey) -> bool:
++        if key not in self.chunks:
++            return False
++        self._next_rank += 1
++        self._ranks[key] = self._next_rank
++        return key in self._evictable
++
++    def _push_evictable(self, key: OffloadKey) -> None:
++        heapq.heappush(
++            self._heap,
++            (self._ranks[key], key),
++        )
++
++    def _is_current(self, entry: tuple[int, OffloadKey]) -> bool:
++        rank, key = entry
++        return key in self._evictable and self._ranks.get(key) == rank
++
++    def _maybe_compact_heap(self) -> None:
++        if len(self._heap) < max(64, 2 * len(self._evictable)):
++            return
++        self._heap = [(self._ranks[key], key) for key in self._evictable]
++        heapq.heapify(self._heap)
++
++    def _update_recency(self, keys: Iterable[OffloadKey]) -> None:
++        updated_evictable = [key for key in keys if self._assign_new_rank(key)]
++        # Rebuilding is linear and substantially cheaper than k heap pushes
++        # for a long prefix. Small updates retain the incremental path.
++        if len(updated_evictable) >= max(64, len(self._evictable) // 4):
++            self._heap = [(self._ranks[key], key) for key in self._evictable]
++            heapq.heapify(self._heap)
++        else:
++            for key in updated_evictable:
++                self._push_evictable(key)
++            self._maybe_compact_heap()
+ 
+     @override
+     def get(self, key: OffloadKey) -> ChunkStatus | None:
+@@ -31,26 +77,40 @@ class LRUCachePolicy(CachePolicy):
+     @override
+     def insert(self, key: OffloadKey, chunk: ChunkStatus) -> None:
+         self.chunks[key] = chunk
++        self._next_rank += 1
++        self._ranks[key] = self._next_rank
+         if chunk.ref_cnt == 0:
+-            self.evictable_chunks[key] = None
++            self._evictable.add(key)
++            self._push_evictable(key)
+ 
+     @override
+     def remove(self, key: OffloadKey) -> None:
+         del self.chunks[key]
+-        self.evictable_chunks.pop(key, None)
++        self._ranks.pop(key, None)
++        self._evictable.discard(key)
+ 
+     @override
+     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+-        for key in reversed(list(keys)):
+-            if key in self.evictable_chunks:
+-                self.evictable_chunks.move_to_end(key)
+-            # active chunks are untouched as they are non-evictable now. They
+-            # will eventually reach the end of evictable_chunks when they finish.
++        self._update_recency(reversed(list(keys)))
++
++    @override
++    def on_request_finished(
++        self,
++        key_groups: Sequence[Sequence[OffloadKey]],
++        insertion_only_keys: set[OffloadKey],
++        reused_keys: set[OffloadKey],
++        req_context: ReqContext,
++    ) -> None:
++        del insertion_only_keys, reused_keys
++        self._update_recency(reversed(order_request_keys(key_groups, req_context)))
+ 
+     @override
+     def clear(self) -> None:
+-        self.evictable_chunks.clear()
+         self.chunks.clear()
++        self._ranks.clear()
++        self._evictable.clear()
++        self._heap.clear()
++        self._next_rank = 0
+ 
+     @override
+     def evict(
+@@ -59,22 +119,44 @@ class LRUCachePolicy(CachePolicy):
+         if n == 0:
+             return []
+ 
+-        candidates: list[tuple[OffloadKey, ChunkStatus]] = []
+-        for key, _ in self.evictable_chunks.items():
++        selected: list[tuple[tuple[int, OffloadKey], ChunkStatus]] = []
++        selected_keys: set[OffloadKey] = set()
++        deferred: list[tuple[int, OffloadKey]] = []
++        while self._heap and len(selected) < n:
++            entry = heapq.heappop(self._heap)
++            if not self._is_current(entry):
++                continue
++            key = entry[1]
++            # Re-pinning without a recency change can leave an equivalent
++            # lazy entry behind. Select each cache key at most once.
++            if key in selected_keys:
++                continue
+             if key in protected:
++                deferred.append(entry)
+                 continue
+-
+             chunk = self.chunks[key]
+             assert chunk.ref_cnt == 0
+-            candidates.append((key, chunk))
+-            if len(candidates) == n:
+-                break
+-
+-        if len(candidates) < n:
++            selected.append((entry, chunk))
++            selected_keys.add(key)
++
++        if len(selected) < n:
++            for entry, _ in selected:
++                heapq.heappush(self._heap, entry)
++            for entry in deferred:
++                heapq.heappush(self._heap, entry)
+             return None
+-        for key, _ in candidates:
+-            del self.evictable_chunks[key]
++
++        for entry in deferred:
++            heapq.heappush(self._heap, entry)
++
++        candidates: list[tuple[OffloadKey, ChunkStatus]] = []
++        for entry, chunk in selected:
++            key = entry[1]
++            self._evictable.remove(key)
+             del self.chunks[key]
++            del self._ranks[key]
++            candidates.append((key, chunk))
++        self._maybe_compact_heap()
+         return candidates
+ 
+     @override
+@@ -82,9 +164,11 @@ class LRUCachePolicy(CachePolicy):
+         # chunks can become evictable when,
+         # store completes - i.e. ref_cnt -1 -> 0 # not in evictable list
+         # all loads complete - i.e ref_cnt 1 -> 0  # not in evictable list
+-        self.evictable_chunks[key] = None
++        self._evictable.add(key)
++        self._push_evictable(key)
++        self._maybe_compact_heap()
+ 
+     @override
+     def mark_non_evictable(self, key: OffloadKey) -> None:
+-        # key must have been in the evictable list.
+-        del self.evictable_chunks[key]
++        # key must have been evictable before it was pinned.
++        self._evictable.remove(key)
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 0940aae..f196168 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -110,13 +110,22 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
+         # read/write is for CPU<->secondary transfers,
+         # load/store is for CPU<->GPU transfers.
+         # These aliases avoid calling prepare_load inside a store path.
+-        self.prepare_read = self.prepare_load
+         self.complete_read = self.complete_load
+         self.prepare_write = self.prepare_store
+         self.complete_write = self.complete_store
+ 
+         self._kv_memoryview = mmap_region.create_kv_memoryview()
+ 
++    def prepare_read(
++        self, keys: Collection[OffloadKey], req_context: ReqContext
++    ) -> LoadStoreSpec:
++        """Pin chunks for a CPU-to-secondary transfer.
++
++        Cascade reads are implementation details of tiering, not additional
++        request accesses, so they must not alter request-scoped recency.
++        """
++        return self._prepare_load(keys, req_context, record_access=False)
++
+     def get_kv_memoryview(self) -> memoryview:
+         """Return the memoryview over the primary tier's KV cache buffer.
+ 
+@@ -781,11 +790,10 @@ class TieringOffloadingManager(OffloadingManager):
+         req_id: str,
+         exclude_tier_idx: int | None = None,
+     ) -> None:
+-        """Finalize secondary tiers once no more store cascades can be submitted.
++        """Finalize secondary tiers once no more cascades can be submitted.
+ 
+-        Finalization means forwarding on_request_finished() to secondary tiers.
+-        It is delayed until pending GPU->primary stores finish, since their
+-        complete_store() callbacks may still submit primary->secondary stores.
++        Their finalization is delayed until pending GPU->primary stores
++        finish, since those callbacks may still submit secondary stores.
+         """
+         state = self._req_state[req_id]
+         if not state.is_finished:

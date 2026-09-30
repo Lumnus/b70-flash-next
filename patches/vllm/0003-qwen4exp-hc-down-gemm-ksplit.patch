@@ -1,0 +1,209 @@
+From 7591776a866fec299954dd8feb0af9d86d655dda Mon Sep 17 00:00:00 2001
+From: wu1ff <197699991+wu1ff@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:16:53 +0000
+Subject: [PATCH] 0003-qwen4exp-hc-down-gemm-ksplit
+
+P4 HC down-GEMM deterministic K-split
+
+Purpose:  On XPU with row width > 64 replace F.linear(x, W[:, :10240]) by two K=5120 GEMMs over contiguous weight
+          halves prepared once at load time (oneDNN skinny BF16 K=10240 GEMM is run-to-run nondeterministic
+          above width 64; it corrupted width-256 graph-replayed prefill). linear.py gets the 8-line
+          process_weights_after_loading hook that calls layer.hc_ksplit_prepare().
+Depends:  0001. The two files in this patch depend on each other (hook <-> marker); apply together.
+Base:     vLLM v0.30.0 (tag commit ced6857afa0ea7b2e3f0846a62e1394e90f15607), as installed in
+          docker.io/vllm/vllm-openai-xpu:v0.30.0 (amd64 sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9).
+          The installed site-packages files and /workspace/vllm source copies are byte-identical to the tag
+          (checked 2026-09-28, base layers sha256:8439dd1b... and sha256:8fcb7387...).
+Origin:   wu1ff B70-LLM-Controller pack Qwen3.8-Flash-Next 1.0.0/1.0.1 (MIT), image
+          ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122 (amd64 sha256:761f215485ab9da27816366c65222465ba6dbf8acb2000641774ed698ce589f8)
+Method:   re-derived as a unified diff from wu1ff's whole-file overlay (their overlay minus upstream v0.30.0).
+          Applying this patch to v0.30.0 reproduces wu1ff's file byte-for-byte; the Dockerfile asserts the sha256.
+Apply:    patch -p1 --fuzz=0 from the directory that CONTAINS vllm/ (site-packages AND /workspace/vllm).
+Files (wu1ff image layer digests, site-packages / workspace copy):
+  vllm/models/qwen4_exp/nvidia/hyperconnection.py <- layer sha256:259ace7d4a89fb7f9f4497cae70d79d0e78b316644505c92e8059bf547513c67 / sha256:bfbfca9ba3972fd2f15297087d19f5a94107981516c6c32ef9b6faac4455ac1a
+  vllm/model_executor/layers/linear.py <- layer sha256:2ccd4ca609ae76c1c42acb5b5fafc2c8df673a388d6245c827e5d0368c8833a1 / sha256:d3fd6efc50eb717bd92e7d5ca1b4eebfe37863065dec96e27c8497f7832f741e
+---
+ vllm/model_executor/layers/linear.py          |   8 ++
+ .../qwen4_exp/nvidia/hyperconnection.py       | 116 +++++++++++++++++-
+ 2 files changed, 120 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 95dc852..73e9283 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -214,6 +214,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
+ 
+             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+         elif current_platform.is_xpu():
++            # Qwen4Exp HC down projections arm their deterministic XPU K-split
++            # here: one-time contiguous K-half prep so the width-gated
++            # two-GEMM branch in GatedResidual is ready before any capture
++            # (only layers carrying the marker are affected; see
++            # vllm/models/qwen4_exp/nvidia/hyperconnection.py).
++            prep = getattr(layer, "hc_ksplit_prepare", None)
++            if prep is not None:
++                prep()
+             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
+             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
+             # bitwise reproducible. Off by default.
+diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+index acdba8c..08d7fea 100644
+--- a/vllm/models/qwen4_exp/nvidia/hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+@@ -23,8 +23,10 @@ Typical usage inside a transformer decoder layer::
+ """
+ 
+ import torch
++import torch.nn.functional as F
+ from torch import nn
+ 
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+     ReplicatedLinear,
+@@ -43,6 +45,38 @@ from .ops.hc import (
+     hc_silu,
+ )
+ 
++logger = init_logger(__name__)
++
++
++def _is_xpu() -> bool:
++    from vllm.platforms import current_platform
++
++    return current_platform.is_xpu()
++
++
++# ---------------------------------------------------------------------------
++# XPU HC down-GEMM determinism (K-split)
++#
++# The skinny BF16 HC down projection (K = hyper_hidden_size = 10240 -> N in
++# {336 merged, 320 final mixer}) is run-to-run racy on XPU for row widths
++# > 64: the oneDNN accumulation re-samples its split-K draw every execution,
++# which is what made PIECEWISE-256 prefill replay diverge from eager
++# (bitwise-equal inputs, few-ULP output flips). Replacing the single GEMM
++# with two K=5120 GEMMs over contiguous weight halves is bitwise-deterministic
++# in eager, fresh-clone and graph capture+replay at every width tested
++# (M in {64, 128, 256}; 0/512 flips at M=256). See
++# docs/HC_DOWN_GEMM_FIX_RECON.md for the offline campaign.
++#
++# Widths <= 64 keep the stock single GEMM (bitwise-clean there, and decode
++# graphs never exceed 8 rows, so M1 FULL decode keeps stock numerics).
++# CUDA is untouched: the halves are prepared only on XPU
++# (UnquantizedLinearMethod.process_weights_after_loading calls the
++# ``hc_ksplit_prepare`` marker set below), so the split branch is never
++# armed on non-XPU platforms.
++# ---------------------------------------------------------------------------
++_HC_KSPLIT_MAX_STOCK_WIDTH = 64
++_HC_KSPLIT_WIDTHS_LOGGED: set[int] = set()
++
+ 
+ # ---------------------------------------------------------------------------
+ # Gated-residual variant
+@@ -125,6 +159,80 @@ class GatedResidual(nn.Module):
+             return_bias=False,
+         )
+ 
++        # -- XPU deterministic K-split state --------------------------------
++        # Contiguous K=5120 halves of the down weight, prepared once at load
++        # time on XPU only (see _prepare_kdown_ksplit). ``None`` everywhere
++        # else, which keeps the stock single GEMM armed.
++        self._kdown_lo: torch.Tensor | None = None
++        self._kdown_hi: torch.Tensor | None = None
++        self._kdown_k = 0
++        down_linear = (
++            self.input_mix_weight_down_block_inject
++            if use_combine
++            else self.input_mix_weight_down
++        )
++        # Marker consumed by
++        # UnquantizedLinearMethod.process_weights_after_loading (XPU only).
++        down_linear.hc_ksplit_prepare = self._prepare_kdown_ksplit
++
++    def _prepare_kdown_ksplit(self) -> None:
++        """One-time contiguous K-half prep for the deterministic XPU split."""
++        if self._kdown_lo is not None:
++            return
++        down_linear = (
++            self.input_mix_weight_down_block_inject
++            if self.use_combine
++            else self.input_mix_weight_down
++        )
++        weight = down_linear.weight
++        if weight is None or weight.ndim != 2 or weight.shape[1] % 2 != 0:
++            logger.debug(
++                "HC down GEMM %s: unexpected weight geometry %s; "
++                "K-split left disarmed",
++                type(down_linear).__name__,
++                None if weight is None else tuple(weight.shape),
++            )
++            return
++        self._kdown_k = weight.shape[1] // 2
++        self._kdown_lo = weight.data[:, : self._kdown_k].contiguous()
++        self._kdown_hi = weight.data[:, self._kdown_k :].contiguous()
++        logger.debug(
++            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d)",
++            weight.shape[1],
++            self._kdown_k,
++            weight.shape[0],
++        )
++
++    def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
++        """Down projection; width-gated deterministic K-split on XPU.
++
++        Row widths <= 64 (all decode graphs) keep the stock single GEMM,
++        which is bitwise-clean there. Wider rows (prefill chunks) take the
++        two-GEMM split over the contiguous K-halves. The branch conditions
++        are shape/attribute reads only, so stream capture bakes the correct
++        arm per graph and replays deterministically.
++        """
++        if (
++            self._kdown_lo is not None
++            and _is_xpu()
++            and xn.shape[0] > _HC_KSPLIT_MAX_STOCK_WIDTH
++        ):
++            width = xn.shape[0]
++            if width not in _HC_KSPLIT_WIDTHS_LOGGED:
++                _HC_KSPLIT_WIDTHS_LOGGED.add(width)
++                logger.info(
++                    "HC down GEMM: deterministic K-split engaged at row width "
++                    "%d (stock single GEMM kept for widths <= %d)",
++                    width,
++                    _HC_KSPLIT_MAX_STOCK_WIDTH,
++                )
++            return F.linear(xn[..., : self._kdown_k], self._kdown_lo) + F.linear(
++                xn[..., self._kdown_k :], self._kdown_hi
++            )
++        if self.use_combine:
++            return self.input_mix_weight_down_block_inject(xn)
++        return self.input_mix_weight_down(xn)
++
+     def mix(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+@@ -138,10 +246,10 @@ class GatedResidual(nn.Module):
+         if self.use_combine:
+             # produce injection logits for combine
+             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
++            down_and_injection = self._down_gemm(xn)
+             lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+         else:
+-            lora = self.input_mix_weight_down(xn)
++            lora = self._down_gemm(xn)
+             injection = None
+ 
+         lora = hc_silu(lora, self.hc_count)
+@@ -175,10 +283,10 @@ class GatedResidual(nn.Module):
+         if self.use_combine:
+             # produce injection logits for combine
+             split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
++            down_and_injection = self._down_gemm(xn)
+             lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+         else:
+-            lora = self.input_mix_weight_down(xn)
++            lora = self._down_gemm(xn)
+             injection = None
+ 
+         lora = hc_silu(lora, self.hc_count)

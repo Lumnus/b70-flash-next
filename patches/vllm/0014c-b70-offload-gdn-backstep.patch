@@ -1,0 +1,159 @@
+From 80aacb5725e89352755c0b77f7412c8eacab7cf0 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Tue, 29 Sep 2026 21:39:39 +0000
+Subject: [PATCH] 0014c-b70-offload-gdn-backstep: retain Mamba states N blocks
+ below the replay boundary (B70_OFFLOAD_GDN_BACKSTEP=N)
+
+Default 0 = off. With sparse Mamba retention (prefix_cache_retention_interval=0)
+a request keeps one Mamba state, at aligned(num_prompt_tokens-1). A revisit
+whose suffix (e.g. a new question) starts inside the last block therefore misses
+the first time even with 0014b. B70_OFFLOAD_GDN_BACKSTEP=N adds the N block
+boundaries below the replay boundary to KVCacheCoordinator.get_replay_boundaries,
+so MambaManager.cache_blocks retains (hashes) those states and the aligned
+boundary hand-off offloads them; the scheduler's Mamba chunk splitter also stops
+there so the states are materialized when the prefill budget spans several
+blocks. Cost per request: N x one Mamba state set (116,195,328 B for the 36 GDN
+groups of Qwen3.8-Flash-Next) on the CPU tier, and N evictable Mamba blocks
+per group on the GPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/core/kv_cache_coordinator.py | 49 ++++++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py      | 16 +++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index afb03ac..8badac2 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from abc import ABC, abstractmethod
+ from collections.abc import Sequence
+ from typing import NamedTuple
+@@ -28,6 +29,25 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.request import Request
+ 
++
++def b70_gdn_backstep() -> int:
++    """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
++    raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
++    try:
++        return max(0, int(raw)) if raw else 0
++    except ValueError:
++        return 0
++
++
++def b70_backstep_boundaries(
++    num_prompt_tokens: int, block_size: int, steps: int
++) -> tuple[int, ...]:
++    """Block boundaries 1..steps blocks below the replay boundary."""
++    base = (num_prompt_tokens - 1) // block_size * block_size
++    return tuple(
++        base - k * block_size for k in range(1, steps + 1) if base - k * block_size > 0
++    )
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -68,6 +88,9 @@ class KVCacheCoordinator(ABC):
+     Coordinate the KV cache of different KV cache groups.
+     """
+ 
++    # B70 0014c default (off) for instances built without __init__.
++    b70_gdn_backstep: int = 0
++
+     enable_partial_hash_hits = False
+ 
+     def __init__(
+@@ -167,6 +190,16 @@ class KVCacheCoordinator(ABC):
+         _validate_prefix_cache_retention_interval(
+             self.retention_interval, self.scheduler_block_size, kv_cache_config
+         )
++        # B70 0014c: extra retained Mamba states below the replay boundary.
++        self.b70_gdn_backstep = b70_gdn_backstep()
++        if self.b70_gdn_backstep:
++            logger.info(
++                "B70-OFFLOAD enabled GDN backstep=%d (retain Mamba states up to "
++                "%d blocks below the replay boundary; retention_interval=%s)",
++                self.b70_gdn_backstep,
++                self.b70_gdn_backstep,
++                self.retention_interval,
++            )
+ 
+     def get_num_blocks_to_allocate(
+         self,
+@@ -325,6 +358,22 @@ class KVCacheCoordinator(ABC):
+         resend's hit to 0. The alignment is the scheduler block size, not the
+         finer hash granularity, which would over-estimate the reach.
+         """
++        if getattr(self, "b70_gdn_backstep", 0):
++            return tuple(
++                sorted(
++                    set(self._get_replay_boundaries(request))
++                    | set(
++                        b70_backstep_boundaries(
++                            request.num_prompt_tokens,
++                            self.scheduler_block_size,
++                            self.b70_gdn_backstep,
++                        )
++                    )
++                )
++            )
++        return self._get_replay_boundaries(request)
++
++    def _get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
+         if not self.eagle_group_ids:
+             return (request.num_prompt_tokens - 1,)
+         block = self.scheduler_block_size
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index daf2b31..bb25ff6 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -35,6 +35,10 @@ from vllm.v1.core.encoder_cache_manager import (
+     EncoderCacheManager,
+     EncoderDecoderCacheManager,
+ )
++from vllm.v1.core.kv_cache_coordinator import (
++    b70_backstep_boundaries,
++    b70_gdn_backstep,
++)
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
+@@ -77,6 +81,9 @@ logger = init_logger(__name__)
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # B70 0014c default (off) for instances built without __init__.
++    b70_gdn_backstep: int = 0
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -340,6 +347,9 @@ class Scheduler(SchedulerInterface):
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
++        # B70 0014c: prefill chunks also stop at the backstep boundaries so
++        # their Mamba states are materialized (they are block aligned).
++        self.b70_gdn_backstep = b70_gdn_backstep()
+         # TODO: Support models with multiple Mamba specs that require different
+         # prefill checkpoint alignments instead of selecting the first one.
+         self.mamba_prefill_checkpoint_alignment = next(
+@@ -521,6 +531,12 @@ class Scheduler(SchedulerInterface):
+             # requests sharing the prefix can reuse it.
+             junction_stop if start < junction < end else 0,
+         )
++        # getattr: some callers pass a namespace instead of a Scheduler.
++        b70_steps = getattr(self, "b70_gdn_backstep", 0)
++        if b70_steps:
++            stops += b70_backstep_boundaries(
++                request.num_prompt_tokens, block_size, b70_steps
++            )
+         # Stop at the earliest mandatory position strictly inside the chunk.
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)

@@ -1,0 +1,53 @@
+From 1c1ec8ec09548707bed684c471bed7ece63ab1bb Mon Sep 17 00:00:00 2001
+From: wu1ff <197699991+wu1ff@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:16:53 +0000
+Subject: [PATCH] 0005-xpu-ops-gdn-index64-hook
+
+P6 (python half) route gdn_attention to the int64-offset kernel library
+
+Purpose:  Load vllm_xpu_kernels/libgdn_index64.so at import and call torch.ops._gdn_index64.gdn_attention instead
+          of torch.ops._xpu_C.gdn_attention. The library is the vllm-xpu-kernels v0.1.14 GDN op rebuilt with
+          64-bit conv-state offsets (source fix: ../vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch).
+Depends:  the binary vllm_xpu_kernels/libgdn_index64.so (sha256 0fc700d337b71dfd6f2d4d08ca8ec588a26fc1bd669ed9034c6e4e468a804b75)
+          MUST be present before vllm is imported, or import fails. The Dockerfile copies it from the wu1ff image.
+Base:     vLLM v0.30.0 (tag commit ced6857afa0ea7b2e3f0846a62e1394e90f15607), as installed in
+          docker.io/vllm/vllm-openai-xpu:v0.30.0 (amd64 sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9).
+          The installed site-packages files and /workspace/vllm source copies are byte-identical to the tag
+          (checked 2026-09-28, base layers sha256:8439dd1b... and sha256:8fcb7387...).
+Origin:   wu1ff B70-LLM-Controller pack Qwen3.8-Flash-Next 1.0.0/1.0.1 (MIT), image
+          ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122 (amd64 sha256:761f215485ab9da27816366c65222465ba6dbf8acb2000641774ed698ce589f8)
+Method:   re-derived as a unified diff from wu1ff's whole-file overlay (their overlay minus upstream v0.30.0).
+          Applying this patch to v0.30.0 reproduces wu1ff's file byte-for-byte; the Dockerfile asserts the sha256.
+Apply:    patch -p1 --fuzz=0 from the directory that CONTAINS vllm/ (site-packages AND /workspace/vllm).
+Files (wu1ff image layer digests, site-packages / workspace copy):
+  vllm/_xpu_ops.py <- layer sha256:69b3dc934a8b780c68e0ad5b305720851704c839147d2c5605f010706abfc0d0 / sha256:28c5b22d2e7e62d968f3ca09728364d68c8c571de41b8ed6f633b32aa05b6ca3
+---
+ vllm/_xpu_ops.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index c1f2bb6..ae2d471 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -13,6 +13,12 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++# GDN convolution uses 64-bit products for page-strided state tensors.
++from pathlib import Path
++import vllm_xpu_kernels
++
++torch.ops.load_library(str(Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so")))
++
+ logger = init_logger(__name__)
+ 
+ if TYPE_CHECKING:
+@@ -189,7 +195,7 @@ def _gdn_attention_core_xpu_impl(
+         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+     )
+ 
+-    torch.ops._xpu_C.gdn_attention(
++    torch.ops._gdn_index64.gdn_attention(
+         core_attn_out,
+         z,
+         projected_states_qkvz,

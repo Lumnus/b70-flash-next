@@ -1,0 +1,1256 @@
+From 8501a43b1192e25beed9f10adf59d05f41645772 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Tue, 29 Sep 2026 20:05:39 +0000
+Subject: [PATCH] 0013 tests: CPU tests + host-path micro-bench for the NVMe
+ PLE table
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/b70/bench_ple_int8_nvme.py | 129 +++++++
+ tests/b70/test_ple_int8_nvme.py  | 634 +++++++++++++++++++++++++++++++
+ 2 files changed, 763 insertions(+)
+ create mode 100644 tests/b70/bench_ple_int8_nvme.py
+ create mode 100644 tests/b70/test_ple_int8_nvme.py
+
+diff --git a/tests/b70/bench_ple_int8_nvme.py b/tests/b70/bench_ple_int8_nvme.py
+new file mode 100644
+index 0000000..bf31aaa
+--- /dev/null
++++ b/tests/b70/bench_ple_int8_nvme.py
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 0013 CPU micro-bench of the per-step host path (one rank).
++
++    nice -n 19 ionice -c3 /opt/venv/bin/python tests/b70/bench_ple_int8_nvme.py
++
++Per shape (decode 1/4/8 seqs, one 1024-token prefill chunk), per rank kind
++(rank 0 = bigram heads, rank 3 = trigram heads): the host hash alone, the
++resolve without I/O (hits + bookkeeping), and the full resolve with the misses
++read from the real table with O_DIRECT. The miss rate is set by pre-installing
++(with dummy bytes, no reads) the complement of each step's rows: 45 % miss on
++bigram ranks, 70 % on trigram ranks (A-design §2.1 planning numbers). Reads
++are capped (~4.5 K per run) — the disk is shared with a serving engine.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import test_ple_int8_nvme as t  # noqa: E402
++
++pn = t.pn
++ROW = t.ROW
++STEPS = int(os.environ.get("PLE_NVME_BENCH_STEPS", "30"))
++THREADS = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
++
++
++def make_step(rng, seqs: int, length: int):
++    tokens = rng.integers(0, t.VOCAB, size=seqs * length).astype(np.int32)
++    qsl = (np.arange(seqs + 1) * length).astype(np.int32)
++    ctx = rng.integers(0, t.VOCAB, size=(seqs, 2)).astype(np.int32)
++    return tokens, qsl, ctx
++
++
++def server_for(rank, store, capacity=2_000_000):
++    total = 320_001_536
++    per = total // t.TP
++    lo, hi = rank * per, (rank + 1) * per
++    cache = pn.PleRowCache(hi - lo, capacity, ROW, slab=np.zeros((capacity, ROW), np.uint8))
++    return pn.PleNvmeServer(
++        tp_start=lo, tp_end=hi,
++        multipliers=t.LAYOUT["layer_multipliers"],
++        sizes=t.LAYOUT["ngram_heads_vocab_sizes"],
++        offsets=t.LAYOUT["ngram_heads_offsets"],
++        eos_token_id=t.EOS, heads_per_ngram=t.HPN, cache=cache, store=store,
++        stats=pn.PleNvmeStats(rank, 1e9, True),
++    )
++
++
++def prewarm(server, step, miss_rate, rng):
++    """Install (dummy bytes) the rows of ~(1 - miss_rate) of the step's
++    own-row lookups, so the timed resolve misses ~miss_rate of them."""
++    tokens, qsl, ctx = step
++    own = server.hash(tokens, qsl, ctx, heads=server.own_heads)
++    mask = (own >= server.tp_start) & (own < server.tp_end)
++    local = np.unique(own[mask] - server.tp_start)
++    keep = local[rng.random(local.shape[0]) >= miss_rate]
++    keep = keep[server.cache.row2slot[keep] < 0]
++    if keep.size:
++        server.cache.begin_step()
++        server.cache.install(keep, np.zeros((keep.shape[0], ROW), np.uint8))
++    return int(local.shape[0])
++
++
++def pct(values, q):
++    return float(np.percentile(np.asarray(values), q))
++
++
++def run_shape(server, label, seqs, length, miss_rate, steps, rng, io=True):
++    out = np.empty(max(seqs * length, 1) * 16 + 16, np.int64)
++    hash_ms, noio_ms, full_ms, reads, lookups = [], [], [], [], []
++    for _ in range(steps):
++        step = make_step(rng, seqs, length)
++        tokens, qsl, ctx = step
++        t0 = time.perf_counter()
++        server.hash(tokens, qsl, ctx, heads=server.own_heads)
++        hash_ms.append((time.perf_counter() - t0) * 1e3)
++        lookups.append(prewarm(server, step, miss_rate, rng))
++        # Then an all-hit replay of the same step: hash + bookkeeping, no I/O.
++        before = server.stats.total_reads
++        t0 = time.perf_counter()
++        if io:
++            server.resolve(tokens, qsl, ctx, seqs * length, out)
++        full_ms.append((time.perf_counter() - t0) * 1e3)
++        reads.append(server.stats.total_reads - before)
++        t0 = time.perf_counter()
++        server.resolve(tokens, qsl, ctx, seqs * length, out)  # all hits now
++        noio_ms.append((time.perf_counter() - t0) * 1e3)
++    lat = np.concatenate(server.stats.read_lat) * 1e3 if server.stats.read_lat else np.zeros(1)
++    server.stats.read_lat = []
++    print(
++        f"{label:<34} steps {steps:>3}  own rows/step {np.mean(lookups):7.1f}  "
++        f"misses/step {np.mean(reads):7.1f}  hash {np.median(hash_ms):6.3f} ms  "
++        f"resolve(all-hit) p50 {np.median(noio_ms):6.3f} p99 {pct(noio_ms, 99):6.3f} ms  "
++        f"resolve+reads p50 {np.median(full_ms):7.3f} p99 {pct(full_ms, 99):7.3f} ms  "
++        f"read lat p50 {np.median(lat):.3f} p99 {pct(lat, 99):.3f} ms"
++    )
++    return int(np.sum(reads))
++
++
++def main():
++    rng = np.random.default_rng(1)
++    data_start, shape, _ = pn.safetensors_tensor_location(t.TABLE, "table")
++    store = pn.PleNvmeRowStore(t.TABLE, data_start, ROW, shape[0], io_threads=THREADS)
++    total_reads = 0
++    print(f"io_threads={THREADS}, O_DIRECT, table {t.TABLE}")
++    for rank, miss in ((3, 0.70), (0, 0.45)):
++        server = server_for(rank, store)
++        kind = "trigram" if rank >= 2 else "bigram"
++        for seqs in (1, 4, 8):
++            total_reads += run_shape(server, f"rank {rank} ({kind}) decode {seqs} seq",
++                                     seqs, 1, miss, STEPS, rng)
++        if rank == 3:
++            total_reads += run_shape(server, f"rank {rank} ({kind}) prefill 1024",
++                                     1, 1024, miss, 1, rng)
++        else:
++            total_reads += run_shape(server, f"rank {rank} ({kind}) prefill 1024 no-I/O",
++                                     1, 1024, 0.0, 3, rng)
++    store.close()
++    print(f"total O_DIRECT row reads this run: {total_reads}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/b70/test_ple_int8_nvme.py b/tests/b70/test_ple_int8_nvme.py
+new file mode 100644
+index 0000000..25b172b
+--- /dev/null
++++ b/tests/b70/test_ple_int8_nvme.py
+@@ -0,0 +1,634 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 0013 host-side tests (CPU only; no GPU, no vLLM import).
++
++Run with the engine's interpreter:
++    nice -n 19 ionice -c3 /opt/venv/bin/python tests/b70/test_ple_int8_nvme.py [name ...]
++or  ... -m pytest --noconftest -q tests/b70/test_ple_int8_nvme.py
++(``--noconftest``: vLLM's tests/conftest.py imports vLLM, which resolves a
++platform; these tests must not).
++
++``ple_nvme.py`` is loaded by path and ``compute_ngram_ids`` (the device
++function, run here on CPU tensors) is extracted from ngram_embedding.py with
++``ast``, so nothing initialises a vLLM platform or touches an XPU.
++
++Env:
++  PLE_NVME_TABLE         real INT8 table (default: the path below);
++                         tests that read it are skipped when absent
++  PLE_NVME_TEST_ROWS     random rows per rank for the row-exact test
++                         (default 400: ~3.4 K reads incl. the mmap reference;
++                         2000 for the full run once the disk is not being
++                         measured)
++  PLE_NVME_TMP           scratch dir for the synthetic tables (/tmp/ple-nvme)
++"""
++
++from __future__ import annotations
++
++import ast
++import importlib.util
++import json
++import mmap
++import os
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++
++ROOT = Path(__file__).resolve().parents[2]
++NVIDIA = ROOT / "vllm" / "models" / "qwen4_exp" / "nvidia"
++TABLE = os.environ.get(
++    "PLE_NVME_TABLE",
++    "/models/qwen3.8-flash-next/INT8-ple-rowscale/ple_ngram_int8_rowscale.safetensors",
++)
++TMP = Path(os.environ.get("PLE_NVME_TMP", "/tmp/ple-nvme"))
++ROW = 164
++VOCAB = 248320
++EOS = 248044
++HPN = 8
++TP = 4
++
++
++def _load_ple_nvme():
++    spec = importlib.util.spec_from_file_location("ple_nvme", NVIDIA / "ple_nvme.py")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules["ple_nvme"] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++pn = _load_ple_nvme()
++
++
++def _device_hasher_class():
++    """Qwen4ExpNGramEmbedding's hash methods (and the 0013 boot self-test),
++    verbatim from the tree."""
++    source = (NVIDIA / "ngram_embedding.py").read_text()
++    tree = ast.parse(source)
++    keep = {"_shift_precompute", "_shift_apply", "compute_ngram_ids",
++            "_b70_nvme_hash_selftest"}
++    for node in tree.body:
++        if isinstance(node, ast.ClassDef) and node.name == "Qwen4ExpNGramEmbedding":
++            body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in keep]
++            assert {n.name for n in body} == keep
++            cls = ast.ClassDef(
++                name="DeviceHasher", bases=[], keywords=[], body=body, decorator_list=[],
++                type_params=[],
++            )
++            module = ast.Module(body=[cls], type_ignores=[])
++            ast.fix_missing_locations(module)
++            import logging
++
++            namespace = {"torch": torch, "ple_ngram_ids": None,
++                         "logger": logging.getLogger("test")}
++            exec(compile(module, str(NVIDIA / "ngram_embedding.py"), "exec"), namespace)
++            return namespace["DeviceHasher"]
++    raise AssertionError("Qwen4ExpNGramEmbedding not found")
++
++
++def _read_layout(path: str) -> dict[str, np.ndarray]:
++    """The three small layout tensors of the table file (~0.4 KB read)."""
++    with open(path, "rb") as handle:
++        header_len = int.from_bytes(handle.read(8), "little")
++        header = json.loads(handle.read(header_len))
++        out = {}
++        for name in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"):
++            begin, end = header[name]["data_offsets"]
++            handle.seek(8 + header_len + begin)
++            out[name] = np.frombuffer(handle.read(end - begin), dtype=np.int64).copy()
++    return out
++
++
++def _real_layout():
++    if os.path.exists(TABLE):
++        return _read_layout(TABLE)
++    # Values of the served checkpoint (A-design §1.1), for hosts without the file.
++    sizes = []
++    candidate = 20_000_000
++    import sympy  # pragma: no cover
++
++    for _ in range(16):
++        candidate = int(sympy.nextprime(candidate))
++        sizes.append(candidate)
++    return {
++        "layer_multipliers": np.array([23703573157769, 20109073645365, 8052911324071]),
++        "ngram_heads_vocab_sizes": np.array(sizes),
++        "ngram_heads_offsets": np.concatenate([[0], np.cumsum(sizes)[:-1]]),
++    }
++
++
++LAYOUT = _real_layout()
++
++
++def _device(layout=LAYOUT):
++    cls = _device_hasher_class()
++    hasher = cls.__new__(cls)
++    hasher.layer_multipliers = torch.tensor(layout["layer_multipliers"])
++    hasher.ngram_heads_vocab_sizes = torch.tensor(layout["ngram_heads_vocab_sizes"])
++    hasher.ngram_heads_offsets = torch.tensor(layout["ngram_heads_offsets"])
++    hasher.eos_token_id = EOS
++    hasher.ngram_size = int(layout["layer_multipliers"].shape[0])
++    hasher.heads_per_ngram = HPN
++    hasher.unigram_vocab_size = VOCAB
++    return hasher
++
++
++def _host(tokens, qsl, ctx, layout=LAYOUT, heads=None):
++    return pn.host_ngram_ids(
++        tokens, qsl, ctx,
++        multipliers=layout["layer_multipliers"],
++        sizes=layout["ngram_heads_vocab_sizes"],
++        offsets=layout["ngram_heads_offsets"],
++        eos_token_id=EOS, heads_per_ngram=HPN, heads=heads,
++    )
++
++
++def _random_batch(rng, *, max_reqs=8, max_len=1024, eos_p=0.02, max_num_reqs=16,
++                  pad=0):
++    num_reqs = int(rng.integers(1, max_reqs + 1))
++    lens = rng.integers(1, max_len + 1, size=num_reqs)
++    if rng.random() < 0.3:  # decode-shaped batch
++        lens[:] = 1
++    real = int(lens.sum())
++    tokens = rng.integers(0, VOCAB, size=real + pad).astype(np.int32)
++    tokens[rng.random(real + pad) < eos_p] = EOS
++    ctx = rng.integers(0, VOCAB, size=(max_num_reqs, 2)).astype(np.int32)
++    ctx[rng.random((max_num_reqs, 2)) < 0.15] = EOS
++    ctx[num_reqs:] = EOS
++    qsl_full = np.full(max_num_reqs + 1, real, dtype=np.int32)
++    qsl_full[0] = 0
++    qsl_full[1 : num_reqs + 1] = np.cumsum(lens)
++    return tokens, qsl_full, ctx, num_reqs, real
++
++
++# ---------------------------------------------------------------------------
++# 2. host hash == device function (CPU tensors)
++# ---------------------------------------------------------------------------
++
++
++def test_host_hash_equals_device_random_batches():
++    rng = np.random.default_rng(7)
++    device = _device()
++    batches = int(os.environ.get("PLE_NVME_HASH_BATCHES", "1500"))
++    checked = 0
++    for index in range(batches):
++        pad = int(rng.integers(0, 64)) if index % 2 else 0
++        tokens, qsl_full, ctx, num_reqs, real = _random_batch(
++            rng, max_len=int(rng.choice([4, 64, 1024])), pad=pad,
++            eos_p=float(rng.choice([0.0, 0.01, 0.3])),
++        )
++        # Device: padded tokens + tail-filled query_start_loc, as the forward sees them.
++        want = device.compute_ngram_ids(
++            torch.from_numpy(tokens), torch.from_numpy(qsl_full), torch.from_numpy(ctx)
++        ).numpy()[:real]
++        got = _host(tokens[:real], qsl_full[: num_reqs + 1], ctx)
++        assert got.shape == want.shape == (real, 16)
++        assert np.array_equal(got, want), f"batch {index}: {(got != want).sum()} ids differ"
++        checked += got.size
++    print(f"hash: {batches} batches, {checked} ids equal")
++
++
++def test_host_hash_edge_tokens():
++    device = _device()
++    for tokens in (
++        np.array([0], np.int32), np.array([VOCAB - 1] * 5, np.int32),
++        np.array([EOS] * 7, np.int32), np.array([EOS, 1, EOS, 2, 3, EOS], np.int32),
++    ):
++        qsl = np.array([0, tokens.shape[0]], np.int32)
++        for ctx in (np.array([[EOS, EOS]]), np.array([[5, EOS]]), np.array([[EOS, 5]]),
++                    np.array([[VOCAB - 1, VOCAB - 1]])):
++            ctx = ctx.astype(np.int32)
++            want = device.compute_ngram_ids(
++                torch.from_numpy(tokens), torch.from_numpy(qsl), torch.from_numpy(ctx)
++            ).numpy()
++            assert np.array_equal(_host(tokens, qsl, ctx), want)
++
++
++def test_host_hash_chunk_boundaries_carry_context():
++    """Hashing a sequence in chunks, with the 2 previous tokens as context,
++    gives the same ids as hashing it whole (prefill chunking, decode steps)."""
++    rng = np.random.default_rng(11)
++    for trial in range(60):
++        seq = rng.integers(0, VOCAB, size=int(rng.integers(2, 700))).astype(np.int32)
++        seq[rng.random(seq.shape[0]) < 0.05] = EOS
++        start_ctx = np.array([[EOS, EOS]], np.int32)
++        whole = _host(seq, np.array([0, seq.shape[0]], np.int32), start_ctx)
++        cuts = np.sort(rng.choice(np.arange(1, seq.shape[0]), size=min(5, seq.shape[0] - 1),
++                                  replace=False))
++        bounds = [0, *cuts.tolist(), seq.shape[0]]
++        pieces = []
++        for lo, hi in zip(bounds[:-1], bounds[1:]):
++            ctx = np.full((1, 2), EOS, np.int32)
++            before = seq[max(0, lo - 2) : lo]
++            if before.size:
++                ctx[0, 2 - before.size :] = before
++            pieces.append(_host(seq[lo:hi], np.array([0, hi - lo], np.int32), ctx))
++        assert np.array_equal(np.concatenate(pieces), whole), f"trial {trial}"
++
++
++def test_boot_hash_selftest_passes_on_cpu():
++    """The engine's boot self-test (host vs device hash, padded batch with a
++    tail-filled query_start_loc) passes with the device function on CPU, and
++    refuses when the host hash is wrong."""
++    device = _device()
++    cache = pn.PleRowCache(1000, 100, ROW, slab=None)
++    server = pn.PleNvmeServer(
++        tp_start=0, tp_end=1000, multipliers=LAYOUT["layer_multipliers"],
++        sizes=LAYOUT["ngram_heads_vocab_sizes"], offsets=LAYOUT["ngram_heads_offsets"],
++        eos_token_id=EOS, heads_per_ngram=HPN, cache=cache, store=None,
++        stats=pn.PleNvmeStats(0, 60, False), sync_only=True,
++    )
++    device._b70_nvme_hash_selftest(server)
++    server.multipliers = server.multipliers + 2  # a wrong host hash
++    try:
++        device._b70_nvme_hash_selftest(server)
++    except RuntimeError as exc:
++        assert "refusing to start" in str(exc)
++    else:
++        raise AssertionError("self-test accepted a wrong host hash")
++
++
++def test_owned_heads_real_layout():
++    sizes, offsets = LAYOUT["ngram_heads_vocab_sizes"], LAYOUT["ngram_heads_offsets"]
++    total = 320_001_536
++    per = total // TP
++    got = [pn.owned_heads(sizes, offsets, r * per, (r + 1) * per).tolist() for r in range(TP)]
++    # Ranks 0-2 own a sliver of a 5th head (278 / 394 / 350 rows).
++    assert got == [[0, 1, 2, 3, 4], [4, 5, 6, 7, 8], [8, 9, 10, 11, 12], [12, 13, 14, 15]], got
++
++
++# ---------------------------------------------------------------------------
++# Synthetic table (for cache / gather / int64 tests)
++# ---------------------------------------------------------------------------
++
++
++def _synthetic_table(rows: int, name: str) -> tuple[str, int]:
++    """A fake 0008-format table file: row g's bytes are a function of g."""
++    TMP.mkdir(parents=True, exist_ok=True)
++    path = TMP / f"{name}-{rows}.safetensors"
++    header = {
++        "table": {"dtype": "U8", "shape": [rows, ROW], "data_offsets": [0, rows * ROW]},
++        "__metadata__": {"format": "lumnus-ple-int8-rowscale/v1"},
++    }
++    raw = json.dumps(header).encode()
++    header_len = 4096 - 8  # data at byte 4096, as the real file
++    raw = raw + b" " * (header_len - len(raw))
++    if not path.exists() or path.stat().st_size != 4096 + rows * ROW:
++        data = _synthetic_rows(np.arange(rows, dtype=np.int64))
++        with open(path, "wb") as handle:
++            handle.write(header_len.to_bytes(8, "little"))
++            handle.write(raw)
++            handle.write(data.tobytes())
++        fd = os.open(path, os.O_RDONLY)
++        os.fsync(fd)
++        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++        os.close(fd)
++    return str(path), 4096
++
++
++def _synthetic_rows(rows: np.ndarray) -> np.ndarray:
++    rows = rows.astype(np.int64)
++    out = ((rows[:, None] * 1_000_003 + np.arange(ROW)[None, :] * 7919) % 251).astype(np.uint8)
++    out[:, 160:] = np.frombuffer(
++        (np.abs(np.sin(rows.astype(np.float64))) + 0.01).astype(np.float32).tobytes(),
++        dtype=np.uint8,
++    ).reshape(-1, 4)
++    return out
++
++
++# ---------------------------------------------------------------------------
++# 3. Cache
++# ---------------------------------------------------------------------------
++
++
++def _zipf_rows(rng, count, num_rows, s=1.1):
++    return (rng.zipf(s, size=count) - 1) % num_rows
++
++
++def test_cache_clock_protects_this_and_previous_step():
++    rows = 60_000
++    rng = np.random.default_rng(3)
++    for capacity in (1000, 50_000):
++        slab = np.zeros((capacity, ROW), np.uint8)
++        cache = pn.PleRowCache(rows, capacity, ROW, slab=slab)
++        previous = np.zeros(0, np.int64)
++        for step in range(300):
++            cache.begin_step()
++            want = _zipf_rows(rng, int(rng.integers(1, capacity // 3)), rows)
++            slots = cache.lookup(want)
++            miss = np.unique(want[slots < 0])
++            if miss.size:
++                cache.install(miss, _synthetic_rows(miss))
++            slots = cache.row2slot[want].astype(np.int64)
++            assert (slots >= 0).all()
++            assert np.array_equal(slab[slots], _synthetic_rows(want)), f"step {step}"
++            # The previous step's rows are still where they were.
++            prev_slots = cache.row2slot[previous]
++            assert (prev_slots >= 0).all(), f"previous-step row evicted at step {step}"
++            assert np.array_equal(slab[prev_slots], _synthetic_rows(previous))
++            previous = np.unique(want)
++            # Maps stay inverse of each other.
++            live = cache.slot2row >= 0
++            assert np.array_equal(cache.row2slot[cache.slot2row[live]], np.nonzero(live)[0])
++
++
++def test_cache_hit_rate_monotone_in_capacity():
++    rows = 200_000
++    rng = np.random.default_rng(5)
++    stream = [_zipf_rows(rng, 64, rows) for _ in range(800)]
++    rates = []
++    for capacity in (512, 2048, 8192, 32768, 131072):
++        cache = pn.PleRowCache(rows, capacity, ROW, slab=None)
++        hits = total = 0
++        for want in stream:
++            cache.begin_step()
++            slots = cache.lookup(want)
++            hits += int((slots >= 0).sum())
++            total += want.shape[0]
++            miss = np.unique(want[slots < 0])
++            if miss.size:
++                cache.install(miss, None)
++        rates.append(hits / total)
++    assert all(a <= b + 1e-9 for a, b in zip(rates, rates[1:])), rates
++    print("hit rate by capacity:", [round(r, 3) for r in rates])
++
++
++def test_cache_overflow_raises_without_corruption():
++    rows = 10_000
++    capacity = 100
++    slab = np.zeros((capacity, ROW), np.uint8)
++    cache = pn.PleRowCache(rows, capacity, ROW, slab=slab)
++    cache.begin_step()
++    first = np.arange(60, dtype=np.int64)
++    cache.install(first, _synthetic_rows(first))
++    cache.begin_step()
++    second = np.arange(60, 90, dtype=np.int64)
++    cache.lookup(second)
++    cache.install(second, _synthetic_rows(second))
++    before = (cache.row2slot.copy(), cache.slot2row.copy(), slab.copy())
++    cache.begin_step()
++    third = np.arange(1000, 1080, dtype=np.int64)  # 80 new; 70 evictable (step 1 rows + 10 free)
++    cache.lookup(third)
++    try:
++        cache.install(third, _synthetic_rows(third))
++    except RuntimeError as exc:
++        assert "evictable" in str(exc)
++    else:
++        raise AssertionError("overflow did not raise")
++    assert np.array_equal(cache.row2slot, before[0])
++    assert np.array_equal(cache.slot2row, before[1])
++    assert np.array_equal(slab, before[2])
++    # A step that fits still works afterwards.
++    cache.begin_step()
++    fourth = np.arange(2000, 2030, dtype=np.int64)
++    cache.install(fourth, _synthetic_rows(fourth))
++    assert np.array_equal(slab[cache.row2slot[fourth]], _synthetic_rows(fourth))
++
++
++def test_int64_slot_offsets_beyond_13m_slots():
++    """Slots above 13,094,412 give byte offsets >= 2^31: the gather must use
++    int64 (the review's blocker). Sparse file-backed slab, few pages touched."""
++    capacity = 13_200_000
++    rows = 20_000_000
++    TMP.mkdir(parents=True, exist_ok=True)
++    path = TMP / "sparse-slab.bin"
++    slab = np.memmap(path, dtype=np.uint8, mode="w+", shape=(capacity, ROW))
++    try:
++        cache = pn.PleRowCache(rows, capacity, ROW, slab=slab)
++        cache.hand = 13_150_000
++        cache.begin_step()
++        want = np.array([5, 19_999_999, 123_456, 7_000_000], np.int64)
++        slots = cache.install(want, _synthetic_rows(want))
++        assert slots.dtype == np.int64 and (slots > 13_094_412).all(), slots
++        assert (slots * ROW >= 2**31).all()
++        # CPU reference of the kernel's address math, int64 vs int32.
++        flat = torch.from_numpy(np.asarray(slab).reshape(-1))
++        s64 = torch.from_numpy(slots)
++        got = _gather_reference(flat, s64, ROW, 0, capacity, 0, capacity)
++        assert torch.equal(got, torch.from_numpy(_synthetic_rows(want)))
++        wrapped = (s64.to(torch.int32) * ROW)  # int32 product wraps
++        assert (wrapped < 0).any() or (wrapped.to(torch.int64) != s64 * ROW).any()
++    finally:
++        del slab
++        path.unlink(missing_ok=True)
++
++
++# ---------------------------------------------------------------------------
++# 4. Gather index math (CPU reference of _lookup_ple_embedding_from_pinned_kernel)
++# ---------------------------------------------------------------------------
++
++
++def _gather_reference(weight_flat, ids, dim, tp_start, tp_end, slab_start, slab_end):
++    """Pure-torch copy of the Triton kernel's per-row semantics, over a
++    zeroed output (the caller zeroes first). ids are int64 (row or slot)."""
++    ids = ids.reshape(-1).to(torch.int64)
++    in_range = (ids >= tp_start) & (ids < tp_end)
++    local = torch.where(in_range, ids - tp_start, torch.zeros_like(ids))
++    in_slab = (ids >= slab_start) & (ids < slab_end)
++    offsets = local[:, None] * dim + torch.arange(dim)[None, :]
++    values = torch.where(in_range[:, None], weight_flat[offsets.clamp_max(weight_flat.numel() - 1)],
++                         torch.zeros((), dtype=weight_flat.dtype))
++    out = torch.zeros(ids.shape[0], dim, dtype=weight_flat.dtype)
++    out[in_slab] = values[in_slab]
++    return out
++
++
++def _fake_layout(rows_per_head=61):
++    sizes = np.array([rows_per_head + 2 * h for h in range(16)], np.int64)
++    offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
++    return {
++        "layer_multipliers": LAYOUT["layer_multipliers"],
++        "ngram_heads_vocab_sizes": sizes,
++        "ngram_heads_offsets": offsets,
++    }, int(sizes.sum())
++
++
++def test_gather_nvme_slots_equal_in_ram_path_after_allreduce():
++    layout, total = _fake_layout()
++    padded = -(-total // 64) * 64
++    path, start = _synthetic_table(padded, "gather")
++    table = torch.from_numpy(_synthetic_rows(np.arange(padded)))
++    per = padded // TP
++    rng = np.random.default_rng(9)
++    servers = []
++    stores = []
++    for rank in range(TP):
++        lo, hi = rank * per, (rank + 1) * per
++        store = pn.PleNvmeRowStore(path, start, ROW, padded, io_threads=4)
++        stores.append(store)
++        cache = pn.PleRowCache(hi - lo, 1200, ROW, slab=np.zeros((1200, ROW), np.uint8))
++        servers.append(pn.PleNvmeServer(
++            tp_start=lo, tp_end=hi,
++            multipliers=layout["layer_multipliers"], sizes=layout["ngram_heads_vocab_sizes"],
++            offsets=layout["ngram_heads_offsets"], eos_token_id=EOS, heads_per_ngram=HPN,
++            cache=cache, store=store, stats=pn.PleNvmeStats(rank, 60, False),
++        ))
++    staging = np.empty(1200 * 16, np.int64)
++    for step in range(40):
++        tokens, qsl_full, ctx, num_reqs, real = _random_batch(rng, max_reqs=6, max_len=48)
++        padded_tokens = real + int(rng.integers(0, 9))
++        ids = _host(tokens[:real], qsl_full[: num_reqs + 1], ctx, layout=layout)
++        # In-RAM (0008) path per rank: global ids over the rank's slab.
++        reduced_ram = torch.zeros(padded_tokens * 16, ROW, dtype=torch.int8)
++        reduced_nvme = torch.zeros_like(reduced_ram)
++        ids_padded = torch.full((padded_tokens, 16), -1, dtype=torch.int64)
++        ids_padded[:real] = torch.from_numpy(ids)
++        for rank, server in enumerate(servers):
++            lo, hi = rank * per, (rank + 1) * per
++            ram = _gather_reference(table[lo:hi].reshape(-1), ids_padded, ROW, lo, hi, lo, hi)
++            slots = server.resolve(tokens[:real], qsl_full[: num_reqs + 1], ctx,
++                                   padded_tokens, staging)[: padded_tokens * 16]
++            cache = server.cache
++            nvme = _gather_reference(torch.from_numpy(cache.slab.reshape(-1)),
++                                     torch.from_numpy(slots.copy()), ROW, 0, cache.capacity,
++                                     0, cache.capacity)
++            assert torch.equal(ram, nvme), f"step {step} rank {rank}"
++            reduced_ram += ram.view(torch.int8)
++            reduced_nvme += nvme.view(torch.int8)
++        want = torch.zeros(padded_tokens * 16, ROW, dtype=torch.uint8)
++        want[: real * 16] = table[torch.from_numpy(ids.reshape(-1))]
++        assert torch.equal(reduced_nvme.view(torch.uint8), want), f"step {step}"
++        assert torch.equal(reduced_ram.view(torch.uint8), want)
++    for store in stores:
++        store.close()
++
++
++# ---------------------------------------------------------------------------
++# Fault injection (reader)
++# ---------------------------------------------------------------------------
++
++
++def test_reader_retries_then_raises_with_row_and_errno():
++    rows = 60_000
++    path, start = _synthetic_table(rows, "cache")
++    store = pn.PleNvmeRowStore(path, start, ROW, rows, io_threads=1)
++    real = store._preadv
++    calls = {"n": 0}
++
++    def flaky(fd, bufs, offset):
++        calls["n"] += 1
++        if calls["n"] <= 2:
++            raise OSError(5, "Input/output error")
++        return real(fd, bufs, offset)
++
++    store._preadv = flaky
++    got = store.read_rows(np.array([17], np.int64))
++    assert np.array_equal(got, _synthetic_rows(np.array([17])))
++    assert calls["n"] == 3
++
++    def short(fd, bufs, offset):
++        return 10
++
++    store._preadv = short
++    try:
++        store.read_rows(np.array([42], np.int64))
++    except RuntimeError as exc:
++        assert "row 42" in str(exc) and "short read" in str(exc)
++    else:
++        raise AssertionError("short read did not raise")
++
++    def eio(fd, bufs, offset):
++        raise OSError(5, "Input/output error")
++
++    store._preadv = eio
++    cache = pn.PleRowCache(rows, 100, ROW, slab=np.zeros((100, ROW), np.uint8))
++    before = cache.row2slot.copy()
++    try:
++        store.read_rows(np.array([99], np.int64))
++    except RuntimeError as exc:
++        assert "row 99" in str(exc) and "errno 5" in str(exc)
++    else:
++        raise AssertionError("EIO did not raise")
++    assert np.array_equal(cache.row2slot, before)  # nothing installed
++    store.close()
++
++
++# ---------------------------------------------------------------------------
++# 1. Row-exact against the real table (reads the NVMe; keep small)
++# ---------------------------------------------------------------------------
++
++
++def _reference_rows(path: str, data_start: int, rows: np.ndarray) -> np.ndarray:
++    """mmap reads of the same rows, then drop the pages we touched."""
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        size = os.fstat(fd).st_size
++        mapped = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
++        try:
++            mapped.madvise(mmap.MADV_RANDOM)
++            out = np.empty((rows.shape[0], ROW), np.uint8)
++            for i, row in enumerate(rows.tolist()):
++                offset = data_start + ROW * row
++                out[i] = np.frombuffer(mapped[offset : offset + ROW], np.uint8)
++        finally:
++            mapped.close()
++        for row in rows.tolist():
++            page = (data_start + ROW * row) & ~4095
++            os.posix_fadvise(fd, page, 8192, os.POSIX_FADV_DONTNEED)
++    finally:
++        os.close(fd)
++    return out
++
++
++def test_row_exact_real_table_all_ranks():
++    if not os.path.exists(TABLE):
++        print("SKIP: no table at", TABLE)
++        return
++    data_start, shape, dtype = pn.safetensors_tensor_location(TABLE, "table")
++    assert dtype == "U8" and shape[1] == ROW and data_start == 4096
++    total = shape[0]
++    per = total // TP
++    per_rank = int(os.environ.get("PLE_NVME_TEST_ROWS", "400"))
++    rng = np.random.default_rng(20260929)
++    store = pn.PleNvmeRowStore(TABLE, data_start, ROW, total, io_threads=16)
++    grand = 0
++    straddlers = 0
++    t0 = time.perf_counter()
++    for rank in range(TP):
++        lo, hi = rank * per, (rank + 1) * per
++        edges = [lo, lo + 1, hi - 1, hi - 2]
++        if rank == TP - 1:
++            edges += [total - 1, 320_001_446, 320_001_445]  # last row, padding rows
++        # Rows crossing a 4 KiB page: (164 g mod 4096) > 3932.
++        cand = rng.integers(lo, hi, size=20_000)
++        cross = cand[((data_start + ROW * cand) % 4096) > 4096 - ROW][:40]
++        rows = np.unique(np.concatenate([
++            rng.integers(lo, hi, size=per_rank), np.array(edges, np.int64), cross,
++        ]))
++        straddlers += int((((data_start + ROW * rows) % 4096) > 4096 - ROW).sum())
++        cache = pn.PleRowCache(hi - lo, rows.shape[0] * 2, ROW,
++                               slab=np.zeros((rows.shape[0] * 2, ROW), np.uint8))
++        cache.begin_step()
++        local = rows - lo
++        cache.lookup(local)
++        cache.install(local, store.read_rows(rows))
++        served = cache.slab[cache.row2slot[local]]
++        want = _reference_rows(TABLE, data_start, rows)
++        assert np.array_equal(served, want), f"rank {rank}: {(served != want).any(1).sum()} rows differ"
++        scales = served[:, 160:].copy().view(np.float32)
++        assert np.isfinite(scales).all() and (scales >= 0).all()
++        grand += rows.shape[0]
++    store.close()
++    print(f"row-exact: {grand} rows over {TP} ranks ({straddlers} page-straddlers), "
++          f"{2 * grand} reads, {time.perf_counter() - t0:.2f} s")
++
++
++if __name__ == "__main__":
++    failures = 0
++    wanted = sys.argv[1:]
++    for name, fn in list(globals().items()):
++        if name.startswith("test_") and callable(fn) and (
++            not wanted or any(w in name for w in wanted)
++        ):
++            t0 = time.perf_counter()
++            try:
++                fn()
++                print(f"PASS {name} ({time.perf_counter() - t0:.2f} s)")
++            except Exception as exc:  # noqa: BLE001
++                failures += 1
++                import traceback
++
++                traceback.print_exc()
++                print(f"FAIL {name}: {exc}")
++    print("failures:", failures)
++    sys.exit(1 if failures else 0)
+From aa42e95d537667559a0d9a36ce0bbaa66404faf0 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Tue, 29 Sep 2026 20:24:26 +0000
+Subject: [PATCH] 0013b tests: native readers, prefill lookahead (simulated +
+ real I/O), bench reader knob
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/b70/bench_ple_int8_nvme.py |  23 +-
+ tests/b70/test_ple_int8_nvme.py  | 385 +++++++++++++++++++++++++++++++
+ 2 files changed, 403 insertions(+), 5 deletions(-)
+
+diff --git a/tests/b70/bench_ple_int8_nvme.py b/tests/b70/bench_ple_int8_nvme.py
+index bf31aaa..4970f1e 100644
+--- a/tests/b70/bench_ple_int8_nvme.py
++++ b/tests/b70/bench_ple_int8_nvme.py
+@@ -10,6 +10,10 @@ read from the real table with O_DIRECT. The miss rate is set by pre-installing
+ (with dummy bytes, no reads) the complement of each step's rows: 45 % miss on
+ bigram ranks, 70 % on trigram ranks (A-design §2.1 planning numbers). Reads
+ are capped (~4.5 K per run) — the disk is shared with a serving engine.
++
++0013b: B70_PLE_INT8_NVME_READER=py|native|uring picks the reader (default
++py = v1); PLE_NVME_BENCH_RANKS (default "3,0") and PLE_NVME_BENCH_SHAPES
++(default "decode,prefill") narrow a run to stay under the read budget.
+ """
+ 
+ from __future__ import annotations
+@@ -28,6 +32,9 @@ pn = t.pn
+ ROW = t.ROW
+ STEPS = int(os.environ.get("PLE_NVME_BENCH_STEPS", "30"))
+ THREADS = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
++READER = os.environ.get("B70_PLE_INT8_NVME_READER", "py")
++RANKS = [int(r) for r in os.environ.get("PLE_NVME_BENCH_RANKS", "3,0").split(",")]
++SHAPES = os.environ.get("PLE_NVME_BENCH_SHAPES", "decode,prefill").split(",")
+ 
+ 
+ def make_step(rng, seqs: int, length: int):
+@@ -106,15 +113,21 @@ def run_shape(server, label, seqs, length, miss_rate, steps, rng, io=True):
+ def main():
+     rng = np.random.default_rng(1)
+     data_start, shape, _ = pn.safetensors_tensor_location(t.TABLE, "table")
+-    store = pn.PleNvmeRowStore(t.TABLE, data_start, ROW, shape[0], io_threads=THREADS)
++    store = pn.PleNvmeRowStore(t.TABLE, data_start, ROW, shape[0], io_threads=THREADS,
++                               reader=READER)
+     total_reads = 0
+-    print(f"io_threads={THREADS}, O_DIRECT, table {t.TABLE}")
++    print(f"reader={READER}, io_threads/QD={THREADS}, O_DIRECT, table {t.TABLE}")
+     for rank, miss in ((3, 0.70), (0, 0.45)):
++        if rank not in RANKS:
++            continue
+         server = server_for(rank, store)
+         kind = "trigram" if rank >= 2 else "bigram"
+-        for seqs in (1, 4, 8):
+-            total_reads += run_shape(server, f"rank {rank} ({kind}) decode {seqs} seq",
+-                                     seqs, 1, miss, STEPS, rng)
++        if "decode" in SHAPES:
++            for seqs in (1, 4, 8):
++                total_reads += run_shape(server, f"rank {rank} ({kind}) decode {seqs} seq",
++                                         seqs, 1, miss, STEPS, rng)
++        if "prefill" not in SHAPES:
++            continue
+         if rank == 3:
+             total_reads += run_shape(server, f"rank {rank} ({kind}) prefill 1024",
+                                      1, 1024, miss, 1, rng)
+diff --git a/tests/b70/test_ple_int8_nvme.py b/tests/b70/test_ple_int8_nvme.py
+index 25b172b..fe488e2 100644
+--- a/tests/b70/test_ple_int8_nvme.py
++++ b/tests/b70/test_ple_int8_nvme.py
+@@ -29,6 +29,7 @@ import json
+ import mmap
+ import os
+ import sys
++import threading
+ import time
+ from pathlib import Path
+ 
+@@ -613,6 +614,390 @@ def test_row_exact_real_table_all_ranks():
+           f"{2 * grand} reads, {time.perf_counter() - t0:.2f} s")
+ 
+ 
++
++# ---------------------------------------------------------------------------
++# 0013b: native readers (C pthread pool / io_uring)
++# ---------------------------------------------------------------------------
++
++
++def _straddlers(rng, lo, hi, count, data_start=4096):
++    cand = rng.integers(lo, hi, size=50 * count)
++    return cand[((data_start + ROW * cand) % 4096) > 4096 - ROW][:count]
++
++
++def test_native_readers_row_exact_synthetic():
++    rows = 60_000
++    path, start = _synthetic_table(rows, "cache")
++    rng = np.random.default_rng(31)
++    ids = np.concatenate([
++        rng.integers(0, rows, size=700), _straddlers(rng, 0, rows, 60),
++        np.array([0, 1, rows - 2, rows - 1], np.int64),  # last row: short read at EOF
++    ])
++    for reader, kwargs in (("native", {"io_threads": 1}), ("native", {"io_threads": 16}),
++                           ("uring", {"queue_depth": 1}), ("uring", {"queue_depth": 4}),
++                           ("uring", {"queue_depth": 64})):
++        # max_batch_rows 128: several native calls per read_rows.
++        store = pn.PleNvmeRowStore(path, start, ROW, rows, reader=reader,
++                                   max_batch_rows=128, **kwargs)
++        lat: list = []
++        got = store.read_rows(ids, latencies=lat)
++        assert np.array_equal(got, _synthetic_rows(ids)), (reader, kwargs)
++        assert store.native_retries == 0, (reader, kwargs)
++        lat = np.concatenate(lat)
++        assert lat.shape[0] == ids.shape[0] and (lat > 0).all() and (lat < 5).all()
++        assert store.read_rows(np.empty(0, np.int64)).shape == (0, ROW)
++        store.close()
++
++
++def test_native_reader_failures_go_through_retry_path():
++    rows = 60_000
++    path, start = _synthetic_table(rows, "cache")
++    for reader in ("native", "uring"):
++        store = pn.PleNvmeRowStore(path, start, ROW, rows, reader=reader, io_threads=4)
++        bad_fd = os.open(path, os.O_WRONLY)  # every native pread fails (EBADF)
++        try:
++            store._native_fd = bad_fd
++            ids = np.array([5, 17, 4000, rows - 1], np.int64)
++            got = store.read_rows(ids)
++            assert np.array_equal(got, _synthetic_rows(ids)), reader
++            assert store.native_retries == ids.shape[0], reader
++
++            def eio(fd, bufs, offset):
++                raise OSError(5, "Input/output error")
++
++            store._preadv = eio
++            try:
++                store.read_rows(np.array([99], np.int64))
++            except RuntimeError as exc:
++                assert "row 99" in str(exc) and "errno 5" in str(exc), exc
++            else:
++                raise AssertionError(f"{reader}: EIO did not raise")
++        finally:
++            store._native_fd = store.fd
++            os.close(bad_fd)
++            store.close()
++    try:
++        pn.PleNvmeRowStore(path, start, ROW, rows, reader="spdk")
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("unknown reader accepted")
++
++
++def test_native_readers_row_exact_real_table():
++    """native and uring vs v1's O_DIRECT py reader (itself checked against
++    the mmap by test_row_exact_real_table_all_ranks), all 4 rank ranges."""
++    if not os.path.exists(TABLE):
++        print("SKIP: no table at", TABLE)
++        return
++    data_start, shape, _ = pn.safetensors_tensor_location(TABLE, "table")
++    total = shape[0]
++    per = total // TP
++    per_rank = int(os.environ.get("PLE_NVME_TEST_ROWS_NATIVE", "150"))
++    rng = np.random.default_rng(20260930)
++    ids = []
++    for rank in range(TP):
++        lo, hi = rank * per, (rank + 1) * per
++        ids += [rng.integers(lo, hi, size=per_rank), _straddlers(rng, lo, hi, 10),
++                np.array([lo, hi - 1], np.int64)]
++    ids = np.unique(np.concatenate(ids + [np.array([total - 1], np.int64)]))
++    ref_store = pn.PleNvmeRowStore(TABLE, data_start, ROW, total, io_threads=16)
++    want = ref_store.read_rows(ids)
++    ref_store.close()
++    for reader in ("native", "uring"):
++        store = pn.PleNvmeRowStore(TABLE, data_start, ROW, total, io_threads=16, reader=reader)
++        got = store.read_rows(ids)
++        store.close()
++        assert np.array_equal(got, want), f"{reader}: {(got != want).any(1).sum()} rows differ"
++    print(f"native row-exact: {ids.shape[0]} rows x 3 readers = {3 * ids.shape[0]} reads")
++
++
++# ---------------------------------------------------------------------------
++# 0013b: prefill lookahead
++# ---------------------------------------------------------------------------
++
++
++def test_plan_next_chunks_and_keys():
++    # One long prefill mid-way, one decode, one prefill finishing this step.
++    idx = np.array([7, 3, 9])
++    computed = np.array([1024, 50, 3000])
++    scheduled = np.array([1024, 1, 200])
++    prefill = np.array([10_000, 40, 3200])
++    plan = pn.plan_next_chunks(idx, computed, scheduled, prefill, 1024)
++    # req 3 decodes and req 9 finishes its prefill this step (so it decodes
++    # next step): 1 token of budget each; req 7 gets the other 1022.
++    assert plan == [(7, 2048, 3070)], plan
++    keys = pn.current_chunk_keys(idx, computed, scheduled, prefill)
++    assert keys == frozenset({(7, 1024), (9, 3000)}), keys
++    # Two prefills share the budget in batch order; the last one is cut.
++    plan = pn.plan_next_chunks(np.array([1, 2]), np.array([0, 0]), np.array([512, 512]),
++                               np.array([900, 5000]), 1024)
++    assert plan == [(1, 512, 900), (2, 512, 1148)], plan
++    # Nothing left to prefill: no plan.
++    assert pn.plan_next_chunks(np.array([1]), np.array([0]), np.array([64]),
++                               np.array([64]), 1024) == []
++
++
++class _SimStore:
++    """In-memory stand-in for PleNvmeRowStore: synthetic rows, and a latency of
++    ``reads / iops`` per call (sleep, GIL released) — the v1 CPU bench's
++    rank-3 point is 2,819 reads in 57.9 ms, i.e. ~49 K IOPS."""
++
++    def __init__(self, iops=49_000.0, max_batch_rows=8192):
++        self.iops = iops
++        self.max_batch_rows = max_batch_rows
++        self.reads = 0
++        self.calls = 0
++        self._lock = threading.Lock()
++
++    def read_rows(self, rows, out=None, latencies=None):
++        rows = np.asarray(rows, np.int64)
++        time.sleep(rows.shape[0] / self.iops)
++        with self._lock:
++            self.reads += int(rows.shape[0])
++            self.calls += 1
++        if latencies is not None:
++            latencies.append(np.full(rows.shape[0], 1 / self.iops))
++        return _synthetic_rows(rows)
++
++    def close(self):
++        pass
++
++
++def _sim_server(rank, layout, total, store, capacity):
++    per = -(-total // TP)
++    lo, hi = rank * per, min(total, (rank + 1) * per)
++    cache = pn.PleRowCache(hi - lo, capacity, ROW, slab=np.zeros((capacity, ROW), np.uint8))
++    return pn.PleNvmeServer(
++        tp_start=lo, tp_end=hi, multipliers=layout["layer_multipliers"],
++        sizes=layout["ngram_heads_vocab_sizes"], offsets=layout["ngram_heads_offsets"],
++        eos_token_id=EOS, heads_per_ngram=HPN, cache=cache, store=store,
++        stats=pn.PleNvmeStats(rank, 1e9, True),
++    )
++
++
++def _check_served(server, tokens, qsl, ctx, out, num_tokens, layout):
++    """Every own (token, head) slot holds exactly its row; the rest is -1."""
++    ids = _host(tokens, qsl, ctx, layout=layout)
++    view = out[: num_tokens * 16].reshape(num_tokens, 16)
++    own = (ids >= server.tp_start) & (ids < server.tp_end)
++    assert (view[~own] == -1).all()
++    slots = view[own]
++    assert (slots >= 0).all()
++    assert np.array_equal(server.cache.slab[slots], _synthetic_rows(ids[own])), "bytes differ"
++
++
++def _run_prefill_sim(*, lookahead, chunk_ms, chunks=6, chunk=1024, rank=3, iops=49_000.0,
++                     seed=5, mispredict_at=None, decode_req=False):
++    """One long prompt, prefilled chunk by chunk as the V2 runner does:
++    hook(k) [take + resolve + submit(k+1)] then the GPU forward (sleep)."""
++    layout, total = _fake_layout(rows_per_head=400_000)
++    rng = np.random.default_rng(seed)
++    prompt = rng.integers(0, VOCAB, size=chunks * chunk).astype(np.int64)
++    prompt[rng.random(prompt.shape[0]) < 0.01] = EOS
++    hook_store, la_store = _SimStore(iops), _SimStore(iops)
++    server = _sim_server(rank, layout, total, hook_store, capacity=200_000)
++    la = pn.PleLookahead(server, la_store, sub_batch=256,
++                         max_rows=chunk * 5) if lookahead else None
++    out = np.empty((chunk + 8) * 16, np.int64)
++    per_chunk = []
++    req = 4
++    dec_tok = int(rng.integers(0, VOCAB))
++    computed = 0
++    for k in range(chunks):
++        start = computed
++        n = chunk
++        if mispredict_at is not None and k == mispredict_at:
++            n = chunk // 2  # the scheduler gives less than predicted
++        n = min(n, prompt.shape[0] - start)
++        toks = prompt[start : start + n]
++        ctx = np.full((1, 2), EOS, np.int64)
++        before = min(2, start)
++        if before:
++            ctx[0, 2 - before :] = prompt[start - before : start]
++        tokens, qsl, ctxs = toks, np.array([0, n]), ctx
++        idx = np.array([req])
++        comp = np.array([start])
++        sched = np.array([n])
++        pre = np.array([prompt.shape[0]])
++        if decode_req:  # a decoding request rides along (1 token/step)
++            tokens = np.concatenate([[dec_tok], toks])
++            qsl = np.array([0, 1, n + 1])
++            ctxs = np.vstack([np.array([[11, 12]]), ctx])
++            idx, comp = np.array([1, req]), np.array([10_000 + k, start])
++            sched, pre = np.array([1, n]), np.array([100, prompt.shape[0]])
++        t0 = time.perf_counter()
++        reads0, pre0 = hook_store.reads, server.stats.total_prefetched
++        keys = pn.current_chunk_keys(idx, comp, sched, pre)
++        prefetched, wait_ms = (la.take(keys) if la else (None, 0.0))
++        server.resolve(tokens, qsl, ctxs, tokens.shape[0] + 3, out,
++                       prefetched=prefetched, wait_ms=wait_ms)
++        hook_ms = (time.perf_counter() - t0) * 1e3
++        _check_served(server, tokens, qsl, ctxs, out, tokens.shape[0], layout)
++        if la:
++            plan = pn.plan_next_chunks(idx, comp, sched, pre, chunk)
++            if plan:
++                r, s0, e0 = plan[0]
++                assert r == req and s0 == start + n
++                nctx = np.full((1, 2), EOS, np.int64)
++                nb = min(2, s0)
++                nctx[0, 2 - nb :] = prompt[s0 - nb : s0]
++                la.submit(frozenset({(r, s0)}), prompt[s0:e0], np.array([0, e0 - s0]), nctx)
++        per_chunk.append({"reads": hook_store.reads - reads0,
++                          "prefetched": server.stats.total_prefetched - pre0,
++                          "wait_ms": wait_ms, "hook_ms": hook_ms})
++        computed += n
++        time.sleep(chunk_ms / 1e3)  # the forward of chunk k
++        if computed >= prompt.shape[0]:
++            break
++    if la:
++        la.close()
++    return per_chunk, server, la
++
++
++def test_lookahead_hides_prefill_reads_simulated():
++    off, s_off, _ = _run_prefill_sim(lookahead=False, chunk_ms=218)
++    on, s_on, la = _run_prefill_sim(lookahead=True, chunk_ms=218)
++    fmt = lambda rows: ", ".join(  # noqa: E731
++        f"{r['reads']}r/{r['prefetched']}p/{r['hook_ms']:.1f}ms" for r in rows)
++    print("  off (hook reads/prefetched/hook ms):", fmt(off))
++    print("  on  (hook reads/prefetched/hook ms):", fmt(on))
++    assert on[0]["reads"] == off[0]["reads"] > 1000  # no lookahead for chunk 0
++    for k in range(1, len(on)):
++        assert off[k]["reads"] > 1000, off[k]
++        assert on[k]["reads"] <= 5, on[k]  # ~0: all misses came from the lookahead
++        assert on[k]["prefetched"] >= 0.95 * off[k]["reads"], (on[k], off[k])
++        assert on[k]["wait_ms"] < 5.0, on[k]
++        assert on[k]["hook_ms"] < 0.5 * off[k]["hook_ms"], (on[k], off[k])
++    # Same rows ended up in both caches' maps (row-exact checked per step).
++    assert la.cancelled == 0 and la.errors == 0
++
++
++def test_lookahead_short_chunk_time_waits_no_duplicate_reads():
++    """Chunk time too short for the reads: the hook waits for the job
++    instead of reading the same rows again; every miss is read exactly once."""
++    on, server, la = _run_prefill_sim(lookahead=True, chunk_ms=5, chunks=4)
++    for k in range(1, len(on)):
++        assert on[k]["wait_ms"] > 5.0, on[k]
++        assert on[k]["reads"] <= 5, on[k]
++    assert la.cancelled == 0
++
++
++def test_lookahead_mispredicted_and_mixed_batches_stay_exact():
++    # The scheduler gives half the predicted chunk at k=2, so the chunk after
++    # it starts elsewhere: that job is cancelled (or finishes unused) and the
++    # hook reads what it needs; bytes stay exact at every step (checked inside).
++    rows, server, la = _run_prefill_sim(lookahead=True, chunk_ms=60, chunks=5,
++                                        mispredict_at=2, decode_req=True)
++    assert rows[3]["reads"] > 0 or rows[3]["prefetched"] > 0
++    # The step after the short chunk found no matching job key.
++    assert la.submitted >= 4
++
++
++def test_lookahead_cancel_when_prediction_misses():
++    """A job whose predicted chunk is not in this step is cancelled within
++    one sub-batch; what it finished is still usable (exact) data."""
++    layout, total = _fake_layout(rows_per_head=400_000)
++    store = _SimStore(iops=5_000.0)  # slow: 256 reads = ~51 ms per sub-batch
++    server = _sim_server(3, layout, total, _SimStore(), capacity=50_000)
++    la = pn.PleLookahead(server, store, sub_batch=256)
++    rng = np.random.default_rng(8)
++    toks = rng.integers(0, VOCAB, size=1024).astype(np.int64)
++    la.submit(frozenset({(0, 4096)}), toks, np.array([0, 1024]), np.full((1, 2), EOS))
++    time.sleep(0.08)
++    t0 = time.perf_counter()
++    got, wait_ms = la.take(frozenset({(5, 0)}))
++    took = (time.perf_counter() - t0) * 1e3
++    assert la.cancelled == 1
++    assert took < 120, took  # at most the sub-batch in flight, not the job (~800 ms)
++    assert got is not None and got[0].shape[0] < 1024 * 4
++    assert np.array_equal(got[1], _synthetic_rows(got[0] + server.tp_start))
++    assert la.take(frozenset()) == (None, 0.0)  # nothing pending any more
++    la.close()
++
++
++def test_lookahead_install_never_evicts_this_steps_hits():
++    """Rows cached at job time and needed by step k+1 stay hits even when the
++    prefetched extras (not needed this step) fill the cache: the lookup marks
++    them first, the extras can only take older slots, and a step's misses are
++    placed before the extras."""
++    layout, total = _fake_layout(rows_per_head=400_000)
++    store = _SimStore()
++    server = _sim_server(3, layout, total, store, capacity=64)
++    cache = server.cache
++    local_rows = np.arange(1000, 1000 + 40, dtype=np.int64)
++    # Step 1..3: cache 40 rows, then age them (two empty steps).
++    cache.begin_step()
++    cache.install(local_rows, _synthetic_rows(local_rows + server.tp_start))
++    cache.begin_step()
++    cache.begin_step()
++    # Step k+1: needs 8 of them (hits) + 8 new rows (in prefetched), and the
++    # lookahead also brought 40 rows this step does not use.
++    need_hit = local_rows[:8]
++    need_new = np.arange(50_000, 50_008, dtype=np.int64)
++    extra = np.arange(60_000, 60_040, dtype=np.int64)
++    pre_rows = np.sort(np.concatenate([need_new, extra]))
++    pre = (pre_rows, _synthetic_rows(pre_rows + server.tp_start))
++    # Resolve directly on own rows: fake a hash that returns our rows.
++    wanted = np.concatenate([need_hit, need_new]) + server.tp_start
++    server.hash = lambda tokens, qsl, ctx, heads=None: np.repeat(
++        wanted[:, None], len(server.own_heads) if heads is not None else 16, axis=1)
++    out = np.empty(16 * 16, np.int64)
++    reads0 = store.reads
++    server.resolve(np.zeros(16, np.int64), np.array([0, 16]), np.full((1, 2), EOS),
++                   16, out, prefetched=pre)
++    assert store.reads == reads0, "a needed row was read instead of hit/prefetched"
++    slots = cache.row2slot[wanted - server.tp_start]
++    assert (slots >= 0).all()
++    assert np.array_equal(cache.slab[slots], _synthetic_rows(wanted))
++    # Capacity 64: 40 old + 8 new + 40 extras cannot all fit; some extras are
++    # dropped or old rows evicted, never this step's 16.
++    assert server.extra_installed + server.extra_dropped == 40
++    assert (cache.epoch[slots] == cache.step).all()
++
++
++def test_lookahead_real_io_uring_synthetic():
++    """End-to-end on real O_DIRECT reads (io_uring reader, synthetic table,
++    ~1-2 K reads): rows exact, hook reads ~0 after chunk 0."""
++    rows_total = 60_000
++    path, start = _synthetic_table(rows_total, "cache")
++    layout, total = _fake_layout(rows_per_head=(rows_total - 240) // 16)
++    assert total <= rows_total
++    hook_store = pn.PleNvmeRowStore(path, start, ROW, rows_total, reader="uring", io_threads=16)
++    la_store = pn.PleNvmeRowStore(path, start, ROW, rows_total, reader="uring", io_threads=16,
++                                  max_batch_rows=256)
++    server = _sim_server(3, layout, total, hook_store, capacity=20_000)
++    la = pn.PleLookahead(server, la_store, max_rows=256 * 5)
++    rng = np.random.default_rng(77)
++    prompt = rng.integers(0, VOCAB, size=4 * 256).astype(np.int64)
++    out = np.empty(300 * 16, np.int64)
++    reads = []
++    for k in range(4):
++        s0 = 256 * k
++        ctx = np.full((1, 2), EOS, np.int64)
++        b = min(2, s0)
++        if b:
++            ctx[0, 2 - b :] = prompt[s0 - b : s0]
++        toks = prompt[s0 : s0 + 256]
++        r0 = server.stats.total_reads
++        prefetched, wait_ms = la.take(frozenset({(0, s0)}))
++        server.resolve(toks, np.array([0, 256]), ctx, 256, out, prefetched=prefetched,
++                       wait_ms=wait_ms)
++        _check_served(server, toks, np.array([0, 256]), ctx, out, 256, layout)
++        reads.append(server.stats.total_reads - r0)
++        if k < 3:
++            e0 = s0 + 512
++            nctx = prompt[s0 + 254 : s0 + 256][None, :]
++            la.submit(frozenset({(0, s0 + 256)}), prompt[s0 + 256 : e0],
++                      np.array([0, 256]), nctx)
++        time.sleep(0.1)
++    la.close()
++    hook_store.close()
++    print(f"  hook reads per chunk: {reads}, lookahead read {la.rows_read}")
++    assert reads[0] > 100 and all(r <= 5 for r in reads[1:]), reads
++
++
++
+ if __name__ == "__main__":
+     failures = 0
+     wanted = sys.argv[1:]

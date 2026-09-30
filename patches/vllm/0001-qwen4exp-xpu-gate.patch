@@ -1,0 +1,45 @@
+From 481a16c00e31c06ee9dc98d25f383d88f213c9dc Mon Sep 17 00:00:00 2001
+From: wu1ff <197699991+wu1ff@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:16:53 +0000
+Subject: [PATCH] 0001-qwen4exp-xpu-gate
+
+P1 XPU gate narrowing
+
+Purpose:  Qwen4Exp raises NotImplementedError on XPU at every official ref (v0.29.0..main 73859fec). Narrow the
+          raise to TPU only so XPU falls through to the nvidia/ backend.
+Depends:  none (first in series). Everything below is unreachable on XPU without it.
+Base:     vLLM v0.30.0 (tag commit ced6857afa0ea7b2e3f0846a62e1394e90f15607), as installed in
+          docker.io/vllm/vllm-openai-xpu:v0.30.0 (amd64 sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9).
+          The installed site-packages files and /workspace/vllm source copies are byte-identical to the tag
+          (checked 2026-09-28, base layers sha256:8439dd1b... and sha256:8fcb7387...).
+Origin:   wu1ff B70-LLM-Controller pack Qwen3.8-Flash-Next 1.0.0/1.0.1 (MIT), image
+          ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122 (amd64 sha256:761f215485ab9da27816366c65222465ba6dbf8acb2000641774ed698ce589f8)
+Method:   re-derived as a unified diff from wu1ff's whole-file overlay (their overlay minus upstream v0.30.0).
+          Applying this patch to v0.30.0 reproduces wu1ff's file byte-for-byte; the Dockerfile asserts the sha256.
+Apply:    patch -p1 --fuzz=0 from the directory that CONTAINS vllm/ (site-packages AND /workspace/vllm).
+Files (wu1ff image layer digests, site-packages / workspace copy):
+  vllm/models/qwen4_exp/__init__.py <- layer sha256:717f200c1f4117c6adcb9459cae05f40edab3dd563699e73af6110cdf922fc2b (site) / sha256:f0346b241585c3b3a4da267757a94d4e5c890b7d0de79de41bca98fb3f4af7a8 (workspace)
+---
+ vllm/models/qwen4_exp/__init__.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/__init__.py b/vllm/models/qwen4_exp/__init__.py
+index 9e533e2..6a4fc6a 100644
+--- a/vllm/models/qwen4_exp/__init__.py
++++ b/vllm/models/qwen4_exp/__init__.py
+@@ -27,8 +27,13 @@ def __getattr__(name: str) -> Any:
+     }:
+         from vllm.platforms import current_platform
+ 
+-        if current_platform.is_xpu() or current_platform.is_tpu():
+-            raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
++        # B70 XPU bring-up: XPU falls through to the nvidia backend below,
++        # whose compute path is XPU-first-class on v0.30 (WnA16 linear/MoE,
++        # GDN, and FA kernels are all registered for XPU upstream).
++        if current_platform.is_tpu():
++            raise NotImplementedError(
++                "Qwen4Exp currently supports CUDA, ROCm, and XPU only"
++            )
+         if current_platform.is_rocm():
+             from .amd.model import (
+                 Qwen4ExpForCausalLM,

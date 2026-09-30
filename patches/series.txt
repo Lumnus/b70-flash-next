@@ -1,0 +1,34 @@
+# patches/series.txt — which published file each fork commit is exported to.
+#
+# Source of truth: github.com/Lumnus/vllm, branch b70/v0.30.0 — one commit per patch on top of vLLM v0.30.0
+# (ced6857afa0ea7b2e3f0846a62e1394e90f15607). scripts/export-series.sh writes patches/vllm/ and
+# patches/vllm-tests/ from that branch; scripts/check-series.sh fails if the files here differ from a fresh export.
+#
+# Key = the first word of the commit subject (without a trailing ':').
+#   vllm file:  the commit's changes under vllm/ (`git format-patch -1 -- vllm/`). The image applies these in
+#               filename order (LC_ALL=C).
+#   tests file: the commit's changes under tests/ (`git format-patch -1 -- tests/`), appended in branch order.
+#               Never applied to the image.
+#
+# key                                                vllm file                                                tests file
+0001-qwen4exp-xpu-gate                               0001-qwen4exp-xpu-gate.patch                             -
+0002-qwen4exp-ple-pinned-host-uva-and-capture-stream 0002-qwen4exp-ple-pinned-host-uva-and-capture-stream.patch -
+0003-qwen4exp-hc-down-gemm-ksplit                    0003-qwen4exp-hc-down-gemm-ksplit.patch                  -
+0004-gdn-spec-metadata-fusion                        0004-gdn-spec-metadata-fusion.patch                      -
+0005-xpu-ops-gdn-index64-hook                        0005-xpu-ops-gdn-index64-hook.patch                      -
+0006-b70-ple-direct-pinned-load                      0006-b70-ple-direct-pinned-load.patch                    -
+0007-b70-ple-fp8-pinned-table                        0007-b70-ple-fp8-pinned-table.patch                      -
+0008-b70-ple-int8-rowscale-pinned-table              0008-b70-ple-int8-rowscale-pinned-table.patch            -
+0009-b70-thinking-budget-per-requested-effort        0009-b70-thinking-budget-per-requested-effort.patch      -
+0010-b70-default-repetition-detection                0010-b70-default-repetition-detection.patch              -
+0012-b70-reasoning-effort-alias                      0012-b70-reasoning-effort-alias.patch                    -
+0013-b70-ple-int8-nvme-table                         0013-b70-ple-int8-nvme-table.patch                       -
+0013                                                 -                                                        0013-b70-ple-int8-nvme-tests.patch
+0013b-b70-ple-int8-nvme-lookahead                    0013b-b70-ple-int8-nvme-lookahead.patch                  -
+0013b                                                -                                                        0013-b70-ple-int8-nvme-tests.patch
+0014a-b70-offload-trace                              0014a-b70-offload-trace.patch                            0014-b70-offload-tests.patch
+0014b-b70-offload-junction                           0014b-b70-offload-junction.patch                         0014-b70-offload-tests.patch
+0014c-b70-offload-gdn-backstep                       0014c-b70-offload-gdn-backstep.patch                     0014-b70-offload-tests.patch
+0014d-b70-offload-empty-advance-guard                0014d-b70-offload-empty-advance-guard.patch              0014-b70-offload-tests.patch
+0014e-b70-offload-group-evict                        0014e-b70-offload-group-evict-51787.patch                0014-b70-offload-tests.patch
+0014f-b70-offload-gates                              0014f-b70-offload-gates.patch                            0014-b70-offload-tests.patch

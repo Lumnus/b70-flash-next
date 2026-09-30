@@ -1,0 +1,436 @@
+From de3768bd41805aee97461e971eced8247d7a141a Mon Sep 17 00:00:00 2001
+From: wu1ff <197699991+wu1ff@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 17:16:53 +0000
+Subject: [PATCH] 0002-qwen4exp-ple-pinned-host-uva-and-capture-stream
+
+P2 + P3 PLE pinned-host 2-slab UVA + FULL-capture stream fix
+
+Purpose:  P2: on XPU with PLE_TABLE_PATH set, mmap ple_table_qwen4exp.pt, split each TP shard into 2 pinned slabs
+          (< 2^34 B each; torch 2.13+xpu returns pageable memory above that), UVA view per slab, slab-masked
+          Triton lookup. P3: under FULL XPU-graph capture run the prefetch lookup on the capture stream and skip
+          the cross-stream wait_stream join (L0 graph build rejects out-of-graph event deps).
+          This is wu1ff's SECOND revision of the file (2026-09-25, 45,872 B); the first (44,866 B, layer
+          sha256:717f200c...) is superseded and not reproduced.
+Depends:  0001 (the code is only reached when XPU passes the gate).
+Base:     vLLM v0.30.0 (tag commit ced6857afa0ea7b2e3f0846a62e1394e90f15607), as installed in
+          docker.io/vllm/vllm-openai-xpu:v0.30.0 (amd64 sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9).
+          The installed site-packages files and /workspace/vllm source copies are byte-identical to the tag
+          (checked 2026-09-28, base layers sha256:8439dd1b... and sha256:8fcb7387...).
+Origin:   wu1ff B70-LLM-Controller pack Qwen3.8-Flash-Next 1.0.0/1.0.1 (MIT), image
+          ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52c09fa660a2e7fe441417129e7c47fac727fd85f66ccea6b65e0a9122 (amd64 sha256:761f215485ab9da27816366c65222465ba6dbf8acb2000641774ed698ce589f8)
+Method:   re-derived as a unified diff from wu1ff's whole-file overlay (their overlay minus upstream v0.30.0).
+          Applying this patch to v0.30.0 reproduces wu1ff's file byte-for-byte; the Dockerfile asserts the sha256.
+Apply:    patch -p1 --fuzz=0 from the directory that CONTAINS vllm/ (site-packages AND /workspace/vllm).
+Files (wu1ff image layer digests, site-packages / workspace copy):
+  vllm/models/qwen4_exp/nvidia/ngram_embedding.py <- layer sha256:57a3b9ae55b433a5d79b1fb865f0436612ffc3ab8751c1bd5a2a81d50c53b24a (site) / sha256:6592f8879b7eee9a59486329dd71611564bef2b7484c6164bb1da7ed01b2949f (workspace)
+---
+ .../qwen4_exp/nvidia/ngram_embedding.py       | 283 ++++++++++++++++--
+ 1 file changed, 259 insertions(+), 24 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 84c4e7c..0375bfd 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
+ from collections.abc import Iterable
+ from typing import ClassVar
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -19,6 +21,10 @@ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+     QuantizeMethodBase,
+ )
++from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
++    CompressedTensorsConfig,
++    should_ignore_layer,
++)
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+ from vllm.model_executor.layers.quantization.modelopt import (
+     ModelOptMixedPrecisionConfig,
+@@ -49,6 +55,12 @@ from .ops.ple import ple_ngram_ids
+ logger = init_logger(__name__)
+ 
+ 
++def _is_xpu() -> bool:
++    from vllm.platforms import current_platform
++
++    return current_platform.is_xpu()
++
++
+ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
+     """ETP-sharded PLE table shared by device and pinned-host backends."""
+ 
+@@ -183,6 +195,23 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+             quant_config, ModelOptQuantConfigBase
+         ) and quant_config.is_layer_excluded(prefix):
+             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++        if isinstance(quant_config, CompressedTensorsConfig):
++            # W4A16 pack-quantized checkpoints exclude the PLE embedding
++            # through the compressed-tensors ignore list (e.g.
++            # "re:.*\.ple\..*"); those tables are bf16 and load
++            # unquantized. A table that is NOT excluded has no supported
++            # compressed-tensors serialization here.
++            if should_ignore_layer(
++                prefix,
++                ignore=quant_config.ignore,
++                fused_mapping=quant_config.packed_modules_mapping,
++            ):
++                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++            raise NotImplementedError(
++                "Qwen4Exp PLE embedding is not in the compressed-tensors "
++                "ignore list; compressed-tensors PLE quantization is not "
++                "supported"
++            )
+         if not isinstance(quant_config, Fp8Config):
+             raise NotImplementedError(
+                 "Qwen4Exp PLE embedding does not support quantization config "
+@@ -362,16 +391,24 @@ def _lookup_ple_embedding_from_pinned_kernel(
+     embedding_dim,
+     tp_vocab_start,
+     tp_vocab_end,
++    slab_start,
++    slab_end,
+     BLOCK_D: tl.constexpr,
+ ):
+-    """Look up TP-owned PLE rows through a CUDA view of pinned host memory."""
++    """Look up TP-owned PLE rows through an accelerator view of pinned memory.
++
++    One launch covers one pinned slab whose rows are global ids in
++    [slab_start, slab_end); rows outside the slab are not stored so a
++    caller looping over slabs writes each row exactly once.
++    """
+     row_id = tl.program_id(0)
+     global_idx = tl.load(ids_ptr + row_id)
+     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
++    in_slab = (global_idx >= slab_start) & (global_idx < slab_end)
+     offsets = tl.arange(0, BLOCK_D)
+-    store_mask = offsets < embedding_dim
+-    load_mask = store_mask & in_range
++    store_mask = (offsets < embedding_dim) & in_slab
++    load_mask = (offsets < embedding_dim) & in_range
+     values = tl.load(
+         weight_ptr + local_idx * embedding_dim + offsets,
+         mask=load_mask,
+@@ -415,15 +452,32 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             max_total_tokens=max_total_tokens,
+             data_parallel_rank=data_parallel_rank,
+         )
+-        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
+         self._block_d = triton.next_power_of_2(self.embedding_dim)
+-        self._prefetch_stream = torch.cuda.Stream(device=self._uva_weight.device)
++        # XPU mirrors the CUDA stream API (Stream/current_stream/stream and
++        # Tensor.record_stream all exist on torch 2.13.0+xpu). XPU pins at
++        # most 16 GiB (2^34 B) per allocation, so a TP shard larger than
++        # that cannot be one pinned tensor: the weight stays pageable here
++        # and _materialize_pinned_xpu_slabs splits it after loading.
++        self._xpu_slabs: list[torch.Tensor] | None = None
++        self._xpu_slab_views: list[torch.Tensor] | None = None
++        self._xpu_slab_rows = 0
++        self._xpu_shard_rows = 0
++        if _is_xpu():
++            self._uva_weight = None
++            self._stream_mod = torch.xpu
++            self._prefetch_stream = torch.xpu.Stream()
++        else:
++            self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
++            self._stream_mod = getattr(torch, self._uva_weight.device.type)
++            self._prefetch_stream = self._stream_mod.Stream(
++                device=self._uva_weight.device
++            )
+         self._prefetch_buffer = torch.empty(
+             max_total_tokens * self.etp_data_parallel_size,
+             num_ngram_heads,
+             self.embedding_dim,
+             dtype=self.weight.dtype,
+-            device=self._uva_weight.device,
++            device=("xpu" if _is_xpu() else self._uva_weight.device),
+         )
+         self._output_dim = num_ngram_heads * self.embedding_dim
+ 
+@@ -433,7 +487,18 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         embedding_dim: int,
+         dtype: torch.dtype,
+     ) -> torch.Tensor:
+-        """Allocate the complete PLE weight directly in pinned CPU memory."""
++        """Allocate the complete PLE weight in host memory.
++
++        CUDA keeps the stock single pinned allocation. On XPU, torch
++        (2.13.0+xpu) silently returns *non-pinned* memory for pinned
++        requests above 2^34 bytes and the UVA-view op then faults, so the
++        TP shard is allocated pageable here and re-materialized into
++        <=2^34-byte pinned slabs after the rows are loaded.
++        """
++        if _is_xpu():
++            return torch.empty(
++                num_embeddings, embedding_dim, dtype=dtype, device="cpu"
++            )
+         return torch.empty(
+             num_embeddings,
+             embedding_dim,
+@@ -442,6 +507,52 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             pin_memory=True,
+         )
+ 
++    def _materialize_pinned_xpu_slabs(self) -> None:
++        """Copy the loaded shard into pinned slabs with UVA views (XPU)."""
++        if self._xpu_slabs is not None:
++            return
++        shard = self.weight
++        shard_rows = shard.shape[0]
++        itemsize = shard.element_size()
++        dim = shard.shape[1]
++        # Keep every slab safely under the 2^34-byte pinned ceiling.
++        slab_rows_limit = ((1 << 34) - (1 << 26)) // (dim * itemsize)
++        num_slabs = max(1, -(-shard_rows // slab_rows_limit))
++        slab_rows = -(-shard_rows // num_slabs)
++        tp_start = self.shard_indices.org_vocab_start_index
++        slabs: list[torch.Tensor] = []
++        views: list[torch.Tensor] = []
++        self._xpu_slab_rows = slab_rows
++        self._xpu_shard_rows = shard_rows
++        for index in range(num_slabs):
++            start = index * slab_rows
++            rows = min(slab_rows, shard_rows - start)
++            if rows <= 0:
++                break
++            slab = torch.empty(rows, dim, dtype=shard.dtype, pin_memory=True)
++            if not slab.is_pinned():
++                raise RuntimeError(
++                    f"PLE pinned slab {index} ({rows * dim * itemsize / 2**30:.1f}"
++                    " GiB) silently failed to pin on XPU"
++                )
++            slab.copy_(shard.narrow(0, start, rows))
++            slabs.append(slab)
++            views.append(get_accelerator_view_from_cpu_tensor(slab))
++        self._xpu_slabs = slabs
++        self._xpu_slab_views = views
++        logger.info(
++            "Materialized PLE pinned-host slabs: %d slabs x %d rows "
++            "(shard %d rows, tp range [%d, %d))",
++            len(slabs),
++            slab_rows,
++            shard_rows,
++            tp_start,
++            self.shard_indices.org_vocab_end_index,
++        )
++        # Free the transient pageable copy now that every row lives in a
++        # pinned slab; the forward path only reads the slab views.
++        shard.data = torch.empty(0, dim, dtype=shard.dtype)
++
+     def _lookup(
+         self,
+         input_ids: torch.Tensor,
+@@ -467,15 +578,47 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+ 
+         flat_ids = input_ids.reshape(-1).long()
+         if flat_ids.numel():
+-            _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+-                self._uva_weight,
+-                flat_ids,
+-                output,
+-                self.embedding_dim,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                BLOCK_D=self._block_d,
+-            )
++            tp_start = self.shard_indices.org_vocab_start_index
++            tp_end = self.shard_indices.org_vocab_end_index
++            if self._xpu_slab_views is not None:
++                # Rows owned by other ETP ranks are zero-contributions in
++                # the all-reduce; no slab stores them, so zero first. Each
++                # slab launch indexes rows against the slab's own bounds:
++                # local_idx = id - slab_start stays inside the slab view.
++                output.zero_()
++                for index, view in enumerate(self._xpu_slab_views):
++                    slab_start = tp_start + index * self._xpu_slab_rows
++                    slab_end = tp_start + min(
++                        (index + 1) * self._xpu_slab_rows, self._xpu_shard_rows
++                    )
++                    _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
++                        view,
++                        flat_ids,
++                        output,
++                        self.embedding_dim,
++                        slab_start,
++                        slab_end,
++                        slab_start,
++                        slab_end,
++                        BLOCK_D=self._block_d,
++                    )
++            elif self._uva_weight is not None:
++                _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
++                    self._uva_weight,
++                    flat_ids,
++                    output,
++                    self.embedding_dim,
++                    tp_start,
++                    tp_end,
++                    tp_start,
++                    tp_end,
++                    BLOCK_D=self._block_d,
++                )
++            else:
++                raise RuntimeError(
++                    "XPU PLE lookup called before the pinned slabs were "
++                    "materialized (PLE table not loaded?)"
++                )
+         return output
+ 
+     def _reduce_etp_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+@@ -489,6 +632,21 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+             return reduced.view(embeddings.dtype)
+         return self.parallel_group.all_reduce(embeddings)
+ 
++    def _in_stream_capture(self) -> bool:
++        """True while an XPU command-graph capture owns the current stream.
++
++        L0 command-graph builds reject cross-stream event joins recorded
++        into the graph ("Event dependency from handler::depends_on does not
++        correspond to a node within the graph"), which kills FULL-graph
++        capture at the pinned-lookup join (Stream.wait_stream on the
++        prefetch stream). During capture the lookup must run directly on
++        the capture stream; the pinned slabs are immutable, so replay
++        re-reads them bitwise-exact through the captured kernel. Every
++        non-capture path (eager prefill, PIECEWISE eager segments) keeps
++        the side-stream overlap, and CUDA is unaffected.
++        """
++        return _is_xpu() and self._stream_mod.is_current_stream_capturing()
++
+     @eager_break_during_capture
+     def start_prefetch(
+         self,
+@@ -499,10 +657,13 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+         active_output = self._prefetch_buffer[: gathered_ids.shape[0]]
++        if self._in_stream_capture():
++            self._lookup(gathered_ids, output=active_output)
++            return
+         prefetch_stream = self._prefetch_stream
+-        prefetch_stream.wait_stream(torch.cuda.current_stream())
++        prefetch_stream.wait_stream(self._stream_mod.current_stream())
+         gathered_ids.record_stream(prefetch_stream)
+-        with torch.cuda.stream(prefetch_stream):
++        with self._stream_mod.stream(prefetch_stream):
+             self._lookup(gathered_ids, output=active_output)
+ 
+     @eager_break_during_capture
+@@ -512,7 +673,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         output: torch.Tensor,
+     ) -> None:
+         """Join the side stream, reduce ETP shards, and select local rows."""
+-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
++        if not self._in_stream_capture():
++            self._stream_mod.current_stream().wait_stream(self._prefetch_stream)
+         slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
+         active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
+         embeddings = self._reduce_etp_embeddings(active_output)
+@@ -539,6 +701,68 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+     _SPLITMIX_M2 = 0x94D049BB133111EB
+     _PLE_LAYER_PRIME = 10007
+ 
++    def _load_ple_table_from_path(self) -> bool:
++        """Fill the pinned-host PLE table from the PLE_TABLE_PATH mmap file.
++
++        XPU bring-up: this checkpoint carries no embedding rows; the full
++        [org_vocab_size, head_dim] bf16 table lives in one external file
++        (``{"table": Tensor}`` mmap) whose rows already follow the exact
++        layout the shard branch of ``load_weights`` consumes. Slice it into
++        ``split_ngram_parts`` virtual shards and run each through the same
++        ``weight_loader(checkpoint_start=...)`` path so only TP-owned rows
++        are copied into this rank's pinned storage.
++        """
++        table_path = os.environ.get("PLE_TABLE_PATH")
++        if not table_path:
++            return False
++        embedding = self.ngram_embedding
++        if not isinstance(embedding, Qwen4ExpPLEPinnedHostEmbedding):
++            raise RuntimeError(
++                "PLE_TABLE_PATH is set but the PLE table is device-resident; "
++                "XPU requires pinned-host table storage"
++            )
++        table_file = torch.load(table_path, mmap=True, weights_only=True)
++        table = table_file["table"] if isinstance(table_file, dict) else table_file
++        org_vocab_size = embedding.org_vocab_size
++        if (
++            table.shape[0] < org_vocab_size
++            or table.shape[1] != embedding.embedding_dim
++        ):
++            raise ValueError(
++                f"PLE table at {table_path} has shape {tuple(table.shape)}, "
++                f"expected >= [{org_vocab_size}, {embedding.embedding_dim}]"
++            )
++        shard_size = (
++            org_vocab_size + self.split_ngram_parts - 1
++        ) // self.split_ngram_parts
++        rows_loaded = 0
++        for shard_index in range(self.split_ngram_parts):
++            checkpoint_start = shard_index * shard_size
++            expected_rows = max(
++                0, min(shard_size, org_vocab_size - checkpoint_start)
++            )
++            if expected_rows == 0:
++                break
++            shard = table.narrow(0, checkpoint_start, expected_rows)
++            embedding.weight.weight_loader(
++                embedding.weight,
++                shard,
++                checkpoint_start=checkpoint_start,
++            )
++            rows_loaded += expected_rows
++        if _is_xpu():
++            embedding._materialize_pinned_xpu_slabs()
++        logger.info(
++            "Loaded PLE table from %s: %d shards, %d/%d rows, dtype=%s, "
++            "storage=pinned-host slabs",
++            table_path,
++            self.split_ngram_parts,
++            rows_loaded,
++            org_vocab_size,
++            table.dtype,
++        )
++        return True
++
+     @classmethod
+     def _splitmix64(cls, value: int) -> int:
+         """Mix an integer into a deterministic unsigned 64-bit value."""
+@@ -700,11 +924,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         if params_dtype is None:
+             params_dtype = torch.get_default_dtype()
+         engram_config = get_current_vllm_config().engram_config
+-        embedding_cls = (
+-            Qwen4ExpPLEPinnedHostEmbedding
+-            if engram_config is not None and engram_config.cpu_offload
+-            else Qwen4ExpPLEDeviceEmbedding
+-        )
++        if engram_config is not None and engram_config.cpu_offload:
++            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
++        elif _is_xpu() and os.environ.get("PLE_TABLE_PATH"):
++            # B70 XPU bring-up: pinned-host PLE table selected by
++            # PLE_TABLE_PATH because the Engram route is CUDA-only
++            # (config/engram.py rejects non-CUDA platforms) while the stock
++            # XPU default would allocate the table device-resident (~26
++            # GB/rank at TP4) and OOM the 32 GB cards.
++            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
++        else:
++            embedding_cls = Qwen4ExpPLEDeviceEmbedding
+         self.ngram_embedding = embedding_cls(
+             padded_vocab_size,
+             self.head_dim,
+@@ -931,6 +1161,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+ 
+         if regular_weights:
+             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
++        if "ngram_embedding.weight" not in loaded:
++            # XPU bring-up: the checkpoint has no embedding rows, so fill
++            # the pinned-host table from the external PLE_TABLE_PATH file.
++            if self._load_ple_table_from_path():
++                loaded.add("ngram_embedding.weight")
+         return loaded
+ 
+ 
