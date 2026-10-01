@@ -52,7 +52,7 @@ changes for 0013/0014 live in `patches/vllm-tests/` (never applied to the image;
 | L9 chunked pinned CPU KV pool (always on; one tensor whenever it fits, otherwise equal power-of-two row-aligned chunks; a null pinned allocation raises instead of being filled) | `0018-b70-offload-chunked-pinned-pool.patch` · `f97fb491372d0f420ba1eb099f92e06830577245aae240c028f79c09a2d83a7c` (tests: `patches/vllm-tests/0018-b70-offload-chunked-pinned-pool-tests.patch` · `479eb266e59bc161605230fd253e58ecb9c93b9258e58ae471d2561f3dcac7dc`) | `vllm/v1/kv_offload/cpu/gpu_worker.py` | — | see §5 | 0013 (same file) |
 | L10 dense-QSA: skip `*.self_attn.indexer.*` checkpoint tensors (always on; affects only configs without `indexer_n_heads` whose checkpoint still ships indexer tensors) | `0019-b70-qwen4exp-dense-qsa-skip-indexer.patch` · `0188886fb52d25c11084bda06715cc4b69f2ae3ba8bb23786a63be70de264fd5` | `vllm/models/qwen4_exp/nvidia/model.py` | — | see §5 | — |
 | P6 binary | **COPY --from the wu1ff image by digest**; no public source | `site-packages/vllm_xpu_kernels/libgdn_index64.so` (4,380,128 B; ELF, not stripped; embeds `csrc/xpu/gdn_attn/…` source paths; GCC 13.3.0 Ubuntu) | `426ebaaaf907281bbfaf34a3a54a7d69ed8a008e3810c1992f0b33b59536a92b` | `0fc700d337b71dfd6f2d4d08ca8ec588a26fc1bd669ed9034c6e4e468a804b75` (matches wu1ff's stated hash) | — |
-| P6 kernel source | `patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` (7 sites) · `d7b1e3f7868c489e1ff0a35094c2d66dfc05ca31c3cc601f1567ceb17fc2d612` | `csrc/xpu/gdn_attn/causal_conv1d.hpp` (3), `csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp` (2), `…/chunk_causal_conv1d_xe2.hpp` (2) | — | not used by this build | **reconstructed** from wu1ff's description; NOT compared against the binary |
+| P6 kernel source | `patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` (7 sites) · `d7b1e3f7868c489e1ff0a35094c2d66dfc05ca31c3cc601f1567ceb17fc2d612` | `csrc/xpu/gdn_attn/causal_conv1d.hpp` (3), `csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp` (2), `…/chunk_causal_conv1d_xe2.hpp` (2) | — | not used by this image (torch 2.13) | **built** into vllm-xpu-kernels `0.1.15.4+b70.1` (fork branch `b70/v0.1.15` @ `69b823f9` = upstream `release/0.1.15.4` + this commit, clean cherry-pick); device code compared with the official wheel by disassembly (§6) [M] |
 | P7 L0 peer-residency shim | **COPY --from the wu1ff image by digest**; no public source (not in wu1ff's public repo) | `/opt/b70-residency-shim/libl0_peer_residency_shim.so` (17,760 B; source name `l0_peer_residency_shim.c`; zelTracer-based) | `512b136c0deacc7459daf8226f7ce8143a14a782070f4fa6312c0e7185e60401` | `ae2c82f549d97393268cbd7b90dba7cf38fd00dbccae54f090b1a545e5613b3c` (matches wu1ff's stated hash) | — |
 | P8 dense-QSA serve config | file `image/files/opt/b70-flashnext/serve-config.json` (wu1ff, MIT); source form `image/derive-serve-config.py` (HF config `b9ef7d7d…` @`40b8f18d` minus 5 `indexer_*` keys, `json.dumps(indent=2)+"\n"` — checked OK) | `/opt/b70-flashnext/serve-config.json` | `c6306db9…` | `91fa33ca705157739a56d2d56fd568fa20cf6b4e7928bcdc3410c8792408791f` | — |
 | P8 entrypoint | file `image/files/opt/b70-flashnext/prepare-serve.sh` (wu1ff, MIT), mode 0755 | `/opt/b70-flashnext/prepare-serve.sh` | `bcee61bc…` (+ chmod `fc11d9c5…`) | `3f246a046c51cda8e7e582524bcf806d34b2cca3425736bd53286621a4a170e4` | P8 config |
@@ -141,3 +141,28 @@ Full-stack result per file (both roots), as asserted by `verify-overlay.sh final
 
 The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The two closed binaries are unchanged
 (COPY by digest, same sha256).
+
+## 6. Kernel builds and the AWQ recipe (added 2026-10-01)
+
+**vllm-xpu-kernels `0.1.15.4+b70.1`** (edge line, torch 2.14; docs/kernels.md) [M]:
+
+| | |
+|---|---|
+| source | github.com/Lumnus/vllm-xpu-kernels `b70/v0.1.15` @ `69b823f9038671c3af7cea7adf615dd269d620ad` = upstream `release/0.1.15.4` (`ddf336d`) + the int64 conv-state offset commit (7 sites) |
+| build | upstream builder image `pytorch/manylinux2_28-builder:xpu-v2.14.0-rc10` (oneAPI 2026.1), `VLLM_XPU_ENABLE_XE3P=OFF`, `VLLM_VERSION_OVERRIDE=0.1.15.4+b70.1`, `setup.py bdist_wheel --py-limited-api=cp38` |
+| wheel | `vllm_xpu_kernels-0.1.15.4+b70.1-cp38-abi3-manylinux_2_28_x86_64.whl`, 370,656,165 B, sha256 `18ecc832240911eb5d07c4b8fbd8572f51c02b6cb504fde5a640c04f5005f37b` (not published) |
+| API | 111 of 111 op schemas identical to the official 0.1.15.4 wheel; no op registration dropped by the B70-only build |
+| fix in the binary | BMG device code disassembled (`ocloc disasm -device bmg`): 36 of 40 `causal_conv1d` variants gain the 64-bit product (`mach`), the 4 unchanged have no conv-state access; `update_states_kernel` and `chunk_update_states_kernel` likewise |
+| not shown | correctness on a GPU past block id 5,042 by a targeted test |
+
+**vllm-xpu-kernels `0.1.14.1+b70.1`** (stable line, torch 2.13): upstream tag `0.1.14.1` = `6d92b1bfbf32767ecda8e819613eb151e70030ad`
++ the same commit, oneAPI 2026.0. In progress; not published.
+
+**AWQ serving recipe** (engines/awq-s16-kv128-chunked.env, docs/weights.md) [M]:
+
+| | |
+|---|---|
+| weights | `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125b929543a783ce700c90e36dd1a575c00c` (19 files, 180.77 GB) |
+| index | `tools/awq_snapshot.py snapshot`: 222,746 → 222,579 tensors (−128 PLE shard tensors, −39 `self_attn.indexer.*`); equal, key for key and file for file, to the index of our serving snapshot |
+| serve config | `engines/serve-config-awq.json`, sha256 `c7a2b345927976d911cfd57d1083b71d1a75fee245f61a17b8f126b6717342c8` = `image/files/opt/b70-flashnext/serve-config.json` + `ignore` entries `re:^mtp.*`, `re:.*self_attn\..*` (reproduced by `tools/awq_snapshot.py serve-config`); byte-identical to the file we serve |
+| engine | derived from our serving definition: TP4 + EP, 16 slots, capture sizes `[1,2,4,8,16,256,512,1024]`, `--gpu-memory-utilization 0.85`, 128 GiB native CPU KV tier, INT8 PLE on NVMe, 0014jb, temperature 0.7, presence 0. Differences: the checkpoint's chat template instead of our modified one; docker instead of our launcher. Not run in this form |

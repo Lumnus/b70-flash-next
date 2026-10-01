@@ -1,7 +1,7 @@
 # Runtime switches (`B70_*`)
 
 Every feature the b70 series adds is behind an environment variable and **off by default**. With none of them set,
-the image behaves as vLLM v0.30.0 plus wu1ff's patch set (0001–0005), apart from three small ungated parts listed at
+the image behaves as vLLM v0.30.0 plus wu1ff's patch set (0001–0005), apart from the ungated parts listed at
 the end. Set the variables in the serving container's environment; `vllm serve` flags are unchanged.
 
 A variable that is not listed here is ignored. Older builds used a `LUMNUS_` prefix for the same switches; those
@@ -75,3 +75,7 @@ B70_OFFLOAD_GDN_BACKSTEP=1 B70_OFFLOAD_EMPTY_ADVANCE_GUARD=0 B70_OFFLOAD_GROUP_E
 2. 0013: the KV-offload host-tensor allocation log line moves from DEBUG to INFO and prints `is_pinned()`.
 3. 0014f: `ReqContext` records key positions (a dict write per key, never read with `B70_OFFLOAD_GROUP_EVICT` unset),
    and the policy base class gains optional hooks that are never called with the flag unset.
+4. 0018: when one pinned allocation for the CPU KV pool is refused (≥ ~31 GiB on a B70), the pool is stored as
+   equal chunks instead of failing at boot. A pool that fits in one allocation is unchanged.
+5. 0019: on dense-QSA configs, checkpoint tensors under `self_attn.indexer` are skipped at load (checkpoints without
+   them, such as devan's, are unaffected).
