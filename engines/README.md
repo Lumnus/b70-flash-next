@@ -1,29 +1,66 @@
 # Example engines
 
-Three example configurations, the ones behind the numbers in `docs/measurements/`. They are examples: adjust the
-paths, the GPU memory fraction and the CPU KV size to your host. All three assume 4× Arc Pro B70 and ~256 GB host RAM.
+Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
+KV size to your host.
 
-| engine | PLE table | CPU KV tier | offload fix | host RAM note |
-|---|---|---|---|---|
-| `r8g-kv64` | INT8, pinned in RAM (48.9 GiB) | 64 GiB | off | ~62 GiB MemAvailable left at idle on our host |
-| `r8g-kv64-0014jb` | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
-| `nvme2-kv96-0014jb` | INT8 from NVMe, 8 GiB row cache | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
+| engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
+|---|---|---|---|---|---|---|
+| **`awq-s16-kv128-chunked`** | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve**, at 64 GiB KV now (see below) |
+| `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
+| `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
+| `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
-Files: `common.env` (shared environment), `<engine>.env` (the differences, plus `KV_OFFLOADING_SIZE` read by the
-script), `serve.args` (`vllm serve` flags, one flag and its value per line), `run-example.sh` (docker).
+Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:
+`KV_OFFLOADING_SIZE`, and optionally `MODEL_DIR`, `SERVE_ARGS`, `SERVE_CONFIG`), `serve.args` / `serve-s16.args`
+(`vllm serve` flags, one flag and its value per line), `serve-config-awq.json` (the AWQ serve config), `run-example.sh`
+(docker).
 
 ```bash
-MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh r8g-kv64-0014jb b70-flash-next:0.30.0-b70.1
+MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
 ```
 
-Notes:
+## The serving recipe (`awq-s16-kv128-chunked`)
 
-1. **Chat template.** The examples use the checkpoint's own template. Our deployment used a lightly modified one
+1. **Weights.** Download `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` at revision `0939125`, plus `ple_table_qwen4exp.pt`
+   from `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (the BF16 PLE table; the INT8 table is built from it).
+   Then make the snapshot the entrypoint expects, on the volume you mount at `/models`:
+   ```bash
+   tools/awq_snapshot.py snapshot /srv/models/qwen3.8-flash-next/AWQ-W4A16 \
+       /srv/models/qwen3.8-flash-next/W4A16/ple_table_qwen4exp.pt /srv/models/qwen3.8-flash-next/AWQ-W4A16-snapshot
+   ```
+   Why, and how the AWQ serve config differs: [docs/weights.md](../docs/weights.md).
+2. **16 slots, power-of-two graphs.** `serve-s16.args`: `--max-num-seqs 16`, capture sizes `[1,2,4,8,16,256,512,1024]`,
+   `--gpu-memory-utilization 0.85`. Keep capture sizes to powers of two ([known issues](../docs/known-issues.md)).
+3. **Sampling.** Server default temperature 0.7 (`--override-generation-config`), no server presence penalty
+   (`B70_DEFAULT_PRESENCE_PENALTY=0`). A request's own values win.
+4. **CPU KV tier.** `--kv-offloading-backend native`, 128 GiB = 32 GiB per rank. One pinned host allocation of ~31 GiB
+   or more is refused by the driver; patch 0018 splits the pool into equal chunks, so no driver debug keys are
+   needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so we currently run
+   `KV_OFFLOADING_SIZE=64`. Keep the size a power of two (total / 4).
+5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, `B70_OFFLOAD_GDN_BACKSTEP=1` (docs/offload-fix.md).
+
+## PLE table: RAM or NVMe
+
+The INT8 PLE table is 48.9 GiB. Two ways to serve it, chosen with one switch:
+
+| | `B70_PLE_INT8_NVME=1` (the AWQ and `nvme2-*` engines) | `B70_PLE_INT8_NVME` unset or `0` (the `r8g-*` engines) |
+|---|---|---|
+| host RAM for the table | 8 GiB pinned row cache in total (`B70_PLE_INT8_NVME_CACHE_GIB`) | 48.9 GiB pinned |
+| cost | decode −2 … −4 %, prefill unchanged; reads the table file with `O_DIRECT` | none |
+| needs | the table on a fast local NVMe (the native reader compiles with the image's `gcc`) | nothing extra |
+
+Both need `B70_PLE_INT8=1` and `B70_PLE_INT8_PATH`. Use NVMe when the freed ~39 GiB buys you more CPU KV tier; keep it in
+RAM when the host has the room. Details: [docs/ple-nvme.md](../docs/ple-nvme.md).
+
+## Notes
+
+1. **Chat template.** The examples use the checkpoint's own template. Our deployment uses a lightly modified one
    (thinking switches off when a client sends `enable_thinking=false` *or* a "none/off" effort); it is not included.
 2. **Boot host RAM.** Pinned memory does not count against a container memory limit. Watch the host's MemAvailable
    during the first boot; with the BF16 table and without 0006 the peak is ~191 GiB.
 3. **Liveness.** Probe with a 1-token chat completion; `/health` and `/v1/models` stay 200 while the engine is wedged.
    Allow ≥180 s under load: a busy engine queues, it is not down.
-4. **compute-runtime.** The numbers were measured on compute-runtime 26.35.39758.10; the base image carries 26.27.
+4. **compute-runtime.** Our numbers were measured on compute-runtime 26.35.39758.10; the base image carries 26.27.
    The image does not change the driver.
-5. `--max-num-seqs 8` with power-of-two capture sizes; see docs/measurements/baseline.md item 4 before changing them.
+5. **GPU hangs.** If a card keeps timing out driver jobs after a GT reset, see
+   [docs/known-issues.md](../docs/known-issues.md) (rebind the card, not an FLR).
