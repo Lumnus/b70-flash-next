@@ -1,0 +1,103 @@
+From fa542f618d17e511cc8b08a9730d1daf68b0cac5 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Wed, 30 Sep 2026 08:28:13 +0000
+Subject: [PATCH 1/7] [GDN] causal_conv1d: compute the conv-state pointer
+ offset in 64 bits
+
+states_id is `int` and conv_states_stride_0 is `const int`, so
+`conv_states + states_id * conv_states_stride_0` multiplies in 32 bits.
+With a 425,984-element stride (Qwen3.8-Flash-Next), any state id >= 5042
+overflows INT32; on Arc Pro B70 this shows up as DEVICE_LOST on deep
+prefills. Cast the id to int64_t at all 7 pointer-offset sites (3 in
+causal_conv1d.hpp, 2 in each xe_2 chunk kernel).
+
+The fix was first shipped by wu1ff (github.com/wu1ff/B70-LLM-Controller)
+only as a prebuilt op library (libgdn_index64.so); its source is not
+published. This change is reconstructed from the published description
+("static_cast<int64_t>(states_id) before * conv_states_stride_0 at 7
+sites") and the library's embedded source paths; untested pending a
+from-source build and A/B against the prebuilt library.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 69b823f9038671c3af7cea7adf615dd269d620ad)
+---
+ csrc/xpu/gdn_attn/causal_conv1d.hpp                      | 6 +++---
+ csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp | 4 ++--
+ csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp       | 4 ++--
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+index d8371db..5e457d4 100644
+--- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
++++ b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+@@ -229,7 +229,7 @@ struct causal_conv1d_kernel {
+     const bool has_init_conv_states =
+         (has_initial_state == nullptr ||
+          (has_initial_state != nullptr && has_initial_state[batch_id]));
+-    T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
++    T* conv_states_ptr = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+ 
+     // load weights
+     T local_weights[Width * elems_per_item];
+@@ -449,7 +449,7 @@ struct update_states_kernel {
+     }
+ 
+     int states_id = cache_indices[batch_id];
+-    T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
++    T* conv_states_ptr = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+     const T* conv_states_tmp_ptr =
+         conv_states_tmp + batch_id * (width - 1) * conv_elems;
+     for (int i = elems_start_offset_group + local_id;
+@@ -681,7 +681,7 @@ struct causal_conv1d_spec_kernel {
+     const int state_id = cache_indices[batch_id * cache_indices_stride_0 + 0];
+     const bool has_conv_state = (state_id != pad_slot_id);
+     T* state_line_ptr = has_conv_state
+-                            ? conv_states + state_id * conv_states_stride_0
++                            ? conv_states + static_cast<int64_t>(state_id) * conv_states_stride_0
+                             : nullptr;
+ 
+     // Load weights
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
+index 21a73cc..8fc81cf 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
+@@ -217,7 +217,7 @@ struct chunk_causal_conv1d_tiled_kernel {
+     const bool has_init_conv_states =
+         (has_initial_state == nullptr ||
+          (has_initial_state != nullptr && has_initial_state[batch_id]));
+-    T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
++    T* conv_states_ptr = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+ 
+     // ========================================================================
+     // Phase 1: COOPERATIVE load of (TileT + Width - 1) tokens into SLM
+@@ -582,7 +582,7 @@ struct chunk_causal_conv1d_tiled_kernel {
+         }
+       }
+     } else if (seq_len == 1) {
+-      T* st = conv_states + states_id * conv_states_stride_0;
++      T* st = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+ #pragma unroll
+       for (int i = 0; i < Width - 1; ++i) {
+         int slot = i + 1;
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+index ccb6006..682038a 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+@@ -200,7 +200,7 @@ struct chunk_causal_conv1d_kernel {
+     const bool has_init_conv_states =
+         (has_initial_state == nullptr ||
+          (has_initial_state != nullptr && has_initial_state[batch_id]));
+-    T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
++    T* conv_states_ptr = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+ 
+     // load weights
+     T local_weights[Width * elems_per_item];
+@@ -624,7 +624,7 @@ struct chunk_update_states_kernel {
+     }
+ 
+     int states_id = cache_indices[batch_id];
+-    T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
++    T* conv_states_ptr = conv_states + static_cast<int64_t>(states_id) * conv_states_stride_0;
+     const T* conv_states_tmp_ptr =
+         conv_states_tmp + batch_id * (width - 1) * conv_elems;
+     for (int i = elems_start_offset_group + local_id;

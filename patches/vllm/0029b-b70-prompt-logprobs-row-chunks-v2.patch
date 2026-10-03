@@ -1,0 +1,89 @@
+From 4b05162ebb0bec8a14d4e4471dcb8f074939d5ee Mon Sep 17 00:00:00 2001
+From: Cell PM <noreply@lumnus.net>
+Date: Sat, 3 Oct 2026 06:15:24 +0000
+Subject: [PATCH] B70-0029b: prompt logprobs on Model Runner V2 in 128-row
+ chunks (+ one-time log)
+
+0029 patched the V1 runner (_get_prompt_logprobs_dict), which this engine never
+calls: the XPU worker logs "Using V2 Model Runner", whose prompt logprobs live in
+v1/worker/gpu/sample/prompt_logprob.py with CHUNK_SIZE = 1024 hardcoded. At
+--max-num-batched-tokens 1024 that is one chunk per step: lm_head shard + TP
+all-gather output + the movedim copy, ~1.07 GiB bf16 per rank, on an engine with
+0.8 GiB VRAM free. On xe the overflow lands in host RAM and stays (06:10Z: 23.9 ->
+11.2 GiB MemAvailable during 60 fidelity items, flat afterwards).
+
+B70_PROMPT_LOGPROBS_CHUNK (default 128; 0 = upstream 1024). Rows are independent,
+so results do not depend on the chunk size. Logs the chunk size once per worker
+so a boot can prove the path is live.
+---
+ vllm/v1/worker/gpu/sample/prompt_logprob.py | 38 ++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/prompt_logprob.py b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+index 50baf39..a0fe102 100644
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Callable
+ 
+ import numpy as np
+ import torch
+ 
+ from vllm.config.model import LogprobsMode
++from vllm.logger import init_logger
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+@@ -13,6 +15,39 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
+ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+ 
+ 
++logger = init_logger(__name__)
++
++# B70-0029b: rows per prompt-logprobs chunk on Model Runner V2. Upstream hardcodes
++# 1024, which equals --max-num-batched-tokens here, so every prompt-logprobs step
++# materialised the [num_tokens, vocab] logits in one piece on every TP rank:
++# lm_head shard [N, V/tp] + all-gather output [tp*N, V/tp] + the movedim copy
++# [N, V] (bf16, V = 248,320: 0.12 + 0.47 + 0.47 GiB at N = 1024). With < 1 GiB
++# of VRAM headroom, xe places the overflow in host RAM and it stays there
++# (crusher 2026-10-03 02:09Z, 02:21Z, 06:10Z). Rows are independent, so the
++# result does not depend on the chunk size. 0 = upstream (1024).
++def _b70_prompt_logprobs_chunk() -> int:
++    try:
++        value = int(os.environ.get("B70_PROMPT_LOGPROBS_CHUNK", "128"))
++    except ValueError:
++        value = 128
++    return value if value > 0 else 1024
++
++
++_B70_CHUNK_LOGGED = False
++
++
++def _b70_log_chunk_once(chunk: int, num_rows: int) -> None:
++    global _B70_CHUNK_LOGGED
++    if not _B70_CHUNK_LOGGED:
++        _B70_CHUNK_LOGGED = True
++        logger.info(
++            "B70-0029b: prompt logprobs on Model Runner V2, %d rows per chunk "
++            "(first step: %d rows)",
++            chunk,
++            num_rows,
++        )
++
++
+ class PromptLogprobsWorker:
+     def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
+         self.max_num_reqs = max_num_reqs
+@@ -205,7 +240,8 @@ def compute_prompt_logprobs_with_chunking(
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     # Since materializing the full prompt logits can take too much memory,
+     # we compute it in chunks.
+-    CHUNK_SIZE = 1024
++    CHUNK_SIZE = _b70_prompt_logprobs_chunk()
++    _b70_log_chunk_once(CHUNK_SIZE, int(prompt_token_ids.shape[0]))
+     token_ids = []
+     scores = []
+     ranks = []

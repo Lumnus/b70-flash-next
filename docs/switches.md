@@ -79,3 +79,22 @@ B70_OFFLOAD_GDN_BACKSTEP=1 B70_OFFLOAD_EMPTY_ADVANCE_GUARD=0 B70_OFFLOAD_GROUP_E
    equal chunks instead of failing at boot. A pool that fits in one allocation is unchanged.
 5. 0019: on dense-QSA configs, checkpoint tensors under `self_attn.indexer` are skipped at load (checkpoints without
    them, such as devan's, are unaffected).
+
+## Added in 0.30.0-b70.2 (0020–0032)
+
+| variable | default | patch | effect |
+|---|---|---|---|
+| `B70_MTP_DRAFT_PREFILL_NO_PIECEWISE` | unset (off) | 0021 | `1`: on XPU, the MTP draft model keeps only FULL (uniform-decode) graphs; mixed prefill batches run the draft eagerly. We serve with `1` (the PIECEWISE draft prefill capture failed on XPU). |
+| `B70_MTP_UNIFORM_DRAFTS` | `1` (on) | 0026 | never schedule a partial draft list on XPU (grammar-trimmed drafts crashed the stock 0.1.14 GDN kernel). `0` turns it off; with kernels that carry upstream #600 (our b70.2/b70.3) it is not needed. |
+| `B70_GDN_MODE` | `index64` when `libgdn_index64.so` is present, else `official` | 0023, 0027 | which GDN op runs: `index64` (wu1ff's library), `official` (the stock op: 64-bit with our kernels, 32-bit with stock 0.1.14.1), `split-index64`, `split-official` (debug). Re-read every 2 s. |
+| `B70_PROMPT_LOGPROBS_CHUNK` | `128` | 0029, 0029b | rows per prompt-logprobs chunk (bounds the [rows, vocab] fp32 transient). `0` = vLLM's own chunking (one pass on V1, 1,024 rows on V2). |
+| `B70_OFFLOAD_H2D_DIRECT` | unset (off) | 0031 | `1`: CPU→GPU KV loads copy straight from the pinned offload pool instead of the kernel's staged batch copy. For kernels without B70-K1; with our 0.1.14.1+b70.3, leave it off. |
+
+Debug tools in 0023/0023c (off unless their flag file exists): a NaN tracer in the GDN wrapper and at the sampling
+boundary, and a probe that zeroes block 0 around FULL replays. The flag files are fixed paths from our lab
+(`/work/probes/gdn-mode`, `/work/probes/gdn-nancheck`, `/work/probes/zero-null-block`,
+`/work/probes/uniform-drafts-off`); with no such files the code does nothing.
+
+Ungated in b70.2: 0020 and 0022 (MTP loader indexer skip; vllm#55506 port), 0028 (acts only on an INC config), 0032
+(log once). Every patch that adds a log line logs once per process when it first acts (e.g. `B70-0029b`, `B70-0031`),
+so a deployment can confirm what is active.

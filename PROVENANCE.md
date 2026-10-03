@@ -1,9 +1,10 @@
-# PROVENANCE — b70-flash-next 0.30.0-b70.1
+# PROVENANCE — b70-flash-next 0.30.0-b70.1 and 0.30.0-b70.2 (draft)
 
 Where every piece of the image comes from, and the hashes that prove it. Grades: **[M]** measured by us ·
 **[W]** third-party claim, not reproduced · **UNVERIFIED**. The source of the vLLM patches is the fork branch
 `b70/v0.30.0` of github.com/Lumnus/vllm (one commit per patch on v0.30.0 `ced6857afa`); `patches/` is exported from
-it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`.
+it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`. For 0.30.0-b70.2 the branch is
+`b70/v0.30.0-intel` (§7).
 
 ## 1. Bases
 
@@ -166,3 +167,75 @@ The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The
 | index | `tools/awq_snapshot.py snapshot`: 222,746 → 222,579 tensors (−128 PLE shard tensors, −39 `self_attn.indexer.*`); equal, key for key and file for file, to the index of our serving snapshot |
 | serve config | `engines/serve-config-awq.json`, sha256 `c7a2b345927976d911cfd57d1083b71d1a75fee245f61a17b8f126b6717342c8` = `image/files/opt/b70-flashnext/serve-config.json` + `ignore` entries `re:^mtp.*`, `re:.*self_attn\..*` (reproduced by `tools/awq_snapshot.py serve-config`); byte-identical to the file we serve |
 | engine | derived from our serving definition: TP4 + EP, 16 slots, capture sizes `[1,2,4,8,16,256,512,1024]`, `--gpu-memory-utilization 0.85`, 128 GiB native CPU KV tier, INT8 PLE on NVMe, 0014jb, temperature 0.7, presence 0. Differences: the checkpoint's chat template instead of our modified one; docker instead of our launcher. Not run in this form |
+
+## 7. Release 0.30.0-b70.2 (draft, 2026-10-03)
+
+Grades as above. Source: github.com/Lumnus/vllm `b70/v0.30.0-intel` @ `640f21881a0320aab34c50a05e0ea9815619739a` =
+`b70/v0.30.0` @ `01abfaaa5` (0.30.0-b70.1) + 12 commits. The engine we serve runs `0d132d3c79` (the same series without
+0032, a log-only change).
+
+**Checks [M] (CPU host, no image built):** `scripts/check-series.sh` → patches/ equals the export of the branch (33 + 3
+files). `scripts/make-tree.sh 0.30.0-b70.2` → a clone of the branch equals patches/ applied to `ced6857a`, and all 33
+files touched by the series carry the `verify-overlay.sh` final sha256; the same with `--from-patches`. Patches
+0001–0019 export byte-identically to the b70.1 files. The six pre-existing files first touched by 0020–0032 were not
+compared against the base image layers.
+
+| patch | sha256 | +/− | files |
+|---|---|---|---|
+| `0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer.patch` | `46ebc67ea5744fe59263d869a46991c5aaecc593267aff1d496bdd9f141b1000` | +12 −6 | `vllm/models/qwen4_exp/nvidia/mtp.py` |
+| `0021-b70-mtp-draft-prefill-no-piecewise-xpu.patch` | `a39b3dae607ecd35e49f3530ddbc5163fccf146c971e45f3a43e93cffbee3cb8` | +25 −1 | `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` |
+| `0022-b70-port-vllm55506-mamba-spec-block-tables-by-req-slot.patch` | `1b38b52ad62397ab553f8147cbb36a444962c33f12d2a5ad17666906efda37f4` | +94 −16 | `vllm/v1/worker/gpu/model_states/mamba_hybrid.py`, `vllm/v1/worker/mamba_utils.py` |
+| `0023-b70-gdn-op-mode-switch-and-nan-tracer.patch` | `096b0d92e49e17b43467b1187497da999f5b67f0fa56656f0760a139a5a709de` | +156 −11 | `vllm/_xpu_ops.py` |
+| `0023c-0024t-b70-sampling-nan-tracer-and-null-block-probe.patch` | `03ecb72d4e78381226e455448f9882212d8d8c8729ef37feedd4db3ea5f57d3d` | +94 −1 | `vllm/v1/worker/gpu/model_runner.py` |
+| `0026-b70-mtp-uniform-drafts-guard.patch` | `b9dcfd9e5a31a110dbb5974ae2e32e335d05b2cb4b8f00848fd1d476b38898d7` | +37 −0 | `vllm/v1/core/sched/scheduler.py` |
+| `0027-b70-gdn-index64-lib-optional.patch` | `64fd4b52ee4300f48b51a83df51ef09ab03f2da1399e134fb2a7ec18ace9b85e` | +14 −3 | `vllm/_xpu_ops.py` |
+| `0028-b70-qwen4exp-ple-accepts-incconfig.patch` | `ebba516d7127f2f345992c0dc334c997ba56ca1ae613691cece46e2525781d53` | +14 −0 | `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` |
+| `0029-b70-prompt-logprobs-row-chunks-v1.patch` | `bbeb4f9bfc0ad54480008a94f372e01a4f9a1aba24a647baccebfe901efb84ee` | +65 −27 | `vllm/v1/worker/gpu_model_runner.py` |
+| `0029b-b70-prompt-logprobs-row-chunks-v2.patch` | `ef67994773cb81b042b79fac125d542fd57d32d4e804a7f75a252f176954e11f` | +37 −1 | `vllm/v1/worker/gpu/sample/prompt_logprob.py` |
+| `0031-b70-offload-h2d-direct-from-pinned.patch` | `b9ec600ecdd542fb65004d7d7b0c76302c29ed992ada4b526c50cb33100cea2e` | +154 −0 | `vllm/v1/kv_offload/cpu/gpu_worker.py` |
+| `0032-b70-index64-fallback-warn-once.patch` | `c0867824773f5f041e0ac0633b9b455b77c28abfce9bd3d4b979ff7743e3c139` | +6 −2 | `vllm/_xpu_ops.py` |
+
+Full-stack result of the files 0020–0032 touch (both roots), as asserted by `verify-overlay.sh final`:
+
+| sha256 | last patch | file |
+|---|---|---|
+| `88d56eb07bbed6a606c70d874053898d4b2133b49439eb2a431521d354cde31b` | 0032 | `vllm/_xpu_ops.py` |
+| `c56577011b058f386ddc44b1b713e34a2e4086a68b2c2a6e971f82fdf0dcd1fc` | 0028 | `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` |
+| `103922296e67b8f7fd5594c3840fa556aa712365cf161fdbd530d807a276f4d9` | 0026 | `vllm/v1/core/sched/scheduler.py` |
+| `38a14d50aa76ee360836517f1afc856d1c5924881617be81e77524a87fb6884f` | 0031 | `vllm/v1/kv_offload/cpu/gpu_worker.py` |
+| `aced22e6c3f361d2784effaeb7098ddd27106765a51c83163ccd311453095418` | 0023c | `vllm/v1/worker/gpu/model_runner.py` |
+| `d1ba61dd9843e536fff1933b2dca18d92a308d6d7516f0c6ff73ce1b56ea963c` | 0020 | `vllm/models/qwen4_exp/nvidia/mtp.py` |
+| `5f688e3972a0a7491ecfa786135d2fa0e1a5aa148e97a9ef3cf507cff6dbe171` | 0021 | `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` |
+| `e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021` | 0022 | `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` |
+| `e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc` | 0022 | `vllm/v1/worker/mamba_utils.py` |
+| `c42d42280e65bb0559850fc9e5377bd41a00bc22ae387a294b19fc48c78c3196` | 0029 | `vllm/v1/worker/gpu_model_runner.py` |
+| `6573862bc03181186824fd2c89bc34bb856d89cdcd656c91d1507a668299cd1d` | 0029b | `vllm/v1/worker/gpu/sample/prompt_logprob.py` |
+
+**Kernels: vllm-xpu-kernels `0.1.14.1+b70.3`** [M]:
+
+| | |
+|---|---|
+| source | github.com/Lumnus/vllm-xpu-kernels tag `v0.1.14.1+b70.3` = `493364ab1b930d346891be9085abadd83f2784cf` (branch `b70/v0.1.14`) = upstream tag `0.1.14.1` (`6d92b1bfbf32767ecda8e819613eb151e70030ad`) + 7 commits |
+| series | `patches/vllm-xpu-kernels/b70.3/` (`git format-patch 0.1.14.1..v0.1.14.1+b70.3`); `git am` on `0.1.14.1` gives tree `ff5a092cddedfac2beffe0069e0bf1f1e30306a0`, equal to the tag |
+| wheel | 351,983,263 B, sha256 `f104a3e5f61480681284ec3632e1a6692358b72a1fbdbda7406db0d7b7d1d589` (not published); vs the b70.2 build only `_C.abi3.so` differs; 106 op schemas identical to b70.2, whose schemas match b70.1, which was checked against the official 0.1.14.1 wheel |
+| on the GPU | B70-K1 log line on all 4 workers; two 6-session KV replays: xe host +0.058 GiB per rank once, 19.6–19.9 GB/s, 0 errors (docs/measurements/b70.2.md §3) |
+
+- `b70.3/0001-GDN-causal_conv1d-compute-the-conv-state-pointer-off.patch` · `c9629d2d544ca09975415946dda55725ea70794f7cb4dd2c10f6546ca2116506`
+- `b70.3/0002-GDN-Fix-ragged-speculative-token-traversal-600.patch` · `8794837a3f52a9e5944a9dfb9da76b8a5be843ca86108a2b958c0018eacffc15`
+- `b70.3/0003-fix-xpu-preserve-tensor-strides-when-pinning-non-pin.patch` · `165c5a377d854b58f7504bff4998515772fe989f03465593bcd6f49b4ca1d6c8`
+- `b70.3/0004-fix-topk_topp_sampler-unaligned-vocab_size-563.patch` · `98bc267e2d5bca97640e6b43887ffa6a95508cf96575826042faeefcd079a21c`
+- `b70.3/0005-EP-Fix-negative-expert-IDs-in-XPU-MoE-remapping-578.patch` · `3b0512f19310ae645686dc668c55add161866127f8972aad02828e8f08275c6c`
+- `b70.3/0006-fix-initialize-atomic_buffer-to-0-to-avoid-race-cond.patch` · `b3e781913912df006e8cde922d63f3dfaca5826abc756462e36c61eb168af008`
+- `b70.3/0007-B70-K1-swap_blocks_batch-H2D-copies-directly-from-pi.patch` · `1a9f352c1b1ae5079825715b0d0febc57b59ba333d2ad97f0b7b9583649d5e8e`
+
+**Weights we serve** [M]: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`
+(29 files, 181.24 GB; still the head revision on 2026-10-03), license qwen-community-1.0 per the card. Every file
+sha256-verified against the Hugging Face tree at download. Snapshot: `tools/intel_snapshot.py` (224,280 → 224,113
+tensors; equal in count to the snapshot we serve). Serve config `engines/serve-config-intel-autoround.json`, sha256
+`e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7`, reproduced by `tools/intel_snapshot.py
+serve-config` byte for byte. INT8 PLE table: as in §6 (built from devan's BF16 table); the identity of Intel's BF16
+PLE rows (shard 16) with devan's table is UNVERIFIED.
+
+**Runtime we serve on** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
+kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro
+B70. Our host image is internal and not published.

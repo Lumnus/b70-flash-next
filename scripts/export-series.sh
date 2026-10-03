@@ -5,7 +5,7 @@
 #
 #   --git-dir  a vLLM clone that has REF and ced6857afa (default: ./vllm-src, cloned on demand from
 #              https://github.com/Lumnus/vllm.git)
-#   --ref      branch, tag or commit (default: b70/v0.30.0; a remote-tracking name like origin/b70/v0.30.0 works)
+#   --ref      branch, tag or commit (default: b70/v0.30.0-intel = 0.30.0-b70.2; a remote-tracking name like origin/b70/v0.30.0 works)
 #   --out      where to write (default: the repo's patches/)
 #
 # Every commit on BASE..REF must have a key in patches/series.txt; an unknown commit is an error, so the
@@ -14,7 +14,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
 REPO_URL=https://github.com/Lumnus/vllm.git
-gd="$here/vllm-src"; ref=b70/v0.30.0; out="$here/patches"
+gd="$here/vllm-src"; ref=b70/v0.30.0-intel; out="$here/patches"
 while [ $# -gt 0 ]; do
   case "$1" in
     --git-dir) gd=$2; shift 2 ;;

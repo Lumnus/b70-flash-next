@@ -1,0 +1,81 @@
+From c62852db49da01abcb8080022ddcab47c7999b5d Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Thu, 1 Oct 2026 17:11:02 +0000
+Subject: [PATCH] 0021-b70-mtp-draft-prefill-no-piecewise-xpu: env-gated
+ FULL-only draft prefill graphs on XPU
+
+On XPU the MTP draft prefill's breakable PIECEWISE capture fails at its
+first capture_begin: "Cannot register the state during capturing stage
+... xpuStreamCaptureStatus: Recording" (all 4 ranks, after the target
+model's PIECEWISE + FULL graphs captured fine). With
+B70_MTP_DRAFT_PREFILL_NO_PIECEWISE=1 the draft prefill manager uses
+FULL_DECODE_ONLY (FULL graphs for uniform-decode batches, eager draft for
+mixed batches); the target model and the draft decode manager are
+unchanged. Default off.
+
+Boots and serves (Flash-Next AWQ, TP4, k=3), but the engine produces
+NaN logits / degenerate text when >=3 requests arrive in the same step
+(seat E MTP attempt 2, 2026-10-01); that corruption is not explained by
+this change (it is a capture-mode change for the draft only, and greedy
+verification cannot turn bad drafts into NaN target logits) but was not
+proven independent of it either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../spec_decode/autoregressive/speculator.py  | 26 ++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 3d243b6..172ad7d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any
+ 
+ import torch
+@@ -9,6 +10,7 @@ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+@@ -125,11 +127,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             )
+ 
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
++        # B70-0021: on XPU the draft prefill's breakable PIECEWISE capture
++        # fails at its first capture_begin ("Cannot register the state during
++        # capturing stage": the default XPU generator state is still flagged
++        # capturing). B70_MTP_DRAFT_PREFILL_NO_PIECEWISE=1 drops PIECEWISE for
++        # the draft prefill only: FULL graphs stay for uniform-decode batches,
++        # mixed batches run the one-layer draft eagerly. Target unchanged.
++        prefill_mode = cudagraph_mode
++        if (
++            os.environ.get("B70_MTP_DRAFT_PREFILL_NO_PIECEWISE", "0") == "1"
++            and current_platform.is_xpu()
++            and cudagraph_mode.has_piecewise_cudagraphs()
++        ):
++            prefill_mode = (
++                CUDAGraphMode.FULL_DECODE_ONLY
++                if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
++                else CUDAGraphMode.NONE
++            )
++            logger.info(
++                "B70-0021: draft prefill cudagraph mode %s -> %s",
++                cudagraph_mode.name,
++                prefill_mode.name,
++            )
+         # Initialize cudagraph manager for draft prefill (draft position 0).
+         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+             self.vllm_config,
+             self.device,
+-            cudagraph_mode,
++            prefill_mode,
+             self.num_speculative_steps + 1,
+         )
+ 

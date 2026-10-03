@@ -5,21 +5,48 @@ KV size to your host.
 
 | engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
 |---|---|---|---|---|---|---|
-| **`awq-s16-kv128-chunked`** | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve**, at 64 GiB KV now (see below) |
+| **`intel-autoround-s16-kv128-mtp3`** | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3 |
+| `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
 | `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
 | `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
 Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:
 `KV_OFFLOADING_SIZE`, and optionally `MODEL_DIR`, `SERVE_ARGS`, `SERVE_CONFIG`), `serve.args` / `serve-s16.args`
-(`vllm serve` flags, one flag and its value per line), `serve-config-awq.json` (the AWQ serve config), `run-example.sh`
-(docker).
+/ `serve-s16-mtp3.args` (`vllm serve` flags, one flag and its value per line), `serve-config-awq.json` and
+`serve-config-intel-autoround.json` (serve configs), `run-example.sh` (docker; the b70.1 image).
 
 ```bash
 MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
 ```
 
-## The serving recipe (`awq-s16-kv128-chunked`)
+## The serving recipe (`intel-autoround-s16-kv128-mtp3`, 0.30.0-b70.2)
+
+We run it from a source tree, not the image (README, Quick start). Differences from the AWQ recipe below:
+
+1. **Weights.** `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`, every file except
+   `model-00016-of-00017.safetensors` (the 102.4 GB PLE shard); devan's `ple_table_qwen4exp.pt` as before. Then:
+   ```bash
+   tools/intel_snapshot.py snapshot /srv/models/qwen3.8-flash-next/W4A16-AutoRound \
+       /srv/models/qwen3.8-flash-next/W4A16/ple_table_qwen4exp.pt /srv/models/qwen3.8-flash-next/W4A16-AutoRound-snapshot
+   ```
+   The serve config is `serve-config-intel-autoround.json` (it replaces the snapshot's `config.json` at start).
+2. **MTP, 3 draft tokens** (`serve-s16-mtp3.args`): `--speculative-config {"method":"mtp","num_speculative_tokens":3}`,
+   `--no-async-scheduling`, and capture sizes at every multiple of 4 up to 64 plus 256/512/1024, so a uniform
+   spec-decode step is never padded; `B70_MTP_DRAFT_PREFILL_NO_PIECEWISE=1`. Both workarounds are needed
+   ([known issues](../docs/known-issues.md) item 6).
+3. **GPU memory 0.88** (`--gpu-memory-utilization`): 311,299 KV tokens; card 0 keeps ~0.7 GiB free. 0.90 fails vLLM's
+   startup check on compute-runtime 26.35.
+4. **Kernels 0.1.14.1+b70.3** with `B70_OFFLOAD_H2D_DIRECT=0`: the kernel copies CPU→GPU KV loads straight from the
+   pinned pool, and a 128 GiB CPU KV tier holds host memory flat. With stock 0.1.14.1 kernels set
+   `B70_OFFLOAD_H2D_DIRECT=1` (0031), keep wu1ff's `libgdn_index64.so`, and keep `B70_MTP_UNIFORM_DRAFTS` on.
+5. **`--enable-prompt-tokens-details`**, so clients see cached prompt tokens in `usage`.
+
+Run `vllm serve <snapshot> $(args from serve-s16-mtp3.args) --kv-offloading-size 128` with `common.env` and the engine
+file in the environment. Not exercised in this form: our launcher sets the same flags and variables, plus our modified
+chat template (note 1) and a host-RAM guard.
+
+## The b70.1 serving recipe (`awq-s16-kv128-chunked`)
 
 1. **Weights.** Download `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` at revision `0939125`, plus `ple_table_qwen4exp.pt`
    from `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (the BF16 PLE table; the INT8 table is built from it).
@@ -35,8 +62,9 @@ MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh awq-s16-kv128-chunked
    (`B70_DEFAULT_PRESENCE_PENALTY=0`). A request's own values win.
 4. **CPU KV tier.** `--kv-offloading-backend native`, 128 GiB = 32 GiB per rank. One pinned host allocation of ~31 GiB
    or more is refused by the driver; patch 0018 splits the pool into equal chunks, so no driver debug keys are
-   needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so we currently run
-   `KV_OFFLOADING_SIZE=64`. Keep the size a power of two (total / 4).
+   needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so on b70.1 we ran
+   `KV_OFFLOADING_SIZE=64`. On b70.2 the host-memory growth we root-caused under a KV-heavy load (staged CPU→GPU copies) is fixed: kernels b70.3
+   or 0031 (README, "Memory is stable now"). Keep the size a power of two (total / 4).
 5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, `B70_OFFLOAD_GDN_BACKSTEP=1` (docs/offload-fix.md).
 
 ## PLE table: RAM or NVMe

@@ -1,0 +1,65 @@
+From 03dfdd2cf8f1cf87bfb7d277c35c9f310d754627 Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <lumnus.org@gmail.com>
+Date: Fri, 2 Oct 2026 02:01:14 +0000
+Subject: [PATCH] B70-0028: Qwen4Exp PLE accepts INCConfig (auto-round
+ checkpoints)
+
+Intel/Qwen3.8-Flash-Next-W4A16-AutoRound (quant_method auto-round ->
+INCConfig) stopped at model construction:
+Qwen4ExpPLEEmbeddingMethod.from_quant_config raised NotImplementedError
+for any config but ModelOpt / compressed-tensors / Fp8, and it runs
+before the B70 PLE overrides (B70_PLE_INT8 / FP8), so even INT8-PLE
+serving could not start.
+
+The checkpoint keeps the PLE table BF16 and marks it 16-bit in
+extra_config (".*ple.*"). Resolve the PLE prefix through INC's own
+parser: 16-bit -> Qwen4ExpPLEUnquantizedEmbeddingMethod (then replaced by
+the B70 INT8 method when B70_PLE_INT8=1); an INC-quantized table still
+raises.
+
+Rest of the INC load path on XPU needed no change (checked on CPU with
+the XPU platform object, /dev/dri hidden): only the 48 main routed-expert
+layers resolve to int4 (INCWna16Scheme -> AutoGPTQMoEMethod ->
+WNA16MoEBackend.XPU / XPUExpertsWNA16); GDN, full attention, shared
+expert, router, hyper-connections, PLE kv_proj, vision and lm_head
+resolve to 16-bit; the MTP draft config (".*mtp.*") gives
+UnquantizedFusedMoEMethod for the BF16 MTP experts. The GPTQ -> XPU
+repack of a real expert dequantizes bit-identically. Not GPU-proven.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/ngram_embedding.py | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index f6b1fd3..e7d6489 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
+     should_ignore_layer,
+ )
+ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
++from vllm.model_executor.layers.quantization.inc import INCConfig
+ from vllm.model_executor.layers.quantization.modelopt import (
+     ModelOptMixedPrecisionConfig,
+     ModelOptQuantConfigBase,
+@@ -649,6 +650,19 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+                 "ignore list; compressed-tensors PLE quantization is not "
+                 "supported"
+             )
++        if isinstance(quant_config, INCConfig):
++            # B70-0028: auto-round checkpoints (e.g. Intel/Qwen3.8-Flash-Next-
++            # W4A16-AutoRound) keep the PLE table BF16 and mark it 16-bit in
++            # extra_config (".*ple.*"). Resolve the layer through INC's own
++            # parser; a 16-bit PLE loads unquantized. An INC-quantized table
++            # has no supported serialization here.
++            bits, _, _ = quant_config.get_layer_config(torch.nn.Module(), prefix)
++            if bits >= 16:
++                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
++            raise NotImplementedError(
++                f"Qwen4Exp PLE embedding {prefix} is {bits}-bit in the INC "
++                "extra_config; INC PLE quantization is not supported"
++            )
+         if not isinstance(quant_config, Fp8Config):
+             raise NotImplementedError(
+                 "Qwen4Exp PLE embedding does not support quantization config "

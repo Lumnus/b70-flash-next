@@ -1,0 +1,37 @@
+From 640f21881a0320aab34c50a05e0ea9815619739a Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <lumnus.org@gmail.com>
+Date: Sat, 3 Oct 2026 19:09:18 +0000
+Subject: [PATCH] B70-0032: the B70-0027 index64-fallback warning is logged
+ once per requested mode, not on every 2 s GDN-mode re-read
+
+It fired 3,236 times on all 4 workers in ~2 h on the -mtp-k3 engine. The B70-0023 'GDN op mode -> X' info line already logs each mode change once.
+---
+ vllm/_xpu_ops.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index 32a7946..a1bddf5 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -148,6 +148,7 @@ def _fused_add_gemma_rms_norm_impl(
+ 
+ 
+ _B70_GDN_MODE = {"mode": None, "t": 0.0}
++_B70_GDN_FALLBACK_WARNED: set = set()
+ 
+ 
+ def _b70_gdn_mode() -> str:
+@@ -164,8 +165,11 @@ def _b70_gdn_mode() -> str:
+         except OSError:
+             mode = os.environ.get("B70_GDN_MODE", default)
+         if not B70_HAS_GDN_INDEX64 and not mode.endswith("official"):
+-            logger.warning("B70-0027: GDN mode %s needs libgdn_index64.so, absent in this venv; using the %s variant",
+-                           mode, mode.replace("index64", "official"))
++            # B70-0032: warn once per requested mode, not on every 2 s re-read (it fired ~3,200 times in 2 h).
++            if mode not in _B70_GDN_FALLBACK_WARNED:
++                _B70_GDN_FALLBACK_WARNED.add(mode)
++                logger.warning("B70-0027: GDN mode %s needs libgdn_index64.so, absent in this venv; using the %s variant "
++                               "(logged once per mode)", mode, mode.replace("index64", "official"))
+             mode = mode.replace("index64", "official")
+         if mode != _B70_GDN_MODE["mode"]:
+             logger.info("B70-0023: GDN op mode -> %s", mode)

@@ -1,0 +1,48 @@
+From 48c8702821db346679d60924dea277fb5a8031fb Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <lumnus.org@gmail.com>
+Date: Fri, 2 Oct 2026 01:11:49 +0000
+Subject: [PATCH] B70-0027: index64 GDN lib optional; default GDN mode official
+ when the venv has no libgdn_index64.so (kernels >= 0.1.14.1+b70.2)
+
+---
+ vllm/_xpu_ops.py | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index b95d7e0..32a7946 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -17,7 +17,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
+ from pathlib import Path
+ import vllm_xpu_kernels
+ 
+-torch.ops.load_library(str(Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so")))
++# B70-0027: wu1ff's index64 GDN lib is optional. Kernels >= 0.1.14.1+b70.2 carry the int64 offsets (and #600 ragged spec
++# rows) in their own gdn_attention, and that venv ships no libgdn_index64.so. Load it only when present; when it is
++# absent, the GDN mode defaults to "official" (see _b70_gdn_mode).
++_B70_GDN_INDEX64_LIB = Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so")
++B70_HAS_GDN_INDEX64 = _B70_GDN_INDEX64_LIB.exists()
++if B70_HAS_GDN_INDEX64:
++    torch.ops.load_library(str(_B70_GDN_INDEX64_LIB))
+ 
+ logger = init_logger(__name__)
+ 
+@@ -151,11 +157,16 @@ def _b70_gdn_mode() -> str:
+ 
+     now = time.monotonic()
+     if _B70_GDN_MODE["mode"] is None or now - _B70_GDN_MODE["t"] > 2.0:
++        default = "index64" if B70_HAS_GDN_INDEX64 else "official"
+         try:
+             with open("/work/probes/gdn-mode") as f:
+-                mode = f.read().strip() or "index64"
++                mode = f.read().strip() or default
+         except OSError:
+-            mode = os.environ.get("B70_GDN_MODE", "index64")
++            mode = os.environ.get("B70_GDN_MODE", default)
++        if not B70_HAS_GDN_INDEX64 and not mode.endswith("official"):
++            logger.warning("B70-0027: GDN mode %s needs libgdn_index64.so, absent in this venv; using the %s variant",
++                           mode, mode.replace("index64", "official"))
++            mode = mode.replace("index64", "official")
+         if mode != _B70_GDN_MODE["mode"]:
+             logger.info("B70-0023: GDN op mode -> %s", mode)
+         _B70_GDN_MODE["mode"] = mode

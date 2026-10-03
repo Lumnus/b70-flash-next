@@ -47,8 +47,14 @@ Third-party material
    license. Patch 0014e is a backport of vLLM commit f12fe10c5c (vllm-project/vllm#51787, by its authors).
 
 3. vllm-xpu-kernels (Apache-2.0) — https://github.com/vllm-project/vllm-xpu-kernels
-   patches/vllm-xpu-kernels/ modifies it and is distributed under its license.
+   patches/vllm-xpu-kernels/ modifies it and is distributed under its license. patches/vllm-xpu-kernels/b70.3/0002–0006
+   are upstream commits (vllm-project/vllm-xpu-kernels #600, #564, #563, #578, #586) cherry-picked, by their
+   authors.
 
-4. Model weights and data are not included. The configuration targets the checkpoint
-   devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, under its own license terms.
-   image/files/opt/b70-flashnext/serve-config.json is derived from that checkpoint's config.json.
+4. Model weights and data are not included. The configurations target the checkpoints
+   Intel/Qwen3.8-Flash-Next-W4A16-AutoRound (revision 4c67bf68), wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (revision 0939125)
+   and devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, each under its own license terms
+   (Qwen3.8-Flash-Next: qwen-community-1.0). image/files/opt/b70-flashnext/serve-config.json is derived from devan's
+   config.json; engines/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
+
+5. Patch 0022 ports vllm-project/vllm#55506 (Apache-2.0, by its authors) to v0.30.0.

@@ -1,0 +1,56 @@
+From ca54bc24175e5ec1e1f12213fcbdc394a4a1edfb Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Thu, 1 Oct 2026 16:06:07 +0000
+Subject: [PATCH] 0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer: drop
+ *.self_attn.indexer.* in the MTP loaders
+
+0019 for the draft model. Dense-QSA configs (no indexer_n_heads) build no
+indexer in the MTP layer either, but the wtdcode AWQ export's
+model_mtp.safetensors ships three mtp.layers.0.self_attn.indexer.*
+tensors (index_qk_proj, k_layernorm, q_layernorm) that are absent from
+model.safetensors.index.json. Qwen4ExpMultiTokenPredictor.load_weights
+raised "There is no module or parameter named
+'layers.0.self_attn.indexer'". Skip the substring in both MTP loaders
+(Qwen4ExpMTP and Qwen4ExpMultiTokenPredictor).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/mtp.py | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index d12b851..38962c2 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -353,9 +353,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+             n_shared_experts=1,
+             ckpt_prefix="mlp.shared_expert",
+         )
+-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
+-        )
++        skip = {"hyper_connection_mixer.block_inject_weight": None}
++        # B70-0020 (= 0019 for the draft model): dense-QSA configs build no
++        # indexer; the wtdcode AWQ model_mtp.safetensors still ships
++        # mtp.layers.0.self_attn.indexer.* tensors. Drop them.
++        if getattr(self.config, "indexer_n_heads", None) is None:
++            skip[".self_attn.indexer."] = None
++        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr=skip)
+         loader = AutoWeightsLoader(
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+@@ -447,9 +451,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+                 if remapped_name is not None:
+                     yield remapped_name, weight
+ 
+-        mapper = WeightsMapper(
+-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
+-        )
++        skip = {"hyper_connection_mixer.block_inject_weight": None}
++        # B70-0020: see Qwen4ExpMultiTokenPredictor.load_weights.
++        if getattr(self.config, "indexer_n_heads", None) is None:
++            skip[".self_attn.indexer."] = None
++        mapper = WeightsMapper(orig_to_new_substr=skip)
+         loader = AutoWeightsLoader(
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
