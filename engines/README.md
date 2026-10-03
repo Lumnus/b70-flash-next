@@ -63,8 +63,7 @@ chat template (note 1) and a host-RAM guard.
 4. **CPU KV tier.** `--kv-offloading-backend native`, 128 GiB = 32 GiB per rank. One pinned host allocation of ~31 GiB
    or more is refused by the driver; patch 0018 splits the pool into equal chunks, so no driver debug keys are
    needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so on b70.1 we ran
-   `KV_OFFLOADING_SIZE=64`. On b70.2 the host-memory growth we root-caused under a KV-heavy load (staged CPU→GPU copies) is fixed: kernels b70.3
-   or 0031 (README, "Memory is stable now"). Keep the size a power of two (total / 4).
+   `KV_OFFLOADING_SIZE=64`. On b70.2, kernels b70.3 (or 0031) keep host memory flat under KV reload load (README, "The host-RAM KV tier"). Keep the size a power of two (total / 4).
 5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, `B70_OFFLOAD_GDN_BACKSTEP=1` (docs/offload-fix.md).
 
 ## PLE table: RAM or NVMe

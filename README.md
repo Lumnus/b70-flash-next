@@ -1,114 +1,106 @@
 # b70-flash-next
 
 vLLM for **Qwen3.8-Flash-Next on 4× Intel Arc Pro B70**: vLLM v0.30.0 for XPU, wu1ff's B70 patch set rebuilt from
-source patches, and a series of improvements for host memory, long-context reuse, MTP speculative decoding and agent
-clients, plus a vllm-xpu-kernels build with the fixes this model needs.
-
-**Status: `0.30.0-b70.2` (draft).** What we serve daily on 4× B70: Intel's AutoRound W4A16 checkpoint with MTP
-(3 draft tokens), 16 slots, 262K context and a 128 GiB CPU KV tier, from source trees. The container image of this
-repository has not been built for b70.2 yet ([CHANGELOG](CHANGELOG.md)).
-
-## Credits first
-
-This work stands on other people's:
-
-1. **wu1ff — [B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller)** (MIT). The Qwen3.8-Flash-Next B70
-   pack: the XPU gate, the pinned-host PLE table, the HC down-GEMM K-split, the GDN spec-metadata fusion, the 64-bit
-   GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. Patches 0001–0005 are
-   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. Thank you.
-2. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
-   weights we serve, made with [AutoRound](https://github.com/intel/auto-round);
-   [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels), whose upstream fixes #600, #563, #564, #578 and
-   #586 are in our kernel build (by Guancheng Fu, Chaojun Zhang, Qiming Zhang and Tony Lin);
-   [llm-scaler](https://github.com/intel/llm-scaler) and the XPU work in
-   [vLLM #55068](https://github.com/vllm-project/vllm/pull/55068).
-3. **wtdcode** — the [`Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16)
-   weights, which we served before the Intel build.
-4. **devan-carlin** — the [`Qwen3.8-Flash-Next-W4A16`](https://huggingface.co/devan-carlin/Qwen3.8-Flash-Next-W4A16)
-   weights we started with, its PLE table (every INT8 table here is built from it), and the early community vLLM port of
-   the model to XPU (`devan-carlin/vllm@xpu-qwen4exp`).
-5. **TSUMUGI-XE** — [intel/compute-runtime#968](https://github.com/intel/compute-runtime/issues/968), the analysis of
-   Level Zero peer residency mirroring device memory into host memory, and the first shim that works around it.
-6. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
-7. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
-   vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
-
-## Models
-
-We have served three 4-bit checkpoints of Qwen3.8-Flash-Next on this stack. They are ranked by what we would run today.
-All need the INT8 PLE table built from devan's BF16 PLE file ([docs/ple-int8.md](docs/ple-int8.md)); details and
-caveats in [docs/weights.md](docs/weights.md) and [docs/measurements/b70.2.md](docs/measurements/b70.2.md).
-
-### 1. Intel — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (recommended; what we serve)
-
-AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, PLE, MTP and the rest stay BF16.
+source patches, a series of patches for host memory, long-context reuse, MTP speculative decoding and agent clients,
+and a vllm-xpu-kernels build with the fixes this model needs.
 
 | | |
 |---|---|
-| decode, 1 stream, MTP | **90.4 tok/s** (short), 89.8 tok/s at 16K |
-| aggregate, 10 streams, MTP | 436 tok/s |
+| model | Qwen3.8-Flash-Next W4A16 (Intel AutoRound or AWQ; [Models](#models)) |
+| GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
+| KV cache | GPU pool ~311K tokens + **128 GB in host RAM** (CPU tier) |
+| PLE n-gram table | **INT8, served from NVMe** (8 GB pinned row cache instead of 48.9 GB in RAM) |
+| decoding | MTP speculative decoding, 3 draft tokens; 16 sequences; 262K context |
+| tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
+| software | torch 2.13.0+xpu, compute-runtime 26.35.39758.10, vllm-xpu-kernels 0.1.14.1+b70.3 |
+
+**Release `0.30.0-b70.2` (draft).** It runs from source trees; the container image of this repository is not built for
+b70.2 ([CHANGELOG](CHANGELOG.md)).
+
+## Models
+
+Two calibrated 4-bit checkpoints run on this stack; a third, round-to-nearest one is the reference. **Intel AutoRound
+is the fastest, AWQ has the best coding fidelity; the choice between them is pending a comparable run** (Benchmark
+status below). All three serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE file
+([docs/ple-int8.md](docs/ple-int8.md)). Details: [docs/weights.md](docs/weights.md),
+[docs/measurements/b70.2.md](docs/measurements/b70.2.md).
+
+Throughput below: single runs on an idle engine, thinking off, 400 (short) or 256 (16K) generated tokens per request;
+"prefill" = prompt tokens over time to first token; differences under ~10 % are noise.
+
+### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (fastest)
+
+AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MTP and the rest BF16.
+
+| | |
+|---|---|
+| decode, 1 stream | **90.4 tok/s with MTP** (89.8 tok/s at a 16K prompt); without MTP: pending the comparable run |
+| decode, 4 streams | 67.9 tok/s per session, 250 tok/s total, with MTP |
+| decode, 8 streams | 56.1 tok/s per session, 403 tok/s total, with MTP |
+| decode, 10 streams | 48.8 tok/s per session, 436 tok/s total, with MTP |
+| prefill | ~3,600 tok/s for one 16K prompt with MTP; 4 × 16K at once: ~3,000 tok/s total |
+| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 90 → 23.5 tok/s with MTP); 48K: pending the comparable run |
 | MTP acceptance length | 2.20–2.35 |
-| prefill | the same as AWQ (TTFT 4.69 s at 16K) |
-| quality vs AWQ | no significant difference: MMLU 280/300 vs 276, TruthfulQA 178/200 vs 176 (medium); coding 45/50 vs 48/50 (p 0.44); same answer on 97 % of items |
-| repetition stops in our coding set | 2 (digit runs in the reasoning), vs 0 for AWQ |
-| host memory at a 128 GiB CPU KV tier | flat with our kernels 0.1.14.1+b70.3: +0.058 GiB per rank once, no guard stops |
-| per card / KV | 20.29 GiB model; 311,299 GPU KV tokens |
-| download | 181.2 GB, of which the 102.4 GB PLE shard is not needed (78.8 GB) |
+| coding (10 agentic tasks × 5, medium effort) | 45/50 with MTP (AWQ 48/50, p 0.44); 2 of 150 samples end in a digit-run repetition stop (AWQ 0) |
+| knowledge | MMLU 280/300, TruthfulQA 178/200 (medium); not different from AWQ |
+| per card | 20.29 GiB model weights; 311,299 GPU KV tokens at memory fraction 0.88 |
+| download | 78.8 GB (the 102.4 GB BF16 PLE shard in the checkpoint is not used) |
 
-**Why first:** it decodes 10–18 % faster at one stream (+3–10 % at 4–10) on the same kernels, because MTP's drafts
-are accepted more often; every quality test is level with AWQ; it is a first-party, calibrated build; and it runs with
-one small loader patch (0028). **What does not favour it:** two repetition stops vs AWQ's zero. That is too few to
-call, and the AWQ runs were without MTP; we watch it.
-
-### 2. AWQ — `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125`
+### AWQ — `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125` (best coding fidelity)
 
 AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
 
 | | |
 |---|---|
-| decode, 1 stream | 81.8 tok/s with MTP (short), 76.2 at 16K; 55 tok/s without MTP |
-| aggregate, 10 streams, MTP | 405 tok/s |
+| decode, 1 stream | **81.8 tok/s with MTP** (76.2 tok/s at a 16K prompt); 54.8 tok/s without MTP |
+| decode, 4 streams | 66.0 tok/s per session, 244 tok/s total, with MTP; 50.3 / 193 without MTP |
+| decode, 8 streams | 54.1 tok/s per session, 386 tok/s total, with MTP; 43.9 / 333 without MTP |
+| decode, 10 streams | 45.5 tok/s per session, 405 tok/s total, with MTP; 40.4 / 379 without MTP |
+| prefill | ~4,000 tok/s for one 16K prompt and ~3,900 for one 48K prompt without MTP; ~3,500 / ~3,400 with MTP; 4 × 16K at once: ~4,100 tok/s total without MTP |
+| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 55 → 24 tok/s without MTP); 48K prompts: 1 → 2 streams |
 | MTP acceptance length | 2.05–2.20 |
-| prefill | the same as Intel |
-| quality vs devan | agentic coding at medium **48/50 vs 39/50 (Fisher p 0.015)**; MMLU and TruthfulQA not different |
-| repetition stops in our coding set | 0 |
-| host memory at a 128 GiB CPU KV tier | guard-stopped under a 6-session replay before the fix; the fix (0031 or kernels b70.3) is not yet tested on AWQ on a GPU |
-| per card / KV | not measured / 309,162 GPU KV tokens |
-| download | 180.77 GB |
+| coding (same set) | **48/50 without MTP**; vs devan 39/50 (Fisher p 0.015); 0 repetition stops |
+| knowledge | MMLU 276/300, TruthfulQA 176/200 (medium) |
+| token-level distance to Intel (both MTP) | KL 0.082, top-1 90.2 %; same answer on 97 % of items |
+| per card | 309,162 GPU KV tokens; model size per card: pending the comparable run |
+| download | 180.8 GB |
 
-**Why second:** equal quality to Intel, slower decode with MTP, and the KV-tier memory fix is not yet proven on it.
-The best fallback, with a clean record.
+### devan — `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (reference)
 
-### 3. devan — `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (where we started)
-
-Most likely round-to-nearest; int4 routed experts **and** the full-attention projections.
+Most likely round-to-nearest; int4 routed experts **and** the full-attention projections. Most of
+[docs/measurements/](docs/measurements/README.md) is measured on it (8 slots, earlier settings).
 
 | | |
 |---|---|
-| decode, 1 stream | ~59 tok/s without MTP; 78.5 tok/s with MTP (older settings) |
-| aggregate, 4 streams, no MTP | ~197 tok/s |
-| prefill, no MTP | 4,711 tok/s at 18.7K, 3,711 at 98K |
-| quality | agentic coding at medium 39/50 (AWQ 48/50, p 0.015); MMLU / TruthfulQA level |
-| token distance from Intel | KL 0.20, prose top-1 77 % |
-| repetition stops | not measured on the same set |
-| download | its PLE table is a separate 102.4 GB file; total not measured |
+| decode, 1 stream | ~59 tok/s without MTP; 78.5 tok/s with MTP |
+| decode, 4 streams | ~49 tok/s per session, ~197 tok/s total, without MTP |
+| prefill | **4,711 tok/s at an 18.7K prompt, 3,711 at 98K**, without MTP |
+| coding (same set) | 39/50 (AWQ 48/50, p 0.015); knowledge level with AWQ |
+| token-level distance to Intel | KL 0.20, prose top-1 77 % |
 
-**Why third:** the first build we ran and the one most of [docs/measurements/](docs/measurements/README.md) is
-measured on, but the calibrated builds write working code more often.
+**Benchmark status.** The Intel and AWQ rows above with MTP come from one matrix on kernels 0.1.14.1+b70.2; AWQ's
+without-MTP rows come from an earlier matrix on stock kernels, and its quality rows ran without MTP. AWQ is being measured on the same stack as Intel (kernels b70.3, B70-0030, MTP). The open
+question: why AWQ decodes slower than Intel with MTP, when both use the same int4 kernel (Intel's drafts are accepted
+more often, ~0.68/0.39/0.19 per position vs ~0.63/0.36/0.19).
 
-## Memory is stable now
+## The host-RAM KV tier
 
-The CPU KV tier gives long agent sessions their prefix back from host RAM (~96 % of prompt tokens reused in real use).
-At 128 GiB it used to grow host memory under load until our guard stopped the engine. The cause was in
-vllm-xpu-kernels: every CPU→GPU KV load was staged through a pinned buffer the size of the load, and torch kept those
-buffers. Patch 0031 copies straight from the pinned pool in vLLM; our kernel build b70.3 does the same in the kernel,
-and that is what we serve:
+Agent sessions resend long, growing prompts. The CPU tier keeps their KV cache in 128 GB of pinned host RAM and loads
+it back instead of recomputing it.
 
-| | before | with the fix |
-|---|---|---|
-| xe host memory per rank, two 6-session replays | +2.56 GiB | +0.058 GiB, once, then flat |
-| CPU→GPU load bandwidth | 8–12 GB/s | 19.6–19.9 GB/s |
-| guard stops | yes | none |
+| | |
+|---|---|
+| prompt tokens reused from cache, real agent use (7.3 h, 1,955 requests, mean prompt 93K tokens) | **96.6 %** |
+| … of which from host RAM / from the GPU pool / computed | **65 % / 31 % / 3.4 %** |
+| prompt tokens served, mean over that window | 6,899 tok/s (peak 32,553 tok/s over 1 min), against 230 tok/s computed |
+| KV load bandwidth, host RAM → GPU | **19.6–19.9 GB/s** |
+| host memory under KV reload load (two replays of 6 real sessions) | **flat**: +0.058 GiB per rank once, no RAM-guard stop ([B70-K1 test](docs/measurements/b70.2.md)) |
+| GPU vs RAM split | set by the workload, not the weights: with 6 sessions in flight the GPU pool serves 46–55 % of prompt tokens and RAM the rest; with 3 sessions the GPU pool serves 91 % |
+
+With ~6 agent sessions in flight the GPU pool serves about half of the reusable prefix; the RAM tier serves the
+rest, so a session that comes back after others have filled the GPU pool still gets its prefix in seconds instead of a
+full re-prefill. The engine's working range is ~6 concurrent sessions; beyond that it holds, and everything slows.
+Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 
 ## Two lines
 
@@ -197,6 +189,31 @@ Every switch: [docs/switches.md](docs/switches.md).
 
 Changes are made on the fork branch, then exported here with `scripts/export-series.sh`; `scripts/check-series.sh`
 fails on any drift.
+
+## Credits
+
+This work stands on other people's:
+
+1. **wu1ff — [B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller)** (MIT). The Qwen3.8-Flash-Next B70
+   pack: the XPU gate, the pinned-host PLE table, the HC down-GEMM K-split, the GDN spec-metadata fusion, the 64-bit
+   GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. Patches 0001–0005 are
+   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. Thank you.
+2. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
+   weights we serve, made with [AutoRound](https://github.com/intel/auto-round);
+   [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels), whose upstream fixes #600, #563, #564, #578 and
+   #586 are in our kernel build (by Guancheng Fu, Chaojun Zhang, Qiming Zhang and Tony Lin);
+   [llm-scaler](https://github.com/intel/llm-scaler) and the XPU work in
+   [vLLM #55068](https://github.com/vllm-project/vllm/pull/55068).
+3. **wtdcode** — the [`Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16)
+   weights.
+4. **devan-carlin** — the [`Qwen3.8-Flash-Next-W4A16`](https://huggingface.co/devan-carlin/Qwen3.8-Flash-Next-W4A16)
+   weights, its BF16 PLE table (every INT8 table here is built from it), and the early community vLLM port of
+   the model to XPU (`devan-carlin/vllm@xpu-qwen4exp`).
+5. **TSUMUGI-XE** — [intel/compute-runtime#968](https://github.com/intel/compute-runtime/issues/968), the analysis of
+   Level Zero peer residency mirroring device memory into host memory, and the first shim that works around it.
+6. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
+7. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
+   vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
 
 ## License
 

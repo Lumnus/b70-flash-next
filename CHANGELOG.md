@@ -32,7 +32,7 @@ pinned sources). It replaces wu1ff's closed `libgdn_index64.so` on the stable li
 `git format-patch 0.1.14.1..v0.1.14.1+b70.3` in a clone of the fork; applied with `git am` on upstream tag `0.1.14.1`
 it gives the tag's tree exactly.
 
-Repository: README (models ranked, the memory fix), `engines/intel-autoround-s16-kv128-mtp3.env`,
+Repository: README (setup table, models with throughput per concurrency, the host-RAM KV tier, credits last), `engines/intel-autoround-s16-kv128-mtp3.env`,
 `serve-s16-mtp3.args`, `serve-config-intel-autoround.json`, `tools/intel_snapshot.py`,
 `docs/measurements/b70.2.md`; `scripts/export-series.sh` defaults to `b70/v0.30.0-intel`; `scripts/make-tree.sh` maps
 `0.30.0-b70.1` to `b70/v0.30.0` and later releases to `b70/v0.30.0-intel`; `image/verify-overlay.sh` carries the final
