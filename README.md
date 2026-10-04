@@ -20,8 +20,11 @@ b70.2 ([CHANGELOG](CHANGELOG.md)).
 ## Models
 
 Two calibrated 4-bit checkpoints run on this stack; a third, round-to-nearest one is the reference. **Intel AutoRound
-is the fastest, AWQ has the best coding fidelity; the choice between them is pending a comparable run** (Benchmark
-status below). All three serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE file
+is the fastest, AWQ has the best coding fidelity** (Benchmark status below). Measured side by side: AWQ decodes
+2.8 % slower at one short stream (87.9 vs 90.4 tok/s) and 5 % slower at one 16K stream (85.0 vs 89.8), and level with
+Intel at 4 to 10 streams (within the ~10 % noise); the two builds sit 0.082 KL apart (top-1 agreement 90.2 %), differ
+on no benchmark we ran, and Intel has 2 digit-run repetition stops in 150 coding samples where AWQ has 0. Which one to
+serve is the reader's call. All three serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE file
 ([docs/ple-int8.md](docs/ple-int8.md)). Details: [docs/weights.md](docs/weights.md),
 [docs/measurements/b70.2.md](docs/measurements/b70.2.md).
 
@@ -34,15 +37,15 @@ AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MT
 
 | | |
 |---|---|
-| decode, 1 stream | **90.4 tok/s with MTP** (89.8 tok/s at a 16K prompt); without MTP: pending the comparable run |
+| decode, 1 stream | **90.4 tok/s with MTP** (89.8 tok/s at a 16K prompt); without MTP: not measured |
 | decode, 4 streams | 67.9 tok/s per session, 250 tok/s total, with MTP |
 | decode, 8 streams | 56.1 tok/s per session, 403 tok/s total, with MTP |
 | decode, 10 streams | 48.8 tok/s per session, 436 tok/s total, with MTP |
 | prefill | ~3,600 tok/s for one 16K prompt with MTP; 4 × 16K at once: ~3,000 tok/s total |
-| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 90 → 23.5 tok/s with MTP); 48K: pending the comparable run |
+| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 90 → 23.5 tok/s with MTP); 48K: not measured |
 | MTP acceptance length | 2.20–2.35 |
-| coding (10 agentic tasks × 5, medium effort) | 45/50 with MTP (AWQ 48/50, p 0.44); 2 of 150 samples end in a digit-run repetition stop (AWQ 0) |
-| knowledge | MMLU 280/300, TruthfulQA 178/200 (medium); not different from AWQ |
+| coding (10 agentic tasks × 5; effort none / medium / high) | 38 / 45 / 42 of 50 with MTP (AWQ with MTP 36 / 47 / 40, p 0.82 / 0.71 / 0.80); 2 of 150 samples end in a digit-run repetition stop (AWQ 0) |
+| knowledge | MMLU 280/300, TruthfulQA 178/200 (medium, MTP); AWQ with MTP 275 / 176 (p 0.18 / 0.50) |
 | per card | 20.29 GiB model weights; 311,299 GPU KV tokens at memory fraction 0.88 |
 | download | 78.8 GB (the 102.4 GB BF16 PLE shard in the checkpoint is not used) |
 
@@ -52,17 +55,17 @@ AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
 
 | | |
 |---|---|
-| decode, 1 stream | **81.8 tok/s with MTP** (76.2 tok/s at a 16K prompt); 54.8 tok/s without MTP |
-| decode, 4 streams | 66.0 tok/s per session, 244 tok/s total, with MTP; 50.3 / 193 without MTP |
-| decode, 8 streams | 54.1 tok/s per session, 386 tok/s total, with MTP; 43.9 / 333 without MTP |
-| decode, 10 streams | 45.5 tok/s per session, 405 tok/s total, with MTP; 40.4 / 379 without MTP |
-| prefill | ~4,000 tok/s for one 16K prompt and ~3,900 for one 48K prompt without MTP; ~3,500 / ~3,400 with MTP; 4 × 16K at once: ~4,100 tok/s total without MTP |
-| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts: 2 → 4 streams (per-session 55 → 24 tok/s without MTP); 48K prompts: 1 → 2 streams |
-| MTP acceptance length | 2.05–2.20 |
-| coding (same set) | **48/50 without MTP**; vs devan 39/50 (Fisher p 0.015); 0 repetition stops |
-| knowledge | MMLU 276/300, TruthfulQA 176/200 (medium) |
+| decode, 1 stream | **87.9 tok/s with MTP** (85.0 tok/s at a 16K prompt); 54.8 tok/s without MTP (earlier matrix) |
+| decode, 4 streams | 71.5 tok/s per session, 252 tok/s total, with MTP; 50.3 / 193 without MTP |
+| decode, 8 streams | 55.6 tok/s per session, 396 tok/s total, with MTP; 43.9 / 333 without MTP |
+| decode, 10 streams | 47.9 tok/s per session, 422 tok/s total, with MTP; 40.4 / 379 without MTP |
+| prefill | ~3,500 tok/s for one 16K prompt with MTP; 4 × 16K at once: ~3,100 tok/s total with MTP; 48K with MTP: not measured. Without MTP (earlier matrix): ~4,000 for one 16K, ~3,900 for one 48K, ~4,100 total for 4 × 16K |
+| degradation breakpoint | short prompts: none up to 10 streams; 16K prompts with MTP: 85.0 tok/s per session at 1 stream, 24.5 at 4 (2 streams: not measured); without MTP (earlier matrix): 2 → 4 streams (55 → 24), 48K prompts 1 → 2 streams |
+| MTP acceptance length | 2.18–2.35 (kernels b70.3; per draft position 0.69 / 0.42 / 0.24 at one short stream, Intel 0.70 / 0.40 / 0.19 on b70.2); 2.05–2.20 on the b70.2 kernels |
+| coding (10 agentic tasks × 5; effort none / medium / high) | **36 / 47 / 40 of 50 with MTP** (Intel 38 / 45 / 42, p 0.82 / 0.71 / 0.80); 48/50 at medium without MTP, vs devan 39/50 (Fisher p 0.015); 0 repetition stops in 150 |
+| knowledge | MMLU 275/300, TruthfulQA 176/200 (medium, MTP); 276 / 176 without MTP |
 | token-level distance to Intel (both MTP) | KL 0.082, top-1 90.2 %; same answer on 97 % of items |
-| per card | 309,162 GPU KV tokens; model size per card: pending the comparable run |
+| per card | 309,467 GPU KV tokens at memory fraction 0.88; 30.5–31.1 GiB VRAM in use; model weights per card: not measured |
 | download | 180.8 GB |
 
 ### devan — `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (reference)
@@ -78,10 +81,14 @@ Most likely round-to-nearest; int4 routed experts **and** the full-attention pro
 | coding (same set) | 39/50 (AWQ 48/50, p 0.015); knowledge level with AWQ |
 | token-level distance to Intel | KL 0.20, prose top-1 77 % |
 
-**Benchmark status.** The Intel and AWQ rows above with MTP come from one matrix on kernels 0.1.14.1+b70.2; AWQ's
-without-MTP rows come from an earlier matrix on stock kernels, and its quality rows ran without MTP. AWQ is being measured on the same stack as Intel (kernels b70.3, B70-0030, MTP). The open
-question: why AWQ decodes slower than Intel with MTP, when both use the same int4 kernel (Intel's drafts are accepted
-more often, ~0.68/0.39/0.19 per position vs ~0.63/0.36/0.19).
+**Benchmark status.** AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
+each; the first short one-stream cell after boot ran cold at 68.6 tok/s, the repeat gave 87.9); Intel's speed rows are
+from the b70.2 kernels (2026-10-02, same harness), and Intel on b70.3 is not re-benched (b70.3 changes only the
+CPU → GPU KV load path, which these cells do not use). AWQ's without-MTP rows come from an earlier matrix on stock
+kernels. Quality rows: AWQ with MTP (2026-10-03, MTP on both; the engine ran the 64K-KV test definition); the earlier
+48/50 AWQ coding row ran without MTP. The b70.2 gap (Intel +10–18 % at one stream) is ~0–5 % on b70.3, and the
+acceptance per draft position is now similar for both builds (AWQ 0.69 / 0.42 / 0.24, Intel 0.70 / 0.40 / 0.19 at one
+short stream). Gates on AWQ b70.3: sweep 0 bad at 1–10 streams, burst gate 0/90, structured-output gate 36 ok + 18 plain ok.
 
 ## The host-RAM KV tier
 
