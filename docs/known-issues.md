@@ -122,7 +122,15 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 0032 logs it once per requested mode. Harmless. Note: with **stock** 0.1.14.1 kernels and no `libgdn_index64.so`, the stock GDN op is
 32-bit and an engine dies with `DEVICE_LOST` once a block id passes 5,042; keep wu1ff's library or use our kernels.
 
-## 12. AWQ is not re-tested on this release
+## 12. AWQ on this release: tested on the frozen stack, not on this exact tree
 
-0029b (as 0030 on the AWQ branch) and the KV-load fixes (0031, kernels b70.3) were tested on the GPU with the Intel
-checkpoint only. They do not depend on the weights, but treat the first AWQ boot on b70.2 as their first AWQ test.
+AWQ (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`) has run on the frozen stack (2026-10-04): MTP k=3, 16 slots, 128 GiB CPU
+tier, vllm-xpu-kernels 0.1.14.1+b70.3 (B70-K1), and 0029b as B70-0030. Measured there: the engine boots on the first
+pass (first token 363 s after start); the K1 load line appears on all four workers; the sweep over 1–10 streams has 0 bad
+outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok with the engine alive; host memory is flat
+under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB and ~355 GB of offload loads); 0 tracebacks,
+0 `DEVICE_LOST`. Speeds and quality: README and [measurements](measurements/b70.2.md).
+
+What is still not measured: AWQ on the b70.2 series as released here (the AWQ tree ran 0030 on the b70.1-MTP branch,
+without 0031; 0031 is redundant with b70.3 and stays off); AWQ with the kernels at 48K prompts; token-level identity
+of the direct copy against staging on AWQ.

@@ -81,7 +81,7 @@ Most likely round-to-nearest; int4 routed experts **and** the full-attention pro
 | coding (same set) | 39/50 (AWQ 48/50, p 0.015); knowledge level with AWQ |
 | token-level distance to Intel | KL 0.20, prose top-1 77 % |
 
-**Benchmark status.** AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
+**Benchmark status.** The Intel and AWQ speed rows are not on the same kernels: Intel's are from the b70.2 kernels, AWQ's from b70.3. AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
 each; the first short one-stream cell after boot ran cold at 68.6 tok/s, the repeat gave 87.9); Intel's speed rows are
 from the b70.2 kernels (2026-10-02, same harness), and Intel on b70.3 is not re-benched (b70.3 changes only the
 CPU → GPU KV load path, which these cells do not use). AWQ's without-MTP rows come from an earlier matrix on stock
