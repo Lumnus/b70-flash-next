@@ -1,5 +1,5 @@
 From 4a167d20b08b2784522e04c2589324272fb2fab5 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 08:28:13 +0000
 Subject: [PATCH] [GDN] causal_conv1d: compute the conv-state pointer offset in
  64 bits

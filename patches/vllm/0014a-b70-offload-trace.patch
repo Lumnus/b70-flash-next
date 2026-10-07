@@ -1,5 +1,5 @@
-From 71efd59a0957bd0c0c71932ab7381bae2a0892ac Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From e64138916cfc564ed0c9a781806f66e4cbdebee5 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:36:45 +0000
 Subject: [PATCH] 0014a-b70-offload-trace: env-gated KV-offload instrumentation
  (B70_OFFLOAD_TRACE=1)

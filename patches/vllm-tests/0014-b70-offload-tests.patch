@@ -1,5 +1,5 @@
-From 0369d95b15016061f925f8123eca7ed589e00695 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 3ed02b178680e3ef24a0f9c74870ba8db37b33ed Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:38:00 +0000
 Subject: [PATCH] 0014b-b70-offload-junction: heal a hybrid prefix after one
  miss (B70_OFFLOAD_JUNCTION=1)
@@ -159,8 +159,8 @@ index 0000000..f7bb858
 +    )
 +    assert without == [False, False, True, False]
 +    assert with_junction == [False, True, True, False]
-From 80aacb5725e89352755c0b77f7412c8eacab7cf0 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 0b0fafc3c992e1ab3385cd0068342907ffb2ac52 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:39:39 +0000
 Subject: [PATCH] 0014c-b70-offload-gdn-backstep: retain Mamba states N blocks
  below the replay boundary (B70_OFFLOAD_GDN_BACKSTEP=N)
@@ -233,8 +233,8 @@ index f7bb858..fb86321 100644
 +            reachable_boundaries=boundaries,
 +        )
 +        assert mask == [True, True, True, False]
-From b714309e9e69ea41e38a2e0a7e17f30477b71b77 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 4916836072f80d24c5cd69e1ffa8e1492da12a04 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:40:43 +0000
 Subject: [PATCH] 0014d-b70-offload-empty-advance-guard: do not skip past
  write-pending keys (B70_OFFLOAD_EMPTY_ADVANCE_GUARD=1)
@@ -346,7 +346,7 @@ index fb86321..e9cf129 100644
 +    assert len(jobs) == 1
 +    [job] = scheduler._jobs.values()
 +    assert job.keys == {key}
-From 11a65f29a180a38d18c2d68feca52d79675a44ec Mon Sep 17 00:00:00 2001
+From af64eccefceea05bc18047c87b8a3a6cf745127a Mon Sep 17 00:00:00 2001
 From: MINJUN GIL <alswnsrlf12@naver.com>
 Date: Tue, 29 Sep 2026 21:40:54 +0000
 Subject: [PATCH] 0014e-b70-offload-group-evict: backport vllm#51787
@@ -1125,8 +1125,8 @@ index f737685..771153e 100644
          chunks = to_keys(range(2))
          ctx = ReqContext(req_id="req_delayed_secondary")
          calls: list[tuple[str, str]] = []
-From bd64e11aef2b9b5b01ab8b9a6b40add07c35865d Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From b16c886174fe3949d813351046a8ff7325a213ec Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 06:20:00 +0000
 Subject: [PATCH] 0014f-b70-offload-gates: #51787 backport opt-in
  (B70_OFFLOAD_GROUP_EVICT=1); cheap TRACE=1

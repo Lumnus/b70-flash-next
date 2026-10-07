@@ -1,9 +1,10 @@
-# PROVENANCE — b70-flash-next 0.30.0-b70.1
+# PROVENANCE — b70-flash-next 0.30.0-b70.1 and 0.30.0-b70.2
 
 Where every piece of the image comes from, and the hashes that prove it. Grades: **[M]** measured by us ·
 **[W]** third-party claim, not reproduced · **UNVERIFIED**. The source of the vLLM patches is the fork branch
 `b70/v0.30.0` of github.com/Lumnus/vllm (one commit per patch on v0.30.0 `ced6857afa`); `patches/` is exported from
-it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`.
+it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`. From 0.30.0-b70.2 the branch is
+`b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7).
 
 ## 1. Bases
 
@@ -52,7 +53,7 @@ changes for 0013/0014 live in `patches/vllm-tests/` (never applied to the image;
 | L9 chunked pinned CPU KV pool (always on; one tensor whenever it fits, otherwise equal power-of-two row-aligned chunks; a null pinned allocation raises instead of being filled) | `0018-b70-offload-chunked-pinned-pool.patch` · `f97fb491372d0f420ba1eb099f92e06830577245aae240c028f79c09a2d83a7c` (tests: `patches/vllm-tests/0018-b70-offload-chunked-pinned-pool-tests.patch` · `479eb266e59bc161605230fd253e58ecb9c93b9258e58ae471d2561f3dcac7dc`) | `vllm/v1/kv_offload/cpu/gpu_worker.py` | — | see §5 | 0013 (same file) |
 | L10 dense-QSA: skip `*.self_attn.indexer.*` checkpoint tensors (always on; affects only configs without `indexer_n_heads` whose checkpoint still ships indexer tensors) | `0019-b70-qwen4exp-dense-qsa-skip-indexer.patch` · `0188886fb52d25c11084bda06715cc4b69f2ae3ba8bb23786a63be70de264fd5` | `vllm/models/qwen4_exp/nvidia/model.py` | — | see §5 | — |
 | P6 binary | **COPY --from the wu1ff image by digest**; no public source | `site-packages/vllm_xpu_kernels/libgdn_index64.so` (4,380,128 B; ELF, not stripped; embeds `csrc/xpu/gdn_attn/…` source paths; GCC 13.3.0 Ubuntu) | `426ebaaaf907281bbfaf34a3a54a7d69ed8a008e3810c1992f0b33b59536a92b` | `0fc700d337b71dfd6f2d4d08ca8ec588a26fc1bd669ed9034c6e4e468a804b75` (matches wu1ff's stated hash) | — |
-| P6 kernel source | `patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` (7 sites) · `d7b1e3f7868c489e1ff0a35094c2d66dfc05ca31c3cc601f1567ceb17fc2d612` | `csrc/xpu/gdn_attn/causal_conv1d.hpp` (3), `csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp` (2), `…/chunk_causal_conv1d_xe2.hpp` (2) | — | not used by this image (torch 2.13) | **built** into vllm-xpu-kernels `0.1.15.4+b70.1` (fork branch `b70/v0.1.15` @ `69b823f9` = upstream `release/0.1.15.4` + this commit, clean cherry-pick); device code compared with the official wheel by disassembly (§6) [M] |
+| P6 kernel source | `patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` (7 sites) · `498c0dbd8c59d05d9b0d7b53f2f66262f8846cd7b2a017e45b678a2b189e9938` | `csrc/xpu/gdn_attn/causal_conv1d.hpp` (3), `csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp` (2), `…/chunk_causal_conv1d_xe2.hpp` (2) | — | not used by this image (torch 2.13) | **built** into vllm-xpu-kernels `0.1.15.4+b70.1` (fork branch `b70/v0.1.15` @ `69b823f9` = upstream `release/0.1.15.4` + this commit, clean cherry-pick); device code compared with the official wheel by disassembly (§6) [M] |
 | P7 L0 peer-residency shim | **COPY --from the wu1ff image by digest**; no public source (not in wu1ff's public repo) | `/opt/b70-residency-shim/libl0_peer_residency_shim.so` (17,760 B; source name `l0_peer_residency_shim.c`; zelTracer-based) | `512b136c0deacc7459daf8226f7ce8143a14a782070f4fa6312c0e7185e60401` | `ae2c82f549d97393268cbd7b90dba7cf38fd00dbccae54f090b1a545e5613b3c` (matches wu1ff's stated hash) | — |
 | P8 dense-QSA serve config | file `image/files/opt/b70-flashnext/serve-config.json` (wu1ff, MIT); source form `image/derive-serve-config.py` (HF config `b9ef7d7d…` @`40b8f18d` minus 5 `indexer_*` keys, `json.dumps(indent=2)+"\n"` — checked OK) | `/opt/b70-flashnext/serve-config.json` | `c6306db9…` | `91fa33ca705157739a56d2d56fd568fa20cf6b4e7928bcdc3410c8792408791f` | — |
 | P8 entrypoint | file `image/files/opt/b70-flashnext/prepare-serve.sh` (wu1ff, MIT), mode 0755 | `/opt/b70-flashnext/prepare-serve.sh` | `bcee61bc…` (+ chmod `fc11d9c5…`) | `3f246a046c51cda8e7e582524bcf806d34b2cca3425736bd53286621a4a170e4` | P8 config |
@@ -166,3 +167,106 @@ The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The
 | index | `tools/awq_snapshot.py snapshot`: 222,746 → 222,579 tensors (−128 PLE shard tensors, −39 `self_attn.indexer.*`); equal, key for key and file for file, to the index of our serving snapshot |
 | serve config | `engines/serve-config-awq.json`, sha256 `c7a2b345927976d911cfd57d1083b71d1a75fee245f61a17b8f126b6717342c8` = `image/files/opt/b70-flashnext/serve-config.json` + `ignore` entries `re:^mtp.*`, `re:.*self_attn\..*` (reproduced by `tools/awq_snapshot.py serve-config`); byte-identical to the file we serve |
 | engine | derived from our serving definition: TP4 + EP, 16 slots, capture sizes `[1,2,4,8,16,256,512,1024]`, `--gpu-memory-utilization 0.85`, 128 GiB native CPU KV tier, INT8 PLE on NVMe, 0014jb, temperature 0.7, presence 0. Differences: the checkpoint's chat template instead of our modified one; docker instead of our launcher. Not run in this form |
+
+## 7. Release 0.30.0-b70.2 (2026-10-07)
+
+Grades as above. Source: github.com/Lumnus/vllm `b70/v0.30.0-stable` @ `9d79d28d7e32f33bdbd115c85d116583ce679cb6`, tag `v0.30.0-b70.2`:
+35 commits on `ced6857a` (33 files in `patches/vllm/`, 3 in `patches/vllm-tests/`). The branch consolidates the two
+working lines we tested on: `b70/v0.30.0-intel` @ `640f21881a` (Intel; the union) and `b70/v0.30.0-mtp0020` @
+`4512442c79` (the AWQ engine of the endurance run: 0001–0027 and B70-0030, which is the same change as 0029b). Every
+commit was rewritten from `640f21881a`: neutral author and committer (`Lumnus`; 0001–0005 keep wu1ff, 0014e keeps the
+upstream author), messages without lab references, author dates kept. The tree differs from `640f21881a` in six files
+only: the debug flag-file directory (`/run/b70-probes/` in 0023, 0023c, 0026, 0027) and code comments in 0029, 0029b
+and 0031 (16 lines changed). What that means for AWQ: docs/known-issues.md item 12. Release assets: the kernel wheel below.
+
+**Checks [M] (CPU host, no image built):** `scripts/check-series.sh` → patches/ equals the export of the branch (33 + 3
+files). `scripts/make-tree.sh 0.30.0-b70.2 --from-patches` → all 33 files touched by the series carry the
+`verify-overlay.sh` final sha256 (six recomputed for this release), and the resulting `vllm/` equals the branch's
+`vllm/` file for file. The diffs of 0001–0022 and 0028 are unchanged from the working lines (only commit ids and author
+lines differ). The six pre-existing files first touched by 0020–0032 were not compared against the base image layers.
+The six edited files compile (`py_compile`); the branch is not yet booted on a GPU.
+
+| file | sha256 |
+|---|---|
+| `vllm/0001-qwen4exp-xpu-gate.patch` | `6c6ca4b2bc32019e58599ae084228914a571040c2498c3411c8938a58075e0e0` |
+| `vllm/0002-qwen4exp-ple-pinned-host-uva-and-capture-stream.patch` | `bb887f1336dd6d5502e21499adf8c6738c1c783b8f20c45453f7810d39170b98` |
+| `vllm/0003-qwen4exp-hc-down-gemm-ksplit.patch` | `a70321a5df0193e88d9cac85bc37d99a1122a4c9395f626154d0836fb276317a` |
+| `vllm/0004-gdn-spec-metadata-fusion.patch` | `b41d2d381c74050a3fc337b1e1d19cb2c2901d112def5a689631c8962bb03279` |
+| `vllm/0005-xpu-ops-gdn-index64-hook.patch` | `7ee8a19cf16f1718c8abc00b7cbd2afb3498e874419d12968b6a02027b3e2b06` |
+| `vllm/0006-b70-ple-direct-pinned-load.patch` | `84489553b6ee3c09333f0caf66deff3d45ea44583b00565b98bd73f19cfb9790` |
+| `vllm/0007-b70-ple-fp8-pinned-table.patch` | `870c1333d31d39155dcdc5bca0466f8dd99fd696f5b8f09f9caf3ee64b194b84` |
+| `vllm/0008-b70-ple-int8-rowscale-pinned-table.patch` | `e357660e56fec76ea97f333371c62a10f380ee7a9a3edc9be8d0bf5fa2b95487` |
+| `vllm/0009-b70-thinking-budget-per-requested-effort.patch` | `14b8e60ec3816e292f02e1e52cc2a0e21fc2cd699e0b21854ee8550f025b35e0` |
+| `vllm/0010-b70-default-repetition-detection.patch` | `7c63a802e11d004667ce951dcafae081ebbdade6f928c52afc466bae92270d43` |
+| `vllm/0012-b70-reasoning-effort-alias.patch` | `995e9bffa3c77678b4edf4bc4ab03f00701f7d1c546d2cd5ca30a5652518688f` |
+| `vllm/0013-b70-ple-int8-nvme-table.patch` | `ded0459a73c394c298d70c29a1fec67c09a2ad6932fd2600b2db77eb1799de4e` |
+| `vllm/0013b-b70-ple-int8-nvme-lookahead.patch` | `1f537117ba2f3c1ae1ec0833e48b05a6e2ba11977bcc45ecc89e4ed085fd5484` |
+| `vllm/0014a-b70-offload-trace.patch` | `a50aae2669af2059189410b6452e4503678b8baef19ca74202cfa6fde5b751cd` |
+| `vllm/0014b-b70-offload-junction.patch` | `8c677dea85ee9d801724da5c6995654d1b8bd29f5245e6587e9c0569f6727f34` |
+| `vllm/0014c-b70-offload-gdn-backstep.patch` | `fc8382afbe0d1dac3ddc0cf3f95944dd3d1dbe8dfec0e4f471931cf67b134f91` |
+| `vllm/0014d-b70-offload-empty-advance-guard.patch` | `e607a3edfa9ca239f022d46e6e53b63220c649caac7059f2f719373952cff6f8` |
+| `vllm/0014e-b70-offload-group-evict-51787.patch` | `2d37a29335e3e3c5802e8af9b79a63b6c01bd3ebc99de09a4ed8599af53c140f` |
+| `vllm/0014f-b70-offload-gates.patch` | `8c9024921b0e688f9d4739f27ea51880025ed3caad6d63992238b37f25d349ca` |
+| `vllm/0018-b70-offload-chunked-pinned-pool.patch` | `f1e344ccb4aa8c12268186e3756ab13b16a3eb7d1d0b05956ec4795823553a83` |
+| `vllm/0019-b70-qwen4exp-dense-qsa-skip-indexer.patch` | `aa6ad65874d2776df0f24f05b4d071b07f6193206f02811d59fe2bd66ba61e61` |
+| `vllm/0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer.patch` | `65b7aca53b815b5a5e8aba45917c33a30748561825751318c374370e8ef12949` |
+| `vllm/0021-b70-mtp-draft-prefill-no-piecewise-xpu.patch` | `010b21825d34aad6a0dc2361f48ddd41b6caacea05d1f3dcf09ee5978426c6f2` |
+| `vllm/0022-b70-port-vllm55506-mamba-spec-block-tables-by-req-slot.patch` | `285952a5054f702ac334f607715e961b39afcab0d1a8756437873572ebe5b9e4` |
+| `vllm/0023-b70-gdn-op-mode-switch-and-nan-tracer.patch` | `242d6ce0af5594e015ecd4704d90a516feb566b84b47d95653287ed7f291331f` |
+| `vllm/0023c-0024t-b70-sampling-nan-tracer-and-null-block-probe.patch` | `963811ce0094a99312484fbac022cef2e8aa550544a23c2376f81dfcf5772de2` |
+| `vllm/0026-b70-mtp-uniform-drafts-guard.patch` | `fbdc91db1344248262bbd3fc06777dbff9d38d80df8f704a8941c6b62cd72688` |
+| `vllm/0027-b70-gdn-index64-lib-optional.patch` | `53d12efd9ed013b4bee8c1ce526f49b2907dca67634fc344aa6b023934814b85` |
+| `vllm/0028-b70-qwen4exp-ple-accepts-incconfig.patch` | `f3c852035f7cd9d8eb0d81290c2f401bf0d1e0eddf036a643daa3b5825fdc568` |
+| `vllm/0029-b70-prompt-logprobs-row-chunks-v1.patch` | `ec82b5beba23613cb700db00a035f361de5f4d6ecd9dcb9a29614f756229f899` |
+| `vllm/0029b-b70-prompt-logprobs-row-chunks-v2.patch` | `d4b331d6a22e074fd9fc9011337f76898b43477a82445b6913d7019720647001` |
+| `vllm/0031-b70-offload-h2d-direct-from-pinned.patch` | `39166c1321b31bfc27fd13f435a8895d5af3bd1a9eee0ba879dcca48d4e46712` |
+| `vllm/0032-b70-index64-fallback-warn-once.patch` | `0d36b53ee8b4a42754f7b5edc3c97a6140f202b4e28de0e2f2b3aea6e5f77720` |
+| `vllm-tests/0013-b70-ple-int8-nvme-tests.patch` | `83dd081a4fd177c42396c54d7c6b4bfacd5c781c01957c3bfc2c42056b275619` |
+| `vllm-tests/0014-b70-offload-tests.patch` | `440b62c2bf6a5ae33672e62556d1f4b3957ac86ebc0ed9c653cfb02dab8e8dc1` |
+| `vllm-tests/0018-b70-offload-chunked-pinned-pool-tests.patch` | `7fc64f4076fef5b1da4dc3ff8d8130a23e834a0bd0456d01309d2747a72cd278` |
+
+Full-stack result of the files 0020–0032 touch (both roots), as asserted by `verify-overlay.sh final` (the 0027 result
+is overwritten by 0032 in `vllm/_xpu_ops.py`; 0023 likewise):
+
+| sha256 | last patch | file |
+|---|---|---|
+| `c56577011b058f386ddc44b1b713e34a2e4086a68b2c2a6e971f82fdf0dcd1fc` | 0028 | `vllm/models/qwen4_exp/nvidia/ngram_embedding.py` |
+| `0b02bdb26b340d57869861c0570815bc68d36812a87c1b78a16960f3b20f842a` | 0023c | `vllm/v1/worker/gpu/model_runner.py` |
+| `98b50a3b6e780ecdb7deb96a1e9ca3663cc7aba9e4ffe051f97c1b14d3df0fe8` | 0031 | `vllm/v1/kv_offload/cpu/gpu_worker.py` |
+| `937e354df45010190858fb4460b50ebe3fdbd7dc570fd8391fe566cd53d792e2` | 0026 | `vllm/v1/core/sched/scheduler.py` |
+| `a32da0c0d4bebb7694da16d0b78643496c82960ab421fac86a489486ef76b706` | 0032 | `vllm/_xpu_ops.py` |
+| `d1ba61dd9843e536fff1933b2dca18d92a308d6d7516f0c6ff73ce1b56ea963c` | 0020 | `vllm/models/qwen4_exp/nvidia/mtp.py` |
+| `5f688e3972a0a7491ecfa786135d2fa0e1a5aa148e97a9ef3cf507cff6dbe171` | 0021 | `vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py` |
+| `e2b41b0b066d1d9e18ca0ce4f135df46ebf0ba0084888441dba4d171d1342021` | 0022 | `vllm/v1/worker/gpu/model_states/mamba_hybrid.py` |
+| `e5014b3e6f2808aa0aca6478e0c650000a0233d16b5abc9cfdf82533b1b749dc` | 0022 | `vllm/v1/worker/mamba_utils.py` |
+| `6e79d4687c38aad5c26cb2eeeada4909ae60008c266993105d4e4c5ed31326ad` | 0029 | `vllm/v1/worker/gpu_model_runner.py` |
+| `ab17fa440e054fe1414956d80f08b67fa733171020ebe1a67c8a6bdaab29f9d1` | 0029b | `vllm/v1/worker/gpu/sample/prompt_logprob.py` |
+
+**Kernels: vllm-xpu-kernels `0.1.14.1+b70.3`** [M]:
+
+| | |
+|---|---|
+| source | github.com/Lumnus/vllm-xpu-kernels tag `v0.1.14.1+b70.3` = `493364ab1b930d346891be9085abadd83f2784cf` (branch `b70/v0.1.14`) = upstream tag `0.1.14.1` (`6d92b1bfbf32767ecda8e819613eb151e70030ad`) + 7 commits |
+| series | `patches/vllm-xpu-kernels/b70.3/` (`git format-patch 0.1.14.1..v0.1.14.1+b70.3`, with the `From:` author line of our two commits, 0001 and 0007, set to `Lumnus`); `git am` on `0.1.14.1` gives tree `ff5a092cddedfac2beffe0069e0bf1f1e30306a0`, equal to the tag (re-checked 2026-10-07) |
+| wheel | 351,983,263 B, sha256 `f104a3e5f61480681284ec3632e1a6692358b72a1fbdbda7406db0d7b7d1d589`, attached to the [release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2); vs the b70.2 build only `_C.abi3.so` differs; 106 op schemas identical to b70.2, whose schemas match b70.1, which was checked against the official 0.1.14.1 wheel |
+| on the GPU | B70-K1 log line on all 4 workers; two 6-session KV replays: xe host +0.058 GiB per rank once, 19.6–19.9 GB/s, 0 errors (docs/measurements/b70.2.md §3) |
+
+- `b70.3/0001-GDN-causal_conv1d-compute-the-conv-state-pointer-off.patch` · `387a64de3e8263e92e3f8502f7d6c838d106dab1bf8ce1a1f083558d641935c7`
+- `b70.3/0002-GDN-Fix-ragged-speculative-token-traversal-600.patch` · `8794837a3f52a9e5944a9dfb9da76b8a5be843ca86108a2b958c0018eacffc15`
+- `b70.3/0003-fix-xpu-preserve-tensor-strides-when-pinning-non-pin.patch` · `165c5a377d854b58f7504bff4998515772fe989f03465593bcd6f49b4ca1d6c8`
+- `b70.3/0004-fix-topk_topp_sampler-unaligned-vocab_size-563.patch` · `98bc267e2d5bca97640e6b43887ffa6a95508cf96575826042faeefcd079a21c`
+- `b70.3/0005-EP-Fix-negative-expert-IDs-in-XPU-MoE-remapping-578.patch` · `3b0512f19310ae645686dc668c55add161866127f8972aad02828e8f08275c6c`
+- `b70.3/0006-fix-initialize-atomic_buffer-to-0-to-avoid-race-cond.patch` · `b3e781913912df006e8cde922d63f3dfaca5826abc756462e36c61eb168af008`
+- `b70.3/0007-B70-K1-swap_blocks_batch-H2D-copies-directly-from-pi.patch` · `d0ce420b09a99f2610a8edcfa2866e606c73c5a03365446b2c5ff90aa83863c7`
+
+**Intel weights (the alternative)** [M]: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`
+(29 files, 181.24 GB; still the head revision on 2026-10-03), license qwen-community-1.0 per the card. Every file
+sha256-verified against the Hugging Face tree at download. Snapshot: `tools/intel_snapshot.py` (224,280 → 224,113
+tensors; equal in count to the snapshot we serve). Serve config `engines/serve-config-intel-autoround.json`, sha256
+`e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7`, reproduced by `tools/intel_snapshot.py
+serve-config` byte for byte. INT8 PLE table: as in §6 (built from devan's BF16 table); the identity of Intel's BF16
+PLE rows (shard 16) with devan's table is UNVERIFIED.
+
+**Runtime we serve on** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
+kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro
+B70. Our host image is internal and not published.

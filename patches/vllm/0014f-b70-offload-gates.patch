@@ -1,5 +1,5 @@
-From bd64e11aef2b9b5b01ab8b9a6b40add07c35865d Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From b16c886174fe3949d813351046a8ff7325a213ec Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 06:20:00 +0000
 Subject: [PATCH] 0014f-b70-offload-gates: #51787 backport opt-in
  (B70_OFFLOAD_GROUP_EVICT=1); cheap TRACE=1

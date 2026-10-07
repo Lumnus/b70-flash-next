@@ -1,5 +1,5 @@
-From 41a455c5a1310be6b24200417d588d319f941b50 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From cff3722d94678790533aa89f1e5a5837d4dc41af Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 20:24:26 +0000
 Subject: [PATCH] 0013b-b70-ple-int8-nvme-lookahead
 

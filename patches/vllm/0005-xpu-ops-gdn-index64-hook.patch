@@ -1,4 +1,4 @@
-From 1c1ec8ec09548707bed684c471bed7ece63ab1bb Mon Sep 17 00:00:00 2001
+From ac2e82ffc18bc3e2563a4bbc1af223a68e4b89a4 Mon Sep 17 00:00:00 2001
 From: wu1ff <197699991+wu1ff@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 17:16:53 +0000
 Subject: [PATCH] 0005-xpu-ops-gdn-index64-hook

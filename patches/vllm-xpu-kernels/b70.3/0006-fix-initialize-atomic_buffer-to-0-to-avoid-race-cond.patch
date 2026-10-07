@@ -1,0 +1,73 @@
+From e68951b0a78ad774646aa6f987155861e043bf20 Mon Sep 17 00:00:00 2001
+From: Tony Lin <tony.lin@intel.com>
+Date: Thu, 10 Sep 2026 22:02:43 +0800
+Subject: [PATCH 6/7] fix: initialize atomic_buffer to 0 to avoid race
+ conditions (#586)
+
+* fix: initialize atomic_buffer to 0 to avoid race conditions
+
+Co-authored-by: Wang, Liyan <liyan1.wang@intel.com>
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+* refine comments
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+* refine comments per maintain's feedback
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+---------
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+Co-authored-by: Wang, Liyan <liyan1.wang@intel.com>
+(cherry picked from commit 3d74ec984e14ddbf17262e65f2a8cb51b7a25cb4)
+---
+ csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp          | 9 ---------
+ .../xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp | 7 +++++--
+ 2 files changed, 5 insertions(+), 11 deletions(-)
+
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+index 7775e4d..e7a1103 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+@@ -102,15 +102,6 @@ CUTE_DEVICE void MoEGEMM(
+   int group_range = item.get_group_range(1);
+   int local_id = item.get_local_linear_id();
+ 
+-  if (group_id == 0 && local_id == 0) {
+-    auto atm = sycl::atomic_ref<
+-        int,
+-        sycl::memory_order::relaxed,
+-        sycl::memory_scope::device,
+-        sycl::access::address_space::global_space>(atomic_buffer[0]);
+-    atm.store(0);
+-  }
+-
+   int pre_rows = 0;
+   int pre_tiles = 0;
+ 
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+index c8ded43..fa289be 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+@@ -249,8 +249,11 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+     TORCH_CHECK(ptr_bias->size(1) == N, "ptr_bias.size(1) must match N");
+   }
+ 
++  // Must be zeroed before kernel launch. Workgroup execution order
++  // is non-deterministic, so initializing in the definition is the most
++  // safe place to avoid any race condition as well as garbage data
+   at::Tensor atomic_buffer =
+-      at::empty({static_cast<long>(1)}, ptr_A.options().dtype(at::kInt));
++      at::zeros({static_cast<long>(1)}, ptr_A.options().dtype(at::kInt));
+ 
+ #define MoEGEMMLauncherCallER(                                                 \
+     LayoutA,                                                                   \
+@@ -732,4 +735,4 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+ #undef MoEGEMMLauncherCallER
+   return ptr_D;
+ }
+-}  // namespace MoE
+\ No newline at end of file
++}  // namespace MoE

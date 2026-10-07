@@ -1,5 +1,5 @@
-From bd0c807e9e8953610b7b2b8e9457116c3648de78 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From d3154ab290fc82f9a879c2cbe7d29650ab11e4c9 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 20:05:39 +0000
 Subject: [PATCH] 0013-b70-ple-int8-nvme-table
 

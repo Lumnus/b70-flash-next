@@ -1,0 +1,209 @@
+From fadbcdafa3bba724a7d25ac764e59a50dea71368 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 3 Oct 2026 14:29:30 +0000
+Subject: [PATCH] B70-0031: KV offload CPU->GPU loads DMA straight from the
+ pinned pool (no staging)
+
+vllm-xpu-kernels swap_blocks_batch stages every CPU->GPU batch through one
+pinned buffer of the batch total, taken from torch XPU CachingHostAllocator,
+even though the offload pool is already pinned. With
+pinned_max_cached_size_mb:1024 that buffer is rounded to a power of two and
+cached forever: one block per concurrently outstanding load per size class.
+Under CPU-tier-heavy traffic (6 replayed agent sessions, 128 GiB CPU tier) worker xe host
+memory grew 64 MiB + 0.5 + 1 + 1 GiB per rank and a host-memory guard
+stopped both engines.
+
+With B70_OFFLOAD_H2D_DIRECT=1 the CPU->GPU handler maps each descriptor back
+to (storage, offset), merges descriptors contiguous on both sides, and issues
+non_blocking torch copies on the transfer stream. torch-xpu-ops copies a
+pinned source with a direct q.memcpy + record_event on the pool block (no
+staging). The manager keeps a loading chunk ref_cnt > 0 until its job
+finishes, so no snapshot is needed (same assumption as CUDA
+cuMemcpyBatchAsync). A descriptor outside its segment raises instead of
+copying. GPU->CPU stores are unchanged (already direct). Unset/0 = upstream.
+
+One-time log lines per worker: "B70-0031: CPU->GPU KV loads copy directly
+from the pinned offload pool (...)" at init, and "B70-0031: first direct
+CPU->GPU load: N descriptors -> M copies" on the first load.
+---
+ vllm/v1/kv_offload/cpu/gpu_worker.py | 153 +++++++++++++++++++++++++++
+ 1 file changed, 153 insertions(+)
+
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index b753cf9..37ef5f1 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import functools
++import os
+ import time
+ from collections import deque
+ from collections.abc import Sequence
+@@ -214,6 +215,149 @@ def compute_sub_block_ptrs(
+     output[:] = flat[skip_count : skip_count + num_sub_blocks]
+ 
+ 
++# ---- B70-0031: direct CPU->GPU loads from the pinned offload pool ----
++#
++# vllm-xpu-kernels' swap_blocks_batch (xpuAsyncMemcpyBatch, 0.1.14.x/0.1.15.x)
++# stages every CPU->GPU batch through ONE pinned buffer of the batch's total
++# size, taken from torch's XPU CachingHostAllocator, even when the source is
++# already pinned (it treats usm::alloc::host like pageable memory). With
++# PYTORCH_ALLOC_CONF=pinned_max_cached_size_mb:1024 that buffer is rounded up
++# to a power of two and kept in the host cache for the life of the process:
++# one block per concurrently outstanding load per size class. Under CPU-tier
++# heavy traffic this grew xe host memory by 0.5 + 1 + 1 GiB per rank and
++# tripped a host-memory guard with a 128 GiB CPU KV tier.
++#
++# The offload pool is pinned (torch pin_memory, USM host) and the manager keeps
++# a chunk's ref_cnt > 0 until its load job reports finished (after end_event),
++# so the snapshot the staging buffer provides is not needed: the copy can DMA
++# straight from the pool, as cuMemcpyBatchAsync does on CUDA. torch's own
++# non_blocking H2D copy does exactly that for a pinned source (torch-xpu-ops
++# Copy.cpp: isPinnedPtr(src) -> q.memcpy + record_event on the pool block;
++# no staging), on the current stream, which transfer_async has set to the
++# transfer stream. Descriptors that are contiguous on both sides are merged.
++#
++# B70_OFFLOAD_H2D_DIRECT=1 enables it; unset/0 = upstream behaviour.
++
++_B70_0031_LOGGED_INIT = False
++_B70_0031_LOGGED_FIRST = False
++
++
++def b70_offload_h2d_direct_enabled() -> bool:
++    return os.environ.get("B70_OFFLOAD_H2D_DIRECT", "0") == "1"
++
++
++class _B70DirectH2DCopier:
++    """swap_blocks_batch replacement for CPU->GPU on XPU: maps each raw
++    descriptor pointer back to (storage view, byte offset) and issues
++    non_blocking torch copies from the pinned pool, one per merged run."""
++
++    def __init__(self, src_segments, dst_segments):
++        # segments: list of (base_ptr, nbytes, flat uint8 tensor), sorted
++        self._s_base = np.array([s[0] for s in src_segments], dtype=np.uint64)
++        self._s_end = np.array([s[0] + s[1] for s in src_segments], dtype=np.uint64)
++        self._s_view = [s[2] for s in src_segments]
++        self._d_base = np.array([s[0] for s in dst_segments], dtype=np.uint64)
++        self._d_end = np.array([s[0] + s[1] for s in dst_segments], dtype=np.uint64)
++        self._d_view = [s[2] for s in dst_segments]
++
++    @staticmethod
++    def _segments(tensors) -> list:
++        """One flat uint8 view per distinct storage behind the given tensors
++        (several layer tensors may share one storage)."""
++        seen: dict[int, tuple] = {}
++        for t in tensors:
++            parts = t.chunks if isinstance(t, ChunkedHostTensor) else [t]
++            for p in parts:
++                st = p.untyped_storage()
++                base = st.data_ptr()
++                if base in seen:
++                    continue
++                flat = torch.empty(0, dtype=torch.uint8, device=p.device)
++                flat.set_(st)
++                seen[base] = (base, st.nbytes(), flat)
++        return sorted(seen.values(), key=lambda s: s[0])
++
++    @classmethod
++    def build(cls, cpu_tensors, gpu_tensors):
++        global _B70_0031_LOGGED_INIT
++        parts = [
++            p
++            for t in cpu_tensors
++            for p in (t.chunks if isinstance(t, ChunkedHostTensor) else [t])
++        ]
++        if not all(p.is_pinned() for p in parts):
++            logger.warning(
++                "B70-0031: CPU offload buffer is not pinned; CPU->GPU loads keep "
++                "the staging path (swap_blocks_batch)."
++            )
++            return None
++        src = cls._segments(cpu_tensors)
++        dst = cls._segments(gpu_tensors)
++        if not _B70_0031_LOGGED_INIT:
++            _B70_0031_LOGGED_INIT = True
++            logger.info(
++                "B70-0031: CPU->GPU KV loads copy directly from the pinned offload "
++                "pool (%d host segments, %.2f GiB; %d device segments), "
++                "no pinned staging buffer",
++                len(src),
++                sum(s[1] for s in src) / 2**30,
++                len(dst),
++            )
++        return cls(src, dst)
++
++    @staticmethod
++    def _locate(ptrs, base, end):
++        idx = np.searchsorted(base, ptrs, side="right").astype(np.int64) - 1
++        if (idx < 0).any():
++            raise RuntimeError("B70-0031: descriptor pointer below every segment")
++        return idx, ptrs - base[idx]
++
++    def __call__(self, src_ptrs, dst_ptrs, sizes, is_src_access_order_any=False):
++        global _B70_0031_LOGGED_FIRST
++        n = int(sizes.numel())
++        if n == 0:
++            return
++        s = src_ptrs.numpy().view(np.uint64)
++        d = dst_ptrs.numpy().view(np.uint64)
++        sz = sizes.numpy().view(np.uint64)
++        si, so = self._locate(s, self._s_base, self._s_end)
++        di, do = self._locate(d, self._d_base, self._d_end)
++        # every copy must lie inside its segment (no silent overrun)
++        if (s + sz > self._s_end[si]).any() or (d + sz > self._d_end[di]).any():
++            raise RuntimeError("B70-0031: descriptor crosses a segment boundary")
++        # merge descriptors contiguous on both sides into one copy
++        if n > 1:
++            brk = np.empty(n, dtype=bool)
++            brk[0] = True
++            brk[1:] = (
++                (si[1:] != si[:-1])
++                | (di[1:] != di[:-1])
++                | (s[1:] != s[:-1] + sz[:-1])
++                | (d[1:] != d[:-1] + sz[:-1])
++            )
++            starts = np.flatnonzero(brk)
++            lens = np.add.reduceat(sz, starts)
++        else:
++            starts = np.zeros(1, dtype=np.int64)
++            lens = sz[:1]
++        s_view, d_view = self._s_view, self._d_view
++        for k, ln in zip(starts.tolist(), lens.tolist()):
++            o_s = int(so[k])
++            o_d = int(do[k])
++            d_view[di[k]][o_d : o_d + ln].copy_(
++                s_view[si[k]][o_s : o_s + ln], non_blocking=True
++            )
++        if not _B70_0031_LOGGED_FIRST:
++            _B70_0031_LOGGED_FIRST = True
++            logger.info(
++                "B70-0031: first direct CPU->GPU load: %d descriptors -> %d copies, "
++                "%.1f MiB",
++                n,
++                len(starts),
++                int(sz.sum()) / 2**20,
++            )
++
++
+ class CopyPlan(NamedTuple):
+     """Precomputed fragment-copy template for one data ref under the canonical
+     CPU layout, unrolled from the ref's mapped runs. Offsets are relative to
+@@ -508,6 +652,15 @@ class SingleDirectionOffloadingHandler:
+         self._swap_blocks_batch = _select_swap_blocks_fn(
+             layer_refs_per_group, gpu_to_cpu
+         )
++        # B70-0031: CPU->GPU on XPU straight from the pinned pool (no staging)
++        if (
++            not gpu_to_cpu
++            and current_platform.is_xpu()
++            and b70_offload_h2d_direct_enabled()
++        ):
++            direct = _B70DirectH2DCopier.build(cpu_tensors, gpu_tensors)
++            if direct is not None:
++                self._swap_blocks_batch = direct
+ 
+         # GPU blocks may be smaller
+         # cpu_page_size = gpu_page_size * blocks_per_chunk.

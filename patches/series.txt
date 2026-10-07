@@ -1,6 +1,7 @@
 # patches/series.txt — which published file each fork commit is exported to.
 #
-# Source of truth: github.com/Lumnus/vllm, branch b70/v0.30.0 — one commit per patch on top of vLLM v0.30.0
+# Source of truth: github.com/Lumnus/vllm, branch b70/v0.30.0-stable (from 0.30.0-b70.2 on; the model is a serving
+# parameter, not a branch) — one commit per patch on top of vLLM v0.30.0
 # (ced6857afa0ea7b2e3f0846a62e1394e90f15607). scripts/export-series.sh writes patches/vllm/ and
 # patches/vllm-tests/ from that branch; scripts/check-series.sh fails if the files here differ from a fresh export.
 #
@@ -34,3 +35,15 @@
 0014f-b70-offload-gates                              0014f-b70-offload-gates.patch                            0014-b70-offload-tests.patch
 0018-b70-offload-chunked-pinned-pool                 0018-b70-offload-chunked-pinned-pool.patch               0018-b70-offload-chunked-pinned-pool-tests.patch
 0019-b70-qwen4exp-dense-qsa-skip-indexer             0019-b70-qwen4exp-dense-qsa-skip-indexer.patch           -
+0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer         0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer.patch           -
+0021-b70-mtp-draft-prefill-no-piecewise-xpu          0021-b70-mtp-draft-prefill-no-piecewise-xpu.patch            -
+0022-b70-port-vllm55506-mamba-spec-block-tables-by-req-slot 0022-b70-port-vllm55506-mamba-spec-block-tables-by-req-slot.patch -
+0023-b70-gdn-op-mode-switch-and-nan-tracer           0023-b70-gdn-op-mode-switch-and-nan-tracer.patch             -
+0023c/0024t-b70-sampling-nan-tracer-and-null-block-probe 0023c-0024t-b70-sampling-nan-tracer-and-null-block-probe.patch -
+0026-b70-mtp-uniform-drafts-guard                    0026-b70-mtp-uniform-drafts-guard.patch                      -
+B70-0027                                             0027-b70-gdn-index64-lib-optional.patch                      -
+B70-0028                                             0028-b70-qwen4exp-ple-accepts-incconfig.patch                -
+B70-0029                                             0029-b70-prompt-logprobs-row-chunks-v1.patch                 -
+B70-0029b                                            0029b-b70-prompt-logprobs-row-chunks-v2.patch                -
+B70-0031                                             0031-b70-offload-h2d-direct-from-pinned.patch                -
+B70-0032                                             0032-b70-index64-fallback-warn-once.patch                    -

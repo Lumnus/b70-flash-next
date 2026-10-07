@@ -1,5 +1,5 @@
-From 01abfaaa549a9ef2d6b3b3c287ad766536b013d7 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From b73cbd5241ff822ce8c28a60a290a4da95f3b7f2 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 13:05:29 +0000
 Subject: [PATCH] 0019-b70-qwen4exp-dense-qsa-skip-indexer: drop
  *.self_attn.indexer.* weights on dense-QSA configs

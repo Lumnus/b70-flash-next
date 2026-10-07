@@ -1,4 +1,4 @@
-From 11a65f29a180a38d18c2d68feca52d79675a44ec Mon Sep 17 00:00:00 2001
+From af64eccefceea05bc18047c87b8a3a6cf745127a Mon Sep 17 00:00:00 2001
 From: MINJUN GIL <alswnsrlf12@naver.com>
 Date: Tue, 29 Sep 2026 21:40:54 +0000
 Subject: [PATCH] 0014e-b70-offload-group-evict: backport vllm#51787

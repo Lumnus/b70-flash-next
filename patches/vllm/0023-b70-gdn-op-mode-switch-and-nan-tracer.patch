@@ -1,0 +1,216 @@
+From 34b784930854f939ddfb4882680fb85871b9a96a Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 1 Oct 2026 19:48:14 +0000
+Subject: [PATCH] 0023-b70-gdn-op-mode-switch-and-nan-tracer (debug, default
+ off)
+
+/run/b70-probes/gdn-mode (re-read every 2 s; env B70_GDN_MODE): index64 (default,
+unchanged) | official | split-index64 | split-official. /run/b70-probes/gdn-nancheck:
+log GDN layer inputs/outputs holding non-finite rows with the batch shape.
+Used to rule out the GDN kernel for the MTP burst NaN (second MTP attempt).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/_xpu_ops.py | 167 +++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 156 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index ae2d471..e88e99e 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -140,6 +140,70 @@ def _fused_add_gemma_rms_norm_impl(
+     torch.ops._C.fused_add_gemma_rms_norm(input, residual, weight, epsilon)
+ 
+ 
++
++_B70_GDN_MODE = {"mode": None, "t": 0.0}
++
++
++def _b70_gdn_mode() -> str:
++    """B70-0023: GDN op mode, re-read from /run/b70-probes/gdn-mode every 2 s."""
++    import os
++    import time
++
++    now = time.monotonic()
++    if _B70_GDN_MODE["mode"] is None or now - _B70_GDN_MODE["t"] > 2.0:
++        try:
++            with open("/run/b70-probes/gdn-mode") as f:
++                mode = f.read().strip() or "index64"
++        except OSError:
++            mode = os.environ.get("B70_GDN_MODE", "index64")
++        if mode != _B70_GDN_MODE["mode"]:
++            logger.info("B70-0023: GDN op mode -> %s", mode)
++        _B70_GDN_MODE["mode"] = mode
++        _B70_GDN_MODE["t"] = now
++    return _B70_GDN_MODE["mode"]
++
++
++
++_B70_FLAGS: dict = {}
++_B70_NAN_SEEN = {"n": 0}
++
++
++def _b70_flag(path: str) -> bool:
++    import os
++    import time
++
++    now = time.monotonic()
++    v = _B70_FLAGS.get(path)
++    if v is None or now - v[1] > 2.0:
++        _B70_FLAGS[path] = (os.path.exists(path), now)
++    return _B70_FLAGS[path][0]
++
++
++def _b70_nan_report(where, prefix, t, n, md) -> None:
++    """Log the rows of t[:n] that hold NaN/Inf, with the GDN batch shape."""
++    if _B70_NAN_SEEN["n"] >= 40:
++        return
++    x = t[:n].reshape(n, -1)
++    bad = (~torch.isfinite(x)).any(dim=1)
++    if not bool(bad.any()):
++        return
++    _B70_NAN_SEEN["n"] += 1
++    rows = bad.nonzero().flatten().tolist()
++
++    def _l(v):
++        return None if v is None else v.tolist()
++
++    logger.warning(
++        "B70-NAN %s %s rows=%s(n=%d of %d) prefills=%d decodes=%d spec=%d "
++        "spec_tok=%s nonspec_tok=%s spec_qsl=%s nonspec_qsl=%s has_init=%s acc=%s",
++        where, prefix, rows[:24], len(rows), n, md.num_prefills, md.num_decodes,
++        md.num_spec_decodes, _l(md.spec_token_indx)[:24] if md.spec_token_indx is not None else None,
++        (_l(md.non_spec_token_indx)[:6] if md.non_spec_token_indx is not None else None),
++        _l(md.spec_query_start_loc), _l(md.non_spec_query_start_loc),
++        _l(md.has_initial_state), _l(md.num_accepted_tokens),
++    )
++
++
+ def _gdn_attention_core_xpu_impl(
+     core_attn_out: torch.Tensor,
+     z: torch.Tensor,
+@@ -195,15 +259,23 @@ def _gdn_attention_core_xpu_impl(
+         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+     )
+ 
+-    torch.ops._gdn_index64.gdn_attention(
+-        core_attn_out,
+-        z,
+-        projected_states_qkvz,
+-        projected_states_ba,
+-        self.num_k_heads,
+-        self.num_v_heads,
+-        self.head_k_dim,
+-        self.head_v_dim,
++    # B70-0023b: NaN tracer (flag file /run/b70-probes/gdn-nancheck). Syncs; debug only.
++    _nan_on = _b70_flag("/run/b70-probes/gdn-nancheck")
++    if _nan_on:
++        _b70_nan_report("in", self.prefix, projected_states_qkvz, num_actual_tokens, attn_metadata)
++    # B70-0023: runtime-switchable GDN op (debug of the MTP mixed-batch NaN).
++    # Mode from /run/b70-probes/gdn-mode (re-read every 2 s) or B70_GDN_MODE env:
++    #   index64 (default) | official | split-index64 | split-official
++    # split-*: a batch holding spec decodes AND non-spec (prefill) rows runs as two
++    # kernel calls on gathered contiguous rows (non-spec only, spec only), each in
++    # the metadata shape the kernel already handles alone; outputs scattered back.
++    mode = _b70_gdn_mode()
++    op = (
++        torch.ops._xpu_C.gdn_attention
++        if mode.endswith("official")
++        else torch.ops._gdn_index64.gdn_attention
++    )
++    common = dict(
+         conv_state=self.kv_cache[0],
+         ssm_state=self.kv_cache[1],
+         conv_weights=conv_weights,
+@@ -211,6 +283,78 @@ def _gdn_attention_core_xpu_impl(
+         activation=self.activation,
+         A_log=self.A_log,
+         dt_bias=self.dt_bias,
++        tp_size=self.tp_size,
++        reorder_input=not self.gqa_interleaved_layout,
++    )
++    heads = (self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim)
++    if (
++        mode.startswith("split")
++        and spec_sequence_masks is not None
++        and num_spec_decodes > 0
++        and (num_prefills > 0 or num_decodes > 0)
++        and non_spec_token_indx is not None
++        and spec_token_indx is not None
++    ):
++        def _run(idx, **kw):
++            n = idx.numel()
++            li = idx.long()
++            qkvz = projected_states_qkvz.index_select(0, li).contiguous()
++            ba = projected_states_ba.index_select(0, li).contiguous()
++            out = torch.zeros(
++                (n,) + tuple(core_attn_out.shape[1:]),
++                dtype=core_attn_out.dtype,
++                device=core_attn_out.device,
++            )
++            zz = torch.empty_like(out)
++            op(out, zz, qkvz, ba, *heads, num_actual_tokens=n, **kw, **common)
++            core_attn_out.index_copy_(0, li, out)
++            z.index_copy_(0, li, zz)
++
++        # non-spec rows alone = the base-mode shape (no spec metadata)
++        _run(
++            non_spec_token_indx,
++            num_prefills=num_prefills,
++            num_decodes=num_decodes,
++            num_spec_decodes=0,
++            has_initial_state=has_initial_state,
++            non_spec_query_start_loc=non_spec_query_start_loc,
++            non_spec_token_indx=None,
++            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
++            spec_query_start_loc=None,
++            spec_token_indx=None,
++            spec_state_indices_tensor=None,
++            num_accepted_tokens=None,
++        )
++        # spec rows alone = the pure-spec shape the builder emits
++        n_spec = spec_token_indx.numel()
++        _run(
++            spec_token_indx,
++            num_prefills=0,
++            num_decodes=0,
++            num_spec_decodes=num_spec_decodes,
++            has_initial_state=None,
++            non_spec_query_start_loc=None,
++            non_spec_token_indx=torch.empty(
++                0, dtype=torch.int32, device=core_attn_out.device
++            ),
++            non_spec_state_indices_tensor=None,
++            spec_query_start_loc=spec_query_start_loc,
++            spec_token_indx=torch.arange(
++                n_spec, dtype=torch.int32, device=core_attn_out.device
++            ),
++            spec_state_indices_tensor=spec_state_indices_tensor,
++            num_accepted_tokens=num_accepted_tokens,
++        )
++        if _nan_on:
++            _b70_nan_report("out", self.prefix, core_attn_out, num_actual_tokens, attn_metadata)
++        return
++
++    op(
++        core_attn_out,
++        z,
++        projected_states_qkvz,
++        projected_states_ba,
++        *heads,
+         num_prefills=num_prefills,  # type: ignore[attr-defined]
+         num_decodes=num_decodes,  # type: ignore[attr-defined]
+         num_spec_decodes=num_spec_decodes,  # type: ignore[attr-defined]
+@@ -223,9 +367,10 @@ def _gdn_attention_core_xpu_impl(
+         spec_state_indices_tensor=spec_state_indices_tensor,
+         num_accepted_tokens=num_accepted_tokens,  # type: ignore[attr-defined]
+         num_actual_tokens=num_actual_tokens,  # type: ignore[attr-defined]
+-        tp_size=self.tp_size,
+-        reorder_input=not self.gqa_interleaved_layout,
++        **common,
+     )
++    if _nan_on:
++        _b70_nan_report("out", self.prefix, core_attn_out, num_actual_tokens, attn_metadata)
+ 
+ 
+ def _xpu_ops_deepseek_scaling_rope_impl(

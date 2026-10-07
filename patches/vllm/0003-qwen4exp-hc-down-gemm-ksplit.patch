@@ -1,4 +1,4 @@
-From 7591776a866fec299954dd8feb0af9d86d655dda Mon Sep 17 00:00:00 2001
+From e38ac184fa6053f368d68d00a94be48545e539e1 Mon Sep 17 00:00:00 2001
 From: wu1ff <197699991+wu1ff@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 17:16:53 +0000
 Subject: [PATCH] 0003-qwen4exp-hc-down-gemm-ksplit

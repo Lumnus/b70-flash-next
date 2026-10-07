@@ -1,0 +1,121 @@
+From dd874858fd6c1d4fde62dbae5cb0fc694b755301 Mon Sep 17 00:00:00 2001
+From: Chaojun Zhang <chaojun.zhang@intel.com>
+Date: Wed, 2 Sep 2026 16:15:12 +0800
+Subject: [PATCH 3/7] fix(xpu): preserve tensor strides when pinning non-pinned
+ CPU tensors for UVA view (#564)
+
+* fix(xpu): avoid breaking tensor strides when pinning non-pinned CPU tensors
+
+Signed-off-by: Chaojun Zhang <chaojun.zhang@intel.com>
+
+* fix(xpu): compute UVA view byte_size from sizes/strides, not numel
+
+numel() * element_size() only equals the required storage span for a
+dense layout (e.g. plain transpose/permute). A strided view with gaps
+(e.g. from narrow/slicing) can address more bytes than that, which
+would under-declare the resulting XPU view's Storage size.
+storage().nbytes() isn't a safe substitute either: for an already-pinned
+input tensor with non-zero storage_offset() (a slice of a larger pinned
+buffer), it reports the whole underlying storage size measured from
+byte 0, not from host_ptr (which already starts at the offset) --
+over-declaring the view's size instead. Compute the addressable span
+directly from sizes/strides so both cases are handled correctly.
+
+Signed-off-by: Chaojun Zhang <chaojun.zhang@intel.com>
+
+---------
+
+Signed-off-by: Chaojun Zhang <chaojun.zhang@intel.com>
+(cherry picked from commit 43abdd5390eb408176d9b319290fd57a5ff9a9dd)
+---
+ csrc/xpu_view.cpp | 30 +++++++++++++++++++++++++-----
+ tests/test_uva.py | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/csrc/xpu_view.cpp b/csrc/xpu_view.cpp
+index 086512c..057d7db 100644
+--- a/csrc/xpu_view.cpp
++++ b/csrc/xpu_view.cpp
+@@ -108,10 +108,11 @@ torch::Tensor get_xpu_view_from_cpu_tensor(torch::Tensor& cpu_tensor) {
+   if (cpu_tensor.is_pinned()) {
+     pinned_owner = cpu_tensor;
+   } else {
+-    torch::Tensor contiguous_cpu = cpu_tensor.contiguous();
+-    pinned_owner = at::empty_like(
+-        contiguous_cpu, contiguous_cpu.options().pinned_memory(true));
+-    pinned_owner.copy_(contiguous_cpu);
++    pinned_owner = at::empty_strided(
++        cpu_tensor.sizes(),
++        cpu_tensor.strides(),
++        cpu_tensor.options().pinned_memory(true));
++    pinned_owner.copy_(cpu_tensor);
+   }
+ 
+   // Get raw host pointer from the pinned tensor.
+@@ -123,7 +124,26 @@ torch::Tensor get_xpu_view_from_cpu_tensor(torch::Tensor& cpu_tensor) {
+   auto strides = pinned_owner.strides();
+   auto scalar_type = pinned_owner.scalar_type();
+ 
+-  size_t byte_size = pinned_owner.numel() * pinned_owner.element_size();
++  // Compute the number of bytes addressable from `host_ptr` given these
++  // sizes/strides. This must NOT be `numel() * element_size()`: that is
++  // only correct for a "dense" layout (e.g. a plain transpose/permute,
++  // where every element in [0, numel) is used exactly once). A tensor with
++  // gaps in its strides (e.g. produced by `narrow`/slicing) can require
++  // more storage than `numel * element_size` to cover every element it
++  // addresses, which would under-declare the view's Storage size. Nor can
++  // we simply use `pinned_owner.storage().nbytes()`: when `pinned_owner`
++  // is a caller-supplied already-pinned tensor with a non-zero
++  // `storage_offset()` (e.g. itself a slice of a larger pinned buffer),
++  // that reports the whole underlying storage's size measured from byte 0,
++  // not from `host_ptr` (which already starts at the offset) -- that would
++  // over-declare the view's size instead. Compute the span directly from
++  // sizes/strides so it is correct in both cases.
++  int64_t max_elem_offset = 0;
++  for (size_t i = 0; i < sizes.size(); ++i) {
++    if (sizes[i] > 1) max_elem_offset += (sizes[i] - 1) * strides[i];
++  }
++  size_t byte_size =
++      static_cast<size_t>(max_elem_offset + 1) * pinned_owner.element_size();
+   // Keep `pinned_owner` storage alive through the view tensor's lifetime.
+   vllm::xpu::XPUHostViewAllocator allocator(host_ptr, byte_size, pinned_owner);
+   c10::DataPtr data_ptr = allocator.allocate(byte_size);
+diff --git a/tests/test_uva.py b/tests/test_uva.py
+index 95a2167..1902da1 100644
+--- a/tests/test_uva.py
++++ b/tests/test_uva.py
+@@ -128,3 +128,34 @@ def test_view_lifetime_after_owner_drop(device):
+     xpu_view.add_(1)
+     assert xpu_view[0, 0].item() == 1
+     assert xpu_view[9, 9].item() == 100
++
++
++@pytest.mark.parametrize("pinned", [False, True])
++@pytest.mark.parametrize("device", XPU_DEVICES)
++def test_non_contiguous_strided_view(device, pinned):
++    torch.set_default_device(device)
++    # Simulate scale_kn: a [32, 16] contiguous tensor
++    scale_kn = torch.arange(512,
++                            dtype=torch.float32,
++                            device="cpu",
++                            pin_memory=pinned).view(32, 16)
++    # Transposed view: shape [16, 32], non-contiguous stride (1, 16)
++    cpu_view = scale_kn.t()
++    assert cpu_view.shape == (16, 32)
++    assert cpu_view.stride() == (1, 16)
++    assert not cpu_view.is_contiguous()
++
++    xpu_view = torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_view)
++    assert xpu_view.device.type == "xpu"
++    assert xpu_view.shape == (16, 32)
++    assert xpu_view.stride() == (1, 16)
++    assert not xpu_view.is_contiguous()
++
++    # Transposing xpu_view back should yield a contiguous [32, 16] tensor
++    xpu_view_t = xpu_view.t()
++    assert xpu_view_t.shape == (32, 16)
++    assert xpu_view_t.is_contiguous()
++
++    # Correctness check: values match original transposed CPU tensor
++    assert torch.equal(xpu_view.cpu(), cpu_view)
++

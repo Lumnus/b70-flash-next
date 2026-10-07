@@ -1,5 +1,5 @@
-From 80aacb5725e89352755c0b77f7412c8eacab7cf0 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 0b0fafc3c992e1ab3385cd0068342907ffb2ac52 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:39:39 +0000
 Subject: [PATCH] 0014c-b70-offload-gdn-backstep: retain Mamba states N blocks
  below the replay boundary (B70_OFFLOAD_GDN_BACKSTEP=N)

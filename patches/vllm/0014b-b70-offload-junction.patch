@@ -1,5 +1,5 @@
-From 0369d95b15016061f925f8123eca7ed589e00695 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 3ed02b178680e3ef24a0f9c74870ba8db37b33ed Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:38:00 +0000
 Subject: [PATCH] 0014b-b70-offload-junction: heal a hybrid prefix after one
  miss (B70_OFFLOAD_JUNCTION=1)

@@ -1,5 +1,5 @@
-From 21546bab3a9c1234dff5294e6de1cd30814c140e Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From c7d3822e73577e1c5dcb6bc808878b5e19330ac9 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 13:31:11 +0000
 Subject: [PATCH] 0010-b70-default-repetition-detection
 

@@ -3,8 +3,8 @@
 #
 #   scripts/make-tree.sh <release|ref> <dir> [--from-patches]
 #
-#   <release|ref>   a release tag of this repo's series (e.g. 0.30.0-b70.1 -> fork branch b70/v0.30.0 or tag
-#                   v0.30.0-b70.1 when it exists), or any fork branch/tag/commit
+#   <release|ref>   a release of this repo's series (0.30.0-b70.1 -> fork branch b70/v0.30.0; 0.30.0-b70.2 and later ->
+#                   the fork tag v<release>, else branch b70/v0.30.0-stable), or any fork branch/tag/commit
 #   <dir>           target directory (must not exist)
 #   --from-patches  do not clone the fork branch; apply this repo's patches/ onto a clean v0.30.0
 #                   (ced6857afa) checkout instead
@@ -19,7 +19,8 @@ URL=https://github.com/Lumnus/vllm.git
 rel=$1; dir=$2; mode=${3:-clone}
 [ ! -e "$dir" ] || { echo "$dir exists" >&2; exit 1; }
 case "$rel" in
-  0.30.0-b70.*) ref=b70/v0.30.0; tag="v$rel" ;;
+  0.30.0-b70.1) ref=b70/v0.30.0; tag="v$rel" ;;
+  0.30.0-b70.*) ref=b70/v0.30.0-stable; tag="v$rel" ;;
   *) ref=$rel; tag="" ;;
 esac
 

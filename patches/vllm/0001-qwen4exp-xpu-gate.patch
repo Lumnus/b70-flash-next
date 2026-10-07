@@ -1,4 +1,4 @@
-From 481a16c00e31c06ee9dc98d25f383d88f213c9dc Mon Sep 17 00:00:00 2001
+From f5efc18b54f4e011199b86287e496389e2b4865d Mon Sep 17 00:00:00 2001
 From: wu1ff <197699991+wu1ff@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 17:16:53 +0000
 Subject: [PATCH] 0001-qwen4exp-xpu-gate

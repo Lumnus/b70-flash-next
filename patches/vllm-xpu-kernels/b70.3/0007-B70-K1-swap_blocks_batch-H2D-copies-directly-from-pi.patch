@@ -1,0 +1,228 @@
+From 493364ab1b930d346891be9085abadd83f2784cf Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 3 Oct 2026 15:09:54 +0000
+Subject: [PATCH 7/7] B70-K1: swap_blocks_batch H2D copies directly from pinned
+ (USM host) sources
+
+xpuAsyncMemcpyBatch staged every H2D batch through one pinned buffer the
+size of the whole load, taken from torch's XPU CachingHostAllocator, plus a
+host memcpy of every byte, even when the source was already USM host memory
+(vLLM's KV offload pool). With pinned_max_cached_size_mb set, blocks up to
+that size stay in torch's host cache forever, one per concurrently
+outstanding load per size class: +2.56 GiB per rank in one 6-session KV
+replay on 4x B70, enough to trip the host RAM guard.
+
+When every non-empty source descriptor is sycl::usm::alloc::host, issue
+queue.memcpy straight from the source. Pageable sources still stage.
+VLLM_XPU_H2D_BATCH_STAGING=1 restores staging for every H2D batch (the old
+mutate-after-return snapshot contract); it is read per call.
+Contract change for pinned sources: the caller keeps the source unchanged
+until the copies complete on the current stream (vLLM holds a ref on loaded
+blocks until the transfer event completes; CUDA cuMemcpyBatchAsync assumes
+the same). One-time stderr line on the first direct batch:
+"B70-K1: swap_blocks_batch H2D copies directly from USM-host (pinned)
+sources, no pinned staging buffer".
+
+Tests: test_swap_blocks_batch_h2d_mutation_race now sets the staging env;
+new test_swap_blocks_batch_h2d_pinned_direct (XPU required).
+Mirrors vLLM patch B70-0031 (Lumnus/vllm 0d132d3c79) at the source.
+---
+ csrc/utils/mem_cpy.cpp | 61 ++++++++++++++++++++++++++++++++++++++--
+ csrc/utils/mem_cpy.h   |  8 ++++--
+ tests/test_cache.py    | 63 ++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 126 insertions(+), 6 deletions(-)
+
+diff --git a/csrc/utils/mem_cpy.cpp b/csrc/utils/mem_cpy.cpp
+index b49a482..e822cdf 100644
+--- a/csrc/utils/mem_cpy.cpp
++++ b/csrc/utils/mem_cpy.cpp
+@@ -3,7 +3,10 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ 
+ #include "ops.h"
+ #include "utils.h"
+@@ -53,6 +56,43 @@ inline void async_h2d_with_staging(
+   record_host_alloc_event_if_possible(staging_ptr, staging.get_context());
+ }
+ 
++// B70-K1: an H2D batch whose sources are all USM host allocations (pinned,
++// e.g. torch pin_memory=True / the KV offload pool) can DMA straight from the
++// source; staging only adds a pinned allocation the size of the whole load
++// (kept forever in torch's host cache for sizes <= pinned_max_cached_size_mb)
++// plus a host memcpy of every byte.  Pageable sources still stage.
++// VLLM_XPU_H2D_BATCH_STAGING=1 restores staging for every H2D batch (the
++// snapshot / mutate-after-return contract); read per call, so tests can flip it.
++inline bool h2d_batch_force_staging() {
++  const char* v = std::getenv("VLLM_XPU_H2D_BATCH_STAGING");
++  return v != nullptr && v[0] != '\0' && v[0] != '0';
++}
++
++inline bool all_sources_usm_host(
++    const uint64_t* src_ptrs,
++    const uint64_t* sizes,
++    int64_t n,
++    const sycl::context& ctx) {
++  for (int64_t i = 0; i < n; i++) {
++    if (sizes[i] == 0) continue;
++    if (sycl::get_pointer_type(reinterpret_cast<const void*>(src_ptrs[i]), ctx) !=
++        sycl::usm::alloc::host) {
++      return false;
++    }
++  }
++  return true;
++}
++
++inline void log_h2d_batch_direct_once() {
++  static std::once_flag flag;
++  std::call_once(flag, [] {
++    std::fprintf(
++        stderr,
++        "B70-K1: swap_blocks_batch H2D copies directly from USM-host "
++        "(pinned) sources, no pinned staging buffer\n");
++  });
++}
++
+ }  // namespace
+ 
+ void memcpyHostToDevice(
+@@ -231,8 +271,25 @@ void xpuAsyncMemcpyBatch(
+     total_bytes += sizes[i];
+   }
+ 
+-  if (needs_staging) {
+-    // H2D: allocate one contiguous pinned staging buffer, snapshot all source
++  if (needs_staging && !h2d_batch_force_staging() &&
++      all_sources_usm_host(
++          src_ptrs, sizes, n, vllm::xpu::vllmGetQueue(0).get_context())) {
++    // H2D from pinned (USM host) sources: direct async DMA, no staging
++    // (B70-K1).  The caller must keep the source bytes unchanged until the
++    // copies complete on the current stream (vLLM's KV offload holds a ref on
++    // every loaded block until the transfer event has completed; CUDA's
++    // cuMemcpyBatchAsync path makes the same assumption).
++    log_h2d_batch_direct_once();
++    for (int64_t i = 0; i < n; i++) {
++      size_t sz = static_cast<size_t>(sizes[i]);
++      if (sz == 0) continue;
++      queue.memcpy(
++          reinterpret_cast<void*>(dst_ptrs[i]),
++          reinterpret_cast<const void*>(src_ptrs[i]),
++          sz);
++    }
++  } else if (needs_staging) {
++    // H2D from pageable sources (or staging forced): allocate one contiguous pinned staging buffer, snapshot all source
+     // blocks, then submit all async DMAs.  This avoids N separate allocator
+     // round-trips and protects against caller mutation after return.
+     auto staging = at::getHostAllocator(at::kXPU)->allocate(
+diff --git a/csrc/utils/mem_cpy.h b/csrc/utils/mem_cpy.h
+index 465ef4c..237ebdf 100644
+--- a/csrc/utils/mem_cpy.h
++++ b/csrc/utils/mem_cpy.h
+@@ -40,8 +40,12 @@ void xpuAsyncMemcpy(
+  * The copy direction is auto-detected from the first non-zero entry's USM
+  * pointer types.  All entries must share the same direction.
+  *
+- * For H2D: snapshots all source blocks through a single contiguous pinned
+- *   staging buffer so the caller may safely mutate host memory immediately.
++ * For H2D from pinned (USM host) sources: direct async DMA, no staging
++ *   (B70-K1).  The caller must not mutate the source until the copies have
++ *   completed on the current stream.
++ * For H2D from pageable sources, or with VLLM_XPU_H2D_BATCH_STAGING=1:
++ *   snapshots all source blocks through a single contiguous pinned staging
++ *   buffer so the caller may safely mutate host memory immediately.
+  * For D2H / D2D: direct async DMA without staging.
+  *
+  * @param src_ptrs   Array of N raw source addresses
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+index ebcec30..052f7c8 100644
+--- a/tests/test_cache.py
++++ b/tests/test_cache.py
+@@ -112,6 +112,9 @@ MINI_PYTEST_PARAMS = {
+     "test_swap_blocks_batch_h2d_mutation_race": {
+         "device": ["xpu:0"],
+     },
++    "test_swap_blocks_batch_h2d_pinned_direct": {
++        "device": ["xpu:0"],
++    },
+     "test_gather_and_maybe_dequant_cache_mla": {
+         "block_size": [8],
+         "num_blocks": [8],
+@@ -1059,8 +1062,13 @@ def test_swap_blocks_batch(
+ 
+ @pytest.mark.parametrize("device", DEVICES)
+ @torch.inference_mode()
+-def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
+-    """Verify staging buffer protects against caller mutation for H2D batch."""
++def test_swap_blocks_batch_h2d_mutation_race(device: str, monkeypatch) -> None:
++    """Verify staging buffer protects against caller mutation for H2D batch.
++
++    Pinned sources are copied directly since B70-K1; the snapshot contract
++    holds only with VLLM_XPU_H2D_BATCH_STAGING=1, which this test sets.
++    """
++    monkeypatch.setenv("VLLM_XPU_H2D_BATCH_STAGING", "1")
+     num_mappings = 16
+     num_heads = 8
+     head_size = 8
+@@ -1116,6 +1124,57 @@ def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
+         )
+ 
+ 
++@pytest.mark.parametrize("device", DEVICES)
++@torch.inference_mode()
++def test_swap_blocks_batch_h2d_pinned_direct(device: str, monkeypatch) -> None:
++    """B70-K1: H2D batch from a pinned (USM host) source takes the direct
++    path (no staging); bytes must match once the stream has completed, and a
++    mutation after synchronize must not reach the destination."""
++    monkeypatch.delenv("VLLM_XPU_H2D_BATCH_STAGING", raising=False)
++    num_mappings = 32
++    num_heads = 8
++    head_size = 64
++    block_size = 16
++    num_blocks = 64
++    dtype = torch.bfloat16
++    seed = 0
++
++    seed_everything(seed)
++    torch.xpu.set_device(device)
++
++    src_blocks = random.sample(range(num_blocks), num_mappings)
++    dst_blocks = random.sample(range(num_blocks), num_mappings)
++    block_mapping = list(zip(src_blocks, dst_blocks))
++
++    src_key, src_val = create_kv_caches_with_pinned(num_blocks, block_size, 1,
++                                                    num_heads, head_size,
++                                                    "auto", dtype, seed, "cpu")
++    assert src_key[0].is_pinned() and src_val[0].is_pinned()
++    dst_key, dst_val = create_kv_caches_with_random(num_blocks, block_size, 1,
++                                                    num_heads, head_size,
++                                                    "auto", dtype, seed)
++
++    src_key_clone = src_key[0].clone()
++    src_val_clone = src_val[0].clone()
++    block_size_in_bytes = src_key[0].element_size() * src_key[0].stride(0)
++
++    for src_cache, dst_cache in [(src_key[0], dst_key[0]),
++                                 (src_val[0], dst_val[0])]:
++        sp, dp, sz = _build_batch_args(src_cache, dst_cache, block_mapping,
++                                       block_size_in_bytes)
++        ops.swap_blocks_batch(sp, dp, sz)
++
++    torch.xpu.synchronize()
++    src_key[0].fill_(0)
++    src_val[0].fill_(0)
++
++    for sb, db in block_mapping:
++        torch.testing.assert_close(src_key_clone[sb].cpu(),
++                                   dst_key[0][db].cpu())
++        torch.testing.assert_close(src_val_clone[sb].cpu(),
++                                   dst_val[0][db].cpu())
++
++
+ @pytest.mark.skipif(torch.xpu.device_count() < 2,
+                     reason="device-inference bug only manifests on a "
+                     "non-zero XPU device (needs >= 2 devices)")

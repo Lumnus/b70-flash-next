@@ -1,5 +1,5 @@
-From 57679613d7350777bf002838b01406008f0143aa Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 502d22471fe9cb2861b00077b96d07a6c0653560 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 28 Sep 2026 17:16:53 +0000
 Subject: [PATCH] 0006-b70-ple-direct-pinned-load
 MIME-Version: 1.0

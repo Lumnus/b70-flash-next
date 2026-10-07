@@ -1,6 +1,40 @@
-# Weights: devan W4A16 or AWQ
+# Weights: Intel AutoRound, AWQ or devan W4A16
 
-Two 4-bit checkpoints of Qwen3.8-Flash-Next run on this image. We serve the AWQ one.
+Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. We serve and recommend the AWQ build (since
+2026-09-30; with MTP and kernels b70.3 since 2026-10-04); Intel's AutoRound build served in between (2026-10-02 to 04) and
+is the documented alternative; devan's W4A16 (from 2026-09-28) is the reference. The README ranks them and says why; the
+numbers are in [measurements/b70.2.md](measurements/b70.2.md).
+
+## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)
+
+| | |
+|---|---|
+| method | AutoRound tuning (signed-gradient optimisation of rounding and clipping, 200 iterations); int4 symmetric g128 |
+| quantized | routed experts only; attention, GDN, shared experts, router, PLE, MTP, vision, embeddings and head stay BF16 |
+| tensor format | `quant_method auto-round`, `packing_format auto_round:auto_gptq`: GPTQ-packed `qweight`, `qzeros` (all symmetric), **F16** `scales` |
+| PLE n-gram table | inside shard 16, which holds nothing else (102.4 GB): not needed for serving |
+| QSA indexer weights | shipped; unused on the dense-QSA config (0019/0020 skip them, the snapshot drops them) |
+| MTP head | BF16, in `model_extra_tensors.safetensors` |
+| license | qwen-community-1.0 (card) |
+| what the series needs | patch 0028 (the PLE embedding accepts the INC config), a snapshot made with `tools/intel_snapshot.py`, `engines/serve-config-intel-autoround.json` |
+
+**How it loads.** vLLM maps `auto-round` to its INC config. The 48 routed-expert layers go through the GPTQ MoE path to
+the XPU WNA16 backend (`XPUExpertsWNA16`), the same int4 kernel and weight key as the AWQ build; the repack drops the
+zero points. Everything else resolves to 16 bits through the checkpoint's `extra_config` patterns, the MTP experts
+included. The registered but unused `qzeros` cost ~0.1–0.17 GiB of VRAM per card.
+
+**Snapshot.** `tools/intel_snapshot.py snapshot <download> <devan ple_table_qwen4exp.pt> <snapshot>` symlinks the
+download except `config.json`, the index and shard 16, writes a filtered index (224,280 → 224,113 tensors: −128 PLE
+tensors, −39 indexer tensors) and links devan's PLE table, which `PLE_TABLE_PATH` uses for the INT8 table's boot
+cross-check. `tools/intel_snapshot.py serve-config engines/serve-config-awq.json <download>/config.json out.json` writes
+the serve config (the dense-QSA config with the checkpoint's auto-round block) and checks it byte for byte against the
+file we serve.
+
+**The PLE table.** We serve the same INT8 table as for the other two builds, built from devan's BF16 table. We have not
+compared Intel's BF16 PLE rows in shard 16 with devan's table; the PLE is kept in BF16 by all three builds, and the
+boot cross-check and every quality test pass, but the identity itself is unverified.
+
+## AWQ and devan
 
 | | `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` | `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125` |
 |---|---|---|

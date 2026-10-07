@@ -1,5 +1,5 @@
-From b3cbc0be56ab8684d37b535c89c4722b60259fdc Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From a2c1203a7462c8d244fb4108e4bb50335317d420 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 28 Sep 2026 17:24:40 +0000
 Subject: [PATCH] 0008-b70-ple-int8-rowscale-pinned-table
 MIME-Version: 1.0

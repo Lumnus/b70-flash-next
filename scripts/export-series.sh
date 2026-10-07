@@ -5,7 +5,8 @@
 #
 #   --git-dir  a vLLM clone that has REF and ced6857afa (default: ./vllm-src, cloned on demand from
 #              https://github.com/Lumnus/vllm.git)
-#   --ref      branch, tag or commit (default: b70/v0.30.0; a remote-tracking name like origin/b70/v0.30.0 works)
+#   --ref      branch, tag or commit (default: b70/v0.30.0-stable, the one release branch from 0.30.0-b70.2 on; a
+#              remote-tracking name like origin/b70/v0.30.0-stable works)
 #   --out      where to write (default: the repo's patches/)
 #
 # Every commit on BASE..REF must have a key in patches/series.txt; an unknown commit is an error, so the
@@ -14,13 +15,13 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
 REPO_URL=https://github.com/Lumnus/vllm.git
-gd="$here/vllm-src"; ref=b70/v0.30.0; out="$here/patches"
+gd="$here/vllm-src"; ref=b70/v0.30.0-stable; out="$here/patches"
 while [ $# -gt 0 ]; do
   case "$1" in
     --git-dir) gd=$2; shift 2 ;;
     --ref) ref=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
-    -h|--help) sed -n 2,13p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

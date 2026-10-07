@@ -1,4 +1,4 @@
-From de3768bd41805aee97461e971eced8247d7a141a Mon Sep 17 00:00:00 2001
+From 925c15d2a8ae2219f07643a3b89f67f4064217a2 Mon Sep 17 00:00:00 2001
 From: wu1ff <197699991+wu1ff@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 17:16:53 +0000
 Subject: [PATCH] 0002-qwen4exp-ple-pinned-host-uva-and-capture-stream

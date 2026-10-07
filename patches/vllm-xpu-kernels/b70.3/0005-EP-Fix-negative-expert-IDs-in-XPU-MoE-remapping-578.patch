@@ -1,0 +1,128 @@
+From 5fcc722749697af5470b3063073ebe1d9d38690f Mon Sep 17 00:00:00 2001
+From: Tony Lin <tony.lin@intel.com>
+Date: Wed, 9 Sep 2026 07:01:33 +0800
+Subject: [PATCH 5/7] [EP] Fix negative expert IDs in XPU MoE remapping (#578)
+
+* Fix negative expert IDs in XPU MoE remapping
+
+Avoid indexing expert_map with padding IDs before checking whether
+the route is valid. This prevents an out-of-bounds read for -1
+padding routes when expert parallelism is enabled.
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+* apply copilot review suggestions
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+* fix pre-commit errors
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+
+---------
+
+Signed-off-by: Tony Lin <tony.lin@intel.com>
+(cherry picked from commit 89bbfccfd8327839c8f56fcb82ea472178eef781)
+---
+ csrc/moe/remap_hidden_states.cpp            | 30 +++++++++------------
+ tests/fused_moe/test_remap_hidden_states.py | 24 +++++++++++++++++
+ 2 files changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/csrc/moe/remap_hidden_states.cpp b/csrc/moe/remap_hidden_states.cpp
+index 16f8567..2dce380 100644
+--- a/csrc/moe/remap_hidden_states.cpp
++++ b/csrc/moe/remap_hidden_states.cpp
+@@ -6,6 +6,15 @@
+ namespace vllm {
+ namespace moe {
+ 
++static inline int
++to_local_expert_id(int global_expert_id, const int* expert_map) {
++  if (global_expert_id < 0) {
++    return -1;
++  }
++  return expert_map == nullptr ? global_expert_id
++                               : expert_map[global_expert_id];
++}
++
+ class RowsPerExpertCount {
+  public:
+   RowsPerExpertCount(
+@@ -56,10 +65,7 @@ class RowsPerExpertCount {
+       int global_expert_id =
+           is_topk_ids_int32 ? reinterpret_cast<int32_t*>(topk_ids)[global_id]
+                             : reinterpret_cast<int64_t*>(topk_ids)[global_id];
+-      int local_expert_id = global_expert_id;
+-      if (expert_map != nullptr) {
+-        local_expert_id = expert_map[global_expert_id];
+-      }
++      int local_expert_id = to_local_expert_id(global_expert_id, expert_map);
+ 
+       if (local_expert_id == -1) {
+         unpermuted_row_to_permuted_row[global_id] = -1;
+@@ -99,10 +105,7 @@ class RowsPerExpertCount {
+       int global_expert_id =
+           is_topk_ids_int32 ? reinterpret_cast<int32_t*>(topk_ids)[global_id]
+                             : reinterpret_cast<int64_t*>(topk_ids)[global_id];
+-      int local_expert_id = global_expert_id;
+-      if (expert_map != nullptr) {
+-        local_expert_id = expert_map[global_expert_id];
+-      }
++      int local_expert_id = to_local_expert_id(global_expert_id, expert_map);
+ 
+       if (local_expert_id != -1) {
+         // local_old + base_offset = global_offset
+@@ -218,16 +221,9 @@ class RemapHiddenStates {
+       }
+     }
+ 
+-    if (expert_map != nullptr) {
+-#pragma unroll
+-      for (int i = 0; i < TopK; ++i) {
+-        local_expert_id[i] = expert_map[global_expert_id[i]];
+-      }
+-    } else {
+ #pragma unroll
+-      for (int i = 0; i < TopK; ++i) {
+-        local_expert_id[i] = global_expert_id[i];
+-      }
++    for (int i = 0; i < TopK; ++i) {
++      local_expert_id[i] = to_local_expert_id(global_expert_id[i], expert_map);
+     }
+ 
+     int rows_offset[TopK];
+diff --git a/tests/fused_moe/test_remap_hidden_states.py b/tests/fused_moe/test_remap_hidden_states.py
+index e5b032d..a117448 100644
+--- a/tests/fused_moe/test_remap_hidden_states.py
++++ b/tests/fused_moe/test_remap_hidden_states.py
+@@ -235,6 +235,30 @@ def test_remap_hidden_states(num_rows, hidden_size, total_experts_num, topk,
+             print("Mismatched ref:", ref_unpermuted_scales[mismatched_indices])
+ 
+ 
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++def test_remap_ignores_negative_expert_ids(id_dtype):
++    """A padded route must not read the entry before the expert map."""
++    hidden = torch.ones((2, 128), dtype=torch.bfloat16, device=DEVICE)
++    # Make an erroneous expert_map[-1] access deterministic.
++    map_storage = torch.tensor([0, 0, -1], dtype=torch.int32,
++                               device=DEVICE)
++    expert_map = map_storage[1:]
++    assert expert_map.storage_offset() == 1
++    assert (expert_map.untyped_storage().data_ptr() ==
++            map_storage.untyped_storage().data_ptr())
++    ids = torch.tensor([[0, 1], [-1, -1]], dtype=id_dtype, device=DEVICE)
++    remapped = torch.empty((4, 128), dtype=hidden.dtype, device=DEVICE)
++    counts = torch.zeros(1, dtype=torch.int32, device=DEVICE)
++    mapping = torch.empty((2, 2), dtype=torch.int32, device=DEVICE)
++
++    torch.ops._moe_C.remap_hidden_states(
++        hidden, None, remapped, None, expert_map, counts, mapping, ids, 2, 1)
++
++    assert counts.tolist() == [1]
++    assert mapping.cpu().tolist() == [[0, -1], [-1, -1]]
++    torch.testing.assert_close(remapped[0], hidden[0], rtol=0, atol=0)
++
++
+ @pytest.mark.parametrize("num_rows", [262144])
+ @pytest.mark.parametrize("hidden_size", [2048])
+ @pytest.mark.parametrize("total_experts_num", [128])

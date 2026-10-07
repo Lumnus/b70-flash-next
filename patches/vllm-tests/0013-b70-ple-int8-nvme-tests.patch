@@ -1,5 +1,5 @@
-From 8501a43b1192e25beed9f10adf59d05f41645772 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From b7bd3e061f6584c5c8dc1b8a3573d859c6c9d8eb Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 20:05:39 +0000
 Subject: [PATCH] 0013 tests: CPU tests + host-path micro-bench for the NVMe
  PLE table
@@ -787,8 +787,8 @@ index 0000000..25b172b
 +                print(f"FAIL {name}: {exc}")
 +    print("failures:", failures)
 +    sys.exit(1 if failures else 0)
-From aa42e95d537667559a0d9a36ce0bbaa66404faf0 Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 20ee81700705efbc0895e982c02719f68bcabf61 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 20:24:26 +0000
 Subject: [PATCH] 0013b tests: native readers, prefill lookahead (simulated +
  real I/O), bench reader knob

@@ -1,0 +1,153 @@
+From 66662389d28e4b299e13e2cb500083ec53e441a8 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 1 Oct 2026 19:48:14 +0000
+Subject: [PATCH] 0023c/0024t-b70-sampling-nan-tracer-and-null-block-probe
+ (debug, default off)
+
+/run/b70-probes/gdn-nancheck: log non-finite target hidden/logit rows at sampling
+with the batch layout, and count KV/state views whose block 0 (the unified
+layout's shared null page) is non-finite before/after each FULL replay.
+/run/b70-probes/zero-null-block: zero block 0 around FULL replays. Measured: a
+padded FULL spec-decode replay (3 reqs -> 4) takes block 0 from 0 to 13
+non-finite views INSIDE the replay, so zeroing cannot help; the fix is to stop
+padding-row state writes (B70-0024) or avoid padded requests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/model_runner.py | 95 +++++++++++++++++++++++++++++-
+ 1 file changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 36e991d..8de8e6e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -17,6 +17,7 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
+ instead of embedding feature-specific logic directly.
+ """
+ 
++import os
+ import functools
+ import gc
+ import time
+@@ -1534,6 +1535,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
++        # B70-0023c: NaN tracer at the sampling boundary (flag /run/b70-probes/gdn-nancheck).
++        if os.path.exists("/run/b70-probes/gdn-nancheck"):
++            _b70_trace_logits(hidden_states, logits, input_batch)
++
+         if grammar_output is not None:
+             # Apply grammar bitmask to the logits in-place.
+             assert self.structured_outputs_worker is not None
+@@ -1719,9 +1724,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+             # boundary reset is visible to the attention metadata.
++            #
++            # Pass the SOURCE per-request-slot block tables, not the per-step
++            # gathered views: the mamba spec-decode context captures these
++            # tensors' raw data_ptrs exactly once and its copy kernels index rows
++            # by req_idx (mamba_utils.py). Gathered views are batch-ordered and
++            # are re-gathered every step, so under PP (max_concurrent_batches =
++            # pp_size + 1) a deferred postprocess on a non-last rank would walk
++            # another step's batch mapping through freed/reallocated block ids.
+             self.model_state.preprocess_state(
+                 input_batch,
+-                block_tables,
++                tuple(bt.gpu for bt in self.block_tables.block_tables),
+                 self.kv_cache_config,
+                 self.req_states.num_computed_tokens.gpu,
+             )
+@@ -1917,7 +1930,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.kv_connector.pre_forward(
+                 **connector_kwargs, attn_metadata=attn_metadata
+             )
++            # B70-0024-test: keep the shared null page (block 0) finite around FULL
++            # replays (flag /run/b70-probes/zero-null-block, re-read every 2 s).
++            _zn = _b70_zero_null_on() and self.kv_block_zeroer is not None
++            _b0 = os.path.exists("/run/b70-probes/gdn-nancheck")
++            if _b0:
++                _b0_pre = _b70_block0_bad(self.kv_caches)
++            if _zn:
++                self.kv_block_zeroer.zero_block_ids([0])
+             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            if _b0:
++                _b0_post = _b70_block0_bad(self.kv_caches)
++                if _b0_pre or _b0_post:
++                    logger.warning(
++                        "B70-BLOCK0 non-finite views before=%d after=%d desc=%s zero=%s",
++                        _b0_pre, _b0_post, batch_desc, _zn,
++                    )
++            if _zn:
++                self.kv_block_zeroer.zero_block_ids([0])
+         else:
+             # For piecewise and eager mode, just call model().
+             batch_descriptor = BatchDescriptor(
+@@ -2354,3 +2384,66 @@ def sort_batch_req_ids(
+         num,
+     )
+     return sorted(num_tokens_per_req, key=key)
++
++
++_B70_TRACE_N = {"n": 0}
++
++
++def _b70_trace_logits(hidden_states, logits, input_batch) -> None:
++    if _B70_TRACE_N["n"] >= 30:
++        return
++    try:
++        nt = int(input_batch.num_tokens)
++    except Exception:
++        nt = hidden_states.shape[0]
++    hs_bad = (~torch.isfinite(hidden_states[:nt].float())).any(dim=-1)
++    lg_bad = (~torch.isfinite(logits.float())).any(dim=-1)
++    if not (bool(hs_bad.any()) or bool(lg_bad.any())):
++        return
++    _B70_TRACE_N["n"] += 1
++
++    def _l(x):
++        try:
++            return x.tolist() if hasattr(x, "tolist") else list(x)
++        except Exception:
++            return str(x)
++
++    logger.warning(
++        "B70-NAN-LOGITS hs_bad_rows=%s (n=%d of %d) logit_bad_rows=%s (of %d) "
++        "num_reqs=%s qsl=%s sched=%s drafts=%s logits_idx=%s idx_map=%s",
++        _l(hs_bad.nonzero().flatten()[:40]), int(hs_bad.sum()), nt,
++        _l(lg_bad.nonzero().flatten()[:40]), logits.shape[0],
++        getattr(input_batch, "num_reqs", None),
++        _l(getattr(input_batch, "query_start_loc_np", getattr(input_batch, "query_start_loc", None)))[:20],
++        _l(getattr(input_batch, "num_scheduled_tokens", None))[:20],
++        _l(getattr(input_batch, "num_draft_tokens_per_req", None) if getattr(input_batch, "num_draft_tokens_per_req", None) is not None else [])[:20],
++        _l(input_batch.logits_indices)[:40],
++        _l(input_batch.idx_mapping)[:20],
++    )
++
++
++_B70_ZN = {"v": False, "t": 0.0}
++
++
++def _b70_zero_null_on() -> bool:
++    import time
++
++    now = time.monotonic()
++    if now - _B70_ZN["t"] > 2.0:
++        _B70_ZN["v"] = os.path.exists("/run/b70-probes/zero-null-block")
++        _B70_ZN["t"] = now
++    return _B70_ZN["v"]
++
++
++def _b70_block0_bad(kv_caches) -> int:
++    """Count KV/state views whose block 0 (the shared null page) is non-finite."""
++    n = 0
++    for c in kv_caches:
++        for t in c if isinstance(c, (list, tuple)) else (c,):
++            if not isinstance(t, torch.Tensor) or not t.is_floating_point():
++                continue
++            if t.dim() == 0 or t.shape[0] == 0:
++                continue
++            if not bool(torch.isfinite(t[0]).all()):
++                n += 1
++    return n

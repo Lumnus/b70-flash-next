@@ -1,5 +1,5 @@
-From 5ab7410fe0b5c586fd328f68c0e3e280f9948f4e Mon Sep 17 00:00:00 2001
-From: Kaloyan Naumov <knaumov@gmail.com>
+From 5a300bef9f5f3d022a0a4a0cf23a70767b6c7000 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 12:04:42 +0000
 Subject: [PATCH] 0018-b70-offload-chunked-pinned-pool: kv_offload: split the
  pinned CPU KV pool when one allocation is too large
@@ -45,7 +45,7 @@ When the pool fits (every CUDA/ROCm run, and XPU pools below the limit)
 the result is one zeroed tensor as before; the allocation is now
 torch.empty + a null check + zero_() instead of torch.zeros.
 
-Diagnosis (Kaloyan Naumov with Claude): a boot segfault of a 128 GiB offload pool on 4x
+Diagnosis: a boot segfault of a 128 GiB offload pool on 4x
 B70 was traced to this allocation from the kernel fault addresses (data
 writes below 2^35 from the fill loop) and the torch 2.13
 CachingHostAllocator source, then confirmed with a single-allocation
