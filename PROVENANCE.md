@@ -172,7 +172,9 @@ The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The
 
 Grades as above. Source: github.com/Lumnus/vllm `b70/v0.30.0-intel` @ `640f21881a0320aab34c50a05e0ea9815619739a` =
 `b70/v0.30.0` @ `01abfaaa5` (0.30.0-b70.1) + 12 commits. The engine we serve runs `0d132d3c79` (the same series without
-0032, a log-only change).
+0032, a log-only change). The AWQ engine we serve runs fork branch `b70/v0.30.0-mtp0020` @
+`4512442c79` (Lumnus/vllm; = series up to B70-0030, no 0031): its tree differs from the intel branch in 0028, 0029, 0031 and
+0032 only, none of which acts on AWQ. AWQ weights, snapshot and serve config: §6 (`engines/awq-s16-kv128-mtp3.env`).
 
 **Checks [M] (CPU host, no image built):** `scripts/check-series.sh` → patches/ equals the export of the branch (33 + 3
 files). `scripts/make-tree.sh 0.30.0-b70.2` → a clone of the branch equals patches/ applied to `ced6857a`, and all 33

@@ -1,8 +1,9 @@
 # Weights: Intel AutoRound, AWQ or devan W4A16
 
-Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. Since 0.30.0-b70.2 we serve Intel's AutoRound build;
-before it, the AWQ build (from 2026-09-30) and devan's W4A16 (from 2026-09-28). The README ranks them; the numbers are
-in [measurements/b70.2.md](measurements/b70.2.md).
+Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. We serve and recommend the AWQ build (since
+2026-09-30; with MTP and kernels b70.3 since 2026-10-04); Intel's AutoRound build served in between (2026-10-02 to 04) and
+is the documented alternative; devan's W4A16 (from 2026-09-28) is the reference. The README ranks them and says why; the
+numbers are in [measurements/b70.2.md](measurements/b70.2.md).
 
 ## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)
 

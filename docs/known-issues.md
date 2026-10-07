@@ -124,13 +124,18 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 
 ## 12. AWQ on this release: tested on the frozen stack, not on this exact tree
 
-AWQ (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`) has run on the frozen stack (2026-10-04): MTP k=3, 16 slots, 128 GiB CPU
-tier, vllm-xpu-kernels 0.1.14.1+b70.3 (B70-K1), and 0029b as B70-0030. Measured there: the engine boots on the first
-pass (first token 363 s after start); the K1 load line appears on all four workers; the sweep over 1–10 streams has 0 bad
-outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok with the engine alive; host memory is flat
-under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB and ~355 GB of offload loads); 0 tracebacks,
-0 `DEVICE_LOST`. Speeds and quality: README and [measurements](measurements/b70.2.md).
+AWQ (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`) is the build we serve and recommend. It ran on the frozen stack from
+2026-10-04: MTP k=3, 16 slots, 128 GiB CPU tier, vllm-xpu-kernels 0.1.14.1+b70.3 (B70-K1), and 0029b as B70-0030. Measured
+there: the engine boots on the first pass (first token 363 s after start); the K1 load line appears on all four workers;
+the sweep over 1–10 streams has 0 bad outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok
+with the engine alive; host memory is flat under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB
+and ~355 GB of offload loads); 0 tracebacks, 0 `DEVICE_LOST`. It then ran **3 days 16 hours in one engine**
+(2026-10-04 to 2026-10-07, ~52,500 requests, 0 errors, 0 aborts; README, Endurance), ended by a planned restart.
+Speeds and quality: README and [measurements](measurements/b70.2.md).
 
-What is still not measured: AWQ on the b70.2 series as released here (the AWQ tree ran 0030 on the b70.1-MTP branch,
-without 0031; 0031 is redundant with b70.3 and stays off); AWQ with the kernels at 48K prompts; token-level identity
-of the direct copy against staging on AWQ.
+What is not covered: the AWQ engine runs fork branch `b70/v0.30.0-mtp0020` @ `4512442c7`, not `b70/v0.30.0-intel`, which
+is what `patches/` exports. The published series adds 0028 (acts only on Intel's checkpoint), 0029 (V1 runner, which this
+model does not use), 0031 (off with kernels b70.3) and 0032 (a log line). We expect none of them to matter for AWQ, but we
+have not booted AWQ on the published tree. Also not measured: AWQ at 48K prompts on b70.3; token-level identity of the
+direct copy against staging on AWQ; the snapshot `tools/awq_snapshot.py` writes was compared with ours by index only
+(same 222,579 tensors), not by a boot.

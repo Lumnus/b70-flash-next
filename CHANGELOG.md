@@ -4,8 +4,11 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 ## 0.30.0-b70.2 — draft (2026-10-03)
 
-The configuration we serve since 2026-10-03: Intel's AutoRound W4A16 checkpoint with MTP (3 draft tokens) and a
-128 GiB CPU KV tier, on our vllm-xpu-kernels 0.1.14.1+b70.3. Source: fork branch `b70/v0.30.0-intel` @ `640f218`
+The configuration we serve since 2026-10-04: the AWQ W4A16 checkpoint (wtdcode) with MTP (3 draft tokens) and a
+128 GiB CPU KV tier, on our vllm-xpu-kernels 0.1.14.1+b70.3. It ran 3 days 16 h in one engine with 0 errors and 0 aborts
+(README, Endurance). Intel's AutoRound checkpoint on the same flags is the documented alternative (it needs 0028).
+The AWQ engine runs fork branch `b70/v0.30.0-mtp0020` @ `4512442c7`; the series below is `b70/v0.30.0-intel`, a
+superset that adds four patches that do not act on AWQ. Source: fork branch `b70/v0.30.0-intel` @ `640f218`
 (= `b70/v0.30.0` @ `01abfaa` + 12 commits). No tag and no image yet.
 
 The series (0020–0032):
@@ -32,7 +35,7 @@ pinned sources). It replaces wu1ff's closed `libgdn_index64.so` on the stable li
 `git format-patch 0.1.14.1..v0.1.14.1+b70.3` in a clone of the fork; applied with `git am` on upstream tag `0.1.14.1`
 it gives the tag's tree exactly.
 
-Repository: README (setup table, models with throughput per concurrency, the host-RAM KV tier, credits last), `engines/intel-autoround-s16-kv128-mtp3.env`,
+Repository: README (setup table, endurance, models ranked AWQ > Intel > devan with throughput per concurrency, the host-RAM KV tier, credits last), `engines/awq-s16-kv128-mtp3.env`, `engines/intel-autoround-s16-kv128-mtp3.env`,
 `serve-s16-mtp3.args`, `serve-config-intel-autoround.json`, `tools/intel_snapshot.py`,
 `docs/measurements/b70.2.md`; `scripts/export-series.sh` defaults to `b70/v0.30.0-intel`; `scripts/make-tree.sh` maps
 `0.30.0-b70.1` to `b70/v0.30.0` and later releases to `b70/v0.30.0-intel`; `image/verify-overlay.sh` carries the final

@@ -5,7 +5,8 @@ KV size to your host.
 
 | engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
 |---|---|---|---|---|---|---|
-| **`intel-autoround-s16-kv128-mtp3`** | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3 |
+| **`awq-s16-kv128-mtp3`** | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve and recommend** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3 |
+| `intel-autoround-s16-kv128-mtp3` | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | the documented alternative: same flags, needs patch 0028 |
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
 | `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
@@ -20,9 +21,19 @@ Files: `common.env` (shared environment), `<engine>.env` (the differences, plus 
 MODELS=/srv/models CACHE=/srv/cache engines/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
 ```
 
-## The serving recipe (`intel-autoround-s16-kv128-mtp3`, 0.30.0-b70.2)
+## The serving recipe (`awq-s16-kv128-mtp3`, 0.30.0-b70.2)
 
-We run it from a source tree, not the image (README, Quick start). Differences from the AWQ recipe below:
+We run it from a source tree, not the image (README, Quick start). It is the AWQ weights (snapshot from
+`tools/awq_snapshot.py`, `serve-config-awq.json`) on the flags and environment described next: MTP k=3, 16 slots, util 0.88,
+262K context, 128 GiB CPU tier, INT8 PLE from NVMe, kernels b70.3. It ran 3 days 16 h in one engine without an error
+(README, Endurance). AWQ weights and snapshot: step 1 of
+"The b70.1 serving recipe" below. The Intel alternative (`intel-autoround-s16-kv128-mtp3`) differs in the weights
+step (Intel specifics, point 1) and needs patch 0028; points 2 to 5 hold for both.
+
+0. **Code.** Our AWQ engine runs fork branch `b70/v0.30.0-mtp0020` @ `4512442c7`; `patches/` exports
+   `b70/v0.30.0-intel`, which adds four patches that do not act on AWQ (known issues item 12).
+
+Intel specifics (point 1 only; points 2 to 5 are common):
 
 1. **Weights.** `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`, every file except
    `model-00016-of-00017.safetensors` (the 102.4 GB PLE shard); devan's `ple_table_qwen4exp.pt` as before. Then:
