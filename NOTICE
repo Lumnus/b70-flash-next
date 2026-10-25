@@ -70,6 +70,6 @@ Third-party material
      the vllm-xpu-kernels headers carried in wu1ff's pack.
    - B70-V32-0053 (the FP8 lm_head) and B70-V32-0054 are ports of patches from Niluthon/qwen38-flash-tp2 @ e536e33
      (Apache-2.0).
-   - The oneCCL plugin is built from uxlfoundation/oneCCL (Apache-2.0) with pull request #229; no oneCCL source is
+   - The optional oneCCL plugin is built from uxlfoundation/oneCCL (Apache-2.0) with pull request #229; no oneCCL source is
      stored here.
    - The drafter incoai/Qwen3.8-Flash-Next-DFlash2 (revision a22a1744, Apache-2.0) is referenced, not included.

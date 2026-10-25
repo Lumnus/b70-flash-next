@@ -2,6 +2,17 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## Unreleased
+
+- **The default recipe is now the stock-plugin configuration.** `v0.32/engines/serve.env` is the configuration without
+  expandable segments and without the patched oneCCL plugin; the patched-plugin configuration moved to
+  `v0.32/engines/serve-plugin.env` (formerly `serve.env`; the old `serve-no-plugin.env` is now `serve.env`). No variable
+  line changed in either file.
+- Why: the plugin buys ~2 % GPU KV (397,309 against 388,872 tokens) with speed within noise, and costs a hand-built `.so`
+  tied to the pip oneCCL 2022.1.2 wheel, five `CCL_SYCL_*_TMP_BUF=1` buffer copies, and a second thing to rebuild on every
+  torch/oneCCL bump.
+- The default flips back to `serve-plugin.env` once uxlfoundation/oneCCL#229 ships in a oneCCL release that torch pins.
+
 ## Repository changes — 2026-10-25: attribution and scope of the headline numbers and gates
 
 Documentation only; no series change, no new tag.
@@ -71,9 +82,9 @@ What we serve since 2026-10-24, published as a second line next to 0.30.0-b70.2 
   `v0.32/scripts/check-series.sh` checks it against the tag.
 - **Serving shape.** Intel AutoRound weights, incoai DFlash2 drafter with 7 draft tokens, async scheduling, 8 sequences,
   prefill chunks of 4096, util 0.89, FULL_AND_PIECEWISE graphs at multiples of 8, 128 GiB CPU KV tier in a private
-  pinned pool (no `/dev/shm` requirement), INT8 PLE from NVMe, compute-runtime copy-through-lock off, expandable
-  segments with the oneCCL legacy plugin rebuilt with uxlfoundation/oneCCL#229. `v0.32/engines/serve.{args,env}`;
-  fallback without the plugin `serve-no-plugin.env`.
+  pinned pool (no `/dev/shm` requirement), INT8 PLE from NVMe, compute-runtime copy-through-lock off, stock
+  oneCCL plugin, no expandable segments (`v0.32/engines/serve.{args,env}`); the expandable-segments configuration with the
+  oneCCL legacy plugin rebuilt with uxlfoundation/oneCCL#229 is `serve-plugin.env`.
 - **Kernels.** vllm-xpu-kernels `release/0.1.15.4` + #658, #660 and #662 (we serve an earlier pinned-only form of #662),
   oneDNN on; wu1ff's Python hunks and
   B70-V32-05/06 in `v0.32/patches/vllm-xpu-kernels-py/`; wu1ff's native libraries built from his 1.0.5 sources, with

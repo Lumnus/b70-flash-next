@@ -288,7 +288,7 @@ B70. Our host image is internal and not published.
 | fork | github.com/Lumnus/vllm `b70/v0.32.0` = tag `v0.32.0-b70.1` → `103f2f2eb94074e91e91f0c13652272f819bef70` (49 commits; the first 34 were published on 2026-10-23 as `979482e2e`) |
 | wu1ff pack | wu1ff/B70-LLM-Controller `5e5cf43f048d9b32146bb22925d4a2cf198400b0` (release `qwen3.8-flash-next-v1.0.5`, MIT) |
 | kernels | vllm-project/vllm-xpu-kernels `release/0.1.15.4` `ddf336d86e3c8602888572a3502f951abd51df12` + `848aca4` (#660), `71b7c5a` (#658; same code as the posted head `ab17bc7`), `3c8d392` (an earlier, pinned-only form of #662, whose posted head is `dc16c9f`) |
-| oneCCL plugin | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
+| oneCCL plugin (optional, for `serve-plugin.env` only) | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
 | weights | Intel/Qwen3.8-Flash-Next-W4A16-AutoRound `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`; drafter incoai/Qwen3.8-Flash-Next-DFlash2 `a22a1744e85c17364dcc54a6a420af7135d4c7f6` (model.safetensors sha256 `d6723f2a…4d3186f`) |
 | serve config | `engines/serve-config-intel-autoround.json`, sha256 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7` (byte-identical to the served file) |
 | runtime | compute-runtime 26.35.39758.10; torch 2.14.0+xpu; triton 3.8.0+xpu; intel-sycl-rt 2026.1.1; oneccl 2022.1.2; transformers 5.17.0; auto-round-lib 0.16.0; icpx 2026.1.1 for builds |

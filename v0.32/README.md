@@ -13,10 +13,10 @@ slot below ([Sparse attention](#sparse-attention-qsa-in-preparation)).
 | weights | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (the only build measured on 0.32) + drafter `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` |
 | GPUs | 4× Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
 | attention | the target model on vLLM's XPU default backend (FlashAttention); the drafter on `TRITON_ATTN` (`serve.args`) |
-| KV | 397,309 GPU KV tokens at memory fraction 0.89 (388,872 with `serve-no-plugin.env`) + 128 GiB CPU tier (32 GiB pinned per rank, private pool, no `/dev/shm` requirement) |
+| KV | 388,872 GPU KV tokens at memory fraction 0.89 (397,309 with `serve-plugin.env`) + 128 GiB CPU tier (32 GiB pinned per rank, private pool, no `/dev/shm` requirement) |
 | software | [Software](#software) below; pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 |
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| engine files | [`engines/serve.args`](engines/serve.args), [`engines/serve.env`](engines/serve.env); fallback [`engines/serve-no-plugin.env`](engines/serve-no-plugin.env) |
+| engine files | [`engines/serve.args`](engines/serve.args), [`engines/serve.env`](engines/serve.env) (stock oneCCL plugin); alternative with the patched plugin [`engines/serve-plugin.env`](engines/serve-plugin.env) |
 | status | the configuration validated on 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
 
 The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable fallback line.
@@ -36,7 +36,7 @@ configuration). The headline table on the main README cover is taken from this o
 | decode, 4 concurrent requests (total tok/s) | 295 | 287 (repeat 296) | **306.2** |
 | decode, 8 streams (total tok/s) | 370 | 588 / 601 | **605.5** (before RC1 and the plugin: 605 / 622) |
 | prefill 8K / 32K / 131K (tok/s) | 4,052 / 3,833 / 2,953 | 6,125 / 6,092 / 4,648 | **6,305 / 6,114 / 4,641** |
-| GPU KV cache (tokens) | ~311K | 406,432 | **397,309** |
+| GPU KV cache (tokens) | ~311K | 406,432 | **388,872** (397,309 with `serve-plugin.env`) |
 | agent replay: wall time, TTFT p50 / p90, preemptions | 401 s, 2.90 / 6.57 s, 0 | 302 s, 2.25 / 4.85 s, 0 | **268 s, 2.13 / 4.71 s, 0** |
 | quality, MMLU 300 / TruthfulQA 200 | 259 / 177 | paired vs the left column: n.s. | paired vs the 0.30 perf line: 1+1 / 0+1 discordant, p = 1.0 / 1.0 |
 | gates | pass | pass | burst 0/150, structured output clean, mix 7/7, greedy token compare: no garbage, first divergences at small baseline margins (not an equivalence check, see row 7) |
@@ -53,7 +53,7 @@ How each row was taken:
 3. **Prefill.** One uncached, salted prompt of 8K, 32K or 131K tokens; prompt tokens over time to first token.
 4. **KV.** The GPU KV cache size vLLM reports at start.
 5. **Replay.** Six recorded agent sessions (243 requests, salted per run) replayed deterministically against the
-   128 GiB CPU tier. The 0.32 row ran on `serve-no-plugin.env` (the KV offload code is the same; the plugin was added
+   128 GiB CPU tier. The 0.32 row ran on `serve.env` (the KV offload code is the same; the plugin was added
    after it); the plain 0.32 def without the private pool needed 281 s with 2 preemptions.
 6. **Quality.** MMLU 300 and TruthfulQA MC1 200, the same items for every configuration, paired McNemar test against
    the configuration it replaced. Every step of the chain was not significantly different: no difference was detected,
@@ -102,8 +102,10 @@ Then two host-memory fixes:
    virtual memory, which compute-runtime 26.35 reserves with a CPU mapping on Battlemage. oneCCL's legacy plugin
    classifies a buffer as host memory when `msync()` succeeds on it, sends it to the CPU collective without a stream,
    and libfabric then copies the device address on the host and segfaults. The plugin fix (uxlfoundation/oneCCL#229)
-   asks SYCL for the pointer type when a queue is given. It buys ~8K KV tokens here. Without the patched plugin, do not
-   enable expandable segments; use `serve-no-plugin.env`.
+   asks SYCL for the pointer type when a queue is given. It buys ~8K KV tokens (~2 %) here, at the price of a hand-built `.so` tied to the oneCCL 2022.1.2 wheel and five
+   `CCL_SYCL_*_TMP_BUF=1` copies, so it is the alternative (`serve-plugin.env`), not the default. Without the patched
+   plugin, do not enable expandable segments; `serve.env` does not. The default flips to this configuration once #229 ships in a
+   oneCCL release that torch pins.
 
 Upstream fixes folded in (all six are our posted PRs; none merged as of 2026-10-25):
 
@@ -147,7 +149,7 @@ wu1ff's `vllm_xpu_kernels/` hunks (0001–0007, astra500 wrappers and the fused-
 | Python | 3.12 |
 | torch / triton | 2.14.0+xpu / 3.8.0+xpu |
 | Intel runtime wheels | intel-sycl-rt, dpcpp-cpp-rt, intel-opencl-rt 2026.1.1; onemkl-sycl 2026.1.0 |
-| oneCCL | 2022.1.2 (pip `oneccl`) core and loader, legacy plugin rebuilt with oneCCL#229 |
+| oneCCL | 2022.1.2 (pip `oneccl`) core and loader, stock legacy plugin; optionally rebuilt with oneCCL#229 (only for `serve-plugin.env`) |
 | vllm-xpu-kernels | `release/0.1.15.4` + #658, #660 and an earlier pinned-only form of #662, oneDNN on; Python side + [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/) |
 | other pins | transformers 5.17.0, auto-round-lib 0.16.0 |
 | vLLM | v0.32.0 + this series |
@@ -214,7 +216,7 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
    op from this library). Put the Level Zero peer-residency shim at `/opt/b70/libl0_peer_residency_shim.so`. Our builds
    are not byte-identical to wu1ff's accepted hashes (different build paths); the shim is.
 
-6. **oneCCL legacy plugin** (only for `serve.env`). One file, built against the venv's shipped oneCCL 2022.1.2:
+6. **oneCCL legacy plugin** (only for `serve-plugin.env`). One file, built against the venv's shipped oneCCL 2022.1.2:
    ```bash
    git clone -b master-v2 https://github.com/uxlfoundation/oneCCL.git && cd oneCCL
    git fetch -q origin pull/229/head && git checkout FETCH_HEAD   # caeb329, on master-v2 c5108e7
@@ -224,7 +226,7 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
        plugins/legacy/ccl_legacy.cpp src/debug.cpp -o /opt/b70/oneccl-legacy/libccl_legacy.so \
        -L$V/lib -lccl -l:libccl.so.2 -ldl -Wl,--no-undefined -Wl,-soname,libccl_legacy.so
    ```
-   `CCL_PLUGIN` in `serve.env` points the shipped loader at it; the venv stays untouched.
+   `CCL_PLUGIN` in `serve-plugin.env` points the shipped loader at it; the venv stays untouched.
 
 7. **Weights.** Intel AutoRound @ `4c67bf68` without the 102.4 GB PLE shard, devan's `ple_table_qwen4exp.pt`, the INT8
    table from `tools/build_int8_ple.py`, and the snapshot from `tools/intel_snapshot.py` (as for 0.30, see
@@ -235,7 +237,7 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
 
 8. **Run.**
    ```bash
-   set -a; . v0.32/engines/serve.env; set +a
+   set -a; . v0.32/engines/serve.env; set +a   # or serve-plugin.env, after build step 6
    mapfile -t args < <(grep -v '^#' v0.32/engines/serve.args | sed '/^$/d' | sed 's/^\(--[^ ]*\) \(.*\)$/\1\n\2/')
    LD_LIBRARY_PATH=/opt/b70/venv/lib /opt/b70/venv/bin/vllm serve /models/qwen3.8-flash-next/serve-dir "${args[@]}"
    ```

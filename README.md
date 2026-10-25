@@ -18,9 +18,9 @@ the full-attention layers attend over the whole context) and **sparse** (QSA wit
 | model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound recommended** (the only build measured on 0.32); AWQ is validated on the 0.30 line; Minachist's recalibrated experts are a supported variant ([Models](#models)) |
 | GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
 | decoding | DFlash2 speculative decoding, 7 draft tokens (incoai's drafter; the drafter on `TRITON_ATTN`, the target on vLLM's XPU default, FlashAttention); async scheduling; 8 sequences; 4096-token prefill chunks; 262K context; GPU memory fraction 0.89 |
-| KV cache | GPU pool 397K tokens + **128 GiB in host RAM** (CPU tier, a private pinned pool per rank; no `/dev/shm` requirement) |
+| KV cache | GPU pool 389K tokens (397K with the optional oneCCL plugin) + **128 GiB in host RAM** (CPU tier, a private pinned pool per rank; no `/dev/shm` requirement) |
 | PLE n-gram table | **INT8, served from NVMe** (8 GiB pinned row cache instead of 48.9 GiB in RAM) |
-| software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 with the legacy plugin rebuilt from oneCCL #229, vllm-xpu-kernels `release/0.1.15.4` + our three PRs ([v0.32/README.md](v0.32/README.md#software)) |
+| software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 (stock plugin; an optional legacy plugin rebuilt from oneCCL #229 adds ~2 % KV), vllm-xpu-kernels `release/0.1.15.4` + our three PRs ([v0.32/README.md](v0.32/README.md#software)) |
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
 | status | gates, quality, speed and an agent-session replay measured; no multi-day run yet ([known issues](v0.32/README.md#known-issues-032)) |
 | **stable fallback** | [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2): vLLM v0.30.0, torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3, MTP k=3, 16 sequences, ~311K GPU KV tokens + the same 128 GiB CPU tier; multi-day validated on Intel and AWQ ([the 0.30 line](#the-030-line-stable-fallback)) |
@@ -33,7 +33,7 @@ Measured against the 0.30 fallback, same harness, same host, one after another:
 | decode, 4 concurrent | 295 tok/s total | 287 tok/s total (repeat 296) | **306.2 tok/s** |
 | decode, 8 streams | 370 tok/s total | 588 / 601 tok/s total | **605.5 tok/s** |
 | prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | 6,125 / 6,092 / 4,648 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
-| GPU KV cache | ~311K tokens | 406K tokens | **397K tokens** |
+| GPU KV cache | ~311K tokens | 406K tokens | **389K tokens** (397K with the optional oneCCL plugin) |
 | agent-session replay (243 requests) | 401 s | 302 s | **268 s** |
 | MMLU / TruthfulQA | — | not significantly different | no difference detected (paired, at every step; not an equivalence bound) |
 
@@ -324,7 +324,7 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 
 | path / repo | what |
 |---|---|
-| [`v0.32/`](v0.32/README.md) | the 0.32.0-b70.1 release: `patches/vllm/` (49 commits on v0.32.0), `patches/vllm-xpu-kernels-py/`, `patches/libgdn-index64/`, `engines/` (`serve.args`, `serve.env`, `serve-no-plugin.env`), `scripts/check-series.sh`, build recipe and numbers |
+| [`v0.32/`](v0.32/README.md) | the 0.32.0-b70.1 release: `patches/vllm/` (49 commits on v0.32.0), `patches/vllm-xpu-kernels-py/`, `patches/libgdn-index64/`, `engines/` (`serve.args`, `serve.env`, `serve-plugin.env`), `scripts/check-series.sh`, build recipe and numbers |
 | `patches/vllm/`, `patches/vllm-tests/` | the series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
 | `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
 | `patches/series.txt` | which fork commit goes to which file |
