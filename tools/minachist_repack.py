@@ -20,6 +20,9 @@ embed/head, MTP) stays Intel's, byte for byte; the serve config and the INT8 PLE
         unpack_from_int32 of the download) and prints max |diff| (expected 0) and the rel-L2 distance between Intel's
         and Minachist's experts (we measured ~0.11 on layers 0, 1, 12, 24, 31, 47). Needs `compressed-tensors`.
 
+The measurements above were taken with the unpublished script this file was ported from; this port's repack math is
+round-trip tested on synthetic tensors, and has not yet been run on the real checkpoint. Run `verify` on your snapshot.
+
 The Minachist download does not need its BF16 n-gram table (the series serves the INT8 PLE table). Needs torch and
 safetensors; CPU only.
 """

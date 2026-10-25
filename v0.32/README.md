@@ -1,6 +1,6 @@
 # 0.32.0-b70.1 — Qwen3.8-Flash-Next on vLLM 0.32, 4× Intel Arc Pro B70
 
-The current line, served since 2026-10-24: vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
+The current line (configuration validated on 2026-10-24): vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
 from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM fixes cherry-picked. Speculative
 decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 8 sequences,
 4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. This
@@ -17,7 +17,7 @@ slot below ([Sparse attention](#sparse-attention-qsa-in-preparation)).
 | software | [Software](#software) below; pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 |
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
 | engine files | [`engines/serve.args`](engines/serve.args), [`engines/serve.env`](engines/serve.env); fallback [`engines/serve-no-plugin.env`](engines/serve-no-plugin.env) |
-| status | the line we serve since 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
+| status | the configuration validated on 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
 
 The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable fallback line.
 
@@ -25,7 +25,8 @@ The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable
 
 Three configurations measured with the same harness on the same host, one after another, on an idle engine (each
 timed cell waits for 20 s with no running or waiting requests). Single runs unless noted; read differences under
-~5 % as noise. These are **not** comparable with the per-build tables in the main README's Models section, which use a different
+~5 % as noise: 0.32 matches the 0.30 perf line, and the gain over 0.30.0-b70.2 is the DFlash2/async/bundle stack, which
+runs on both. These are **not** comparable with the per-build tables in the main README's Models section, which use a different
 harness (the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching
 configuration). The headline table on the main README cover is taken from this one.
 
@@ -44,7 +45,9 @@ configuration). The headline table on the main README cover is taken from this o
 How each row was taken:
 
 1. **Decode, 1 and 4.** `bench_det` (taken from Niluthon/qwen38-flash-tp2, Apache-2.0): steady decode milliseconds
-   per step, converted with the measured tokens accepted per step.
+   per step, converted with the measured tokens accepted per step. Greedy: temperature 0, thinking off. At temperature
+   0 the K=7 configurations use the vocab-parallel greedy verify; sampled requests (production's default temperature
+   is not 0) do not take that path, and no speed number at a sampling temperature is in this table.
 2. **8 streams.** Eight parallel generations, total generated tokens over wall time. The second 8-stream run of the
    served configuration overlapped other traffic and is not reported.
 3. **Prefill.** One uncached, salted prompt of 8K, 32K or 131K tokens; prompt tokens over time to first token.

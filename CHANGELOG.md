@@ -2,6 +2,21 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## Repository changes — 2026-10-25: attribution and scope of the headline numbers
+
+Documentation only; no series change, no new tag.
+
+- **The cover table has the 0.30 perf line column** (DFlash2 K=7, 8 slots on vLLM v0.30.0, taken from
+  `v0.32/README.md`). The gain over 0.30.0-b70.2 comes from DFlash2 K=7, async scheduling, 4096-token prefill chunks
+  and bundles A/B, which also run on 0.30; 0.32 against the 0.30 perf line is within noise (it matches).
+- **Speed numbers are greedy** (temperature 0, thinking off), where the K=7 greedy-verify path is active; stated on the
+  cover and in `v0.32/README.md`.
+- "The line we serve since 2026-10-24" → "the configuration validated on 2026-10-24": what the engine runs moves
+  between this configuration and fallbacks during development windows.
+- Minachist: the "max |diff| 0" repack check was measured with the unpublished script `tools/minachist_repack.py` was
+  ported from; the port is tested on synthetic tensors only, not yet on the real checkpoint (README, PROVENANCE, the
+  tool's docstring).
+
 ## Repository changes — 2026-10-25: documentation reconciled to the current line
 
 Documentation only; no series change, no new tag.

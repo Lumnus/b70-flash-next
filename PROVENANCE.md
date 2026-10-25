@@ -271,9 +271,10 @@ PLE rows (shard 16) with devan's table is UNVERIFIED.
 @ `411505aaa5588e3dac0693c41e442ba79e897975` (2026-10-23; `main` is a different, earlier calibration), license
 qwen-community-1.0 per the card; downloaded without its BF16 n-gram table (~73 GB), every file sha256-verified. Only
 the routed experts are used: `tools/minachist_repack.py` writes them into copies of the 14 Intel shards that hold
-experts (same keys, dtypes, shapes and sizes) and links everything else from the Intel snapshot. Its `verify` mode
-gave max |diff| 0 against compressed-tensors' own unpack on layers 0, 1, 12, 24, 31, 47 (32 experts × 3 each) and a
-rel-L2 of 0.110–0.119 between Intel's and Minachist's experts. Not redistributed here.
+experts (same keys, dtypes, shapes and sizes) and links everything else from the Intel snapshot. The original (unpublished) script it was ported from,
+in its `verify` mode, gave max |diff| 0 against compressed-tensors' own unpack on layers 0, 1, 12, 24, 31, 47 (32 experts × 3 each) and a
+rel-L2 of 0.110–0.119 between Intel's and Minachist's experts; the published port is tested on synthetic tensors
+only, not yet on the real checkpoint. Not redistributed here.
 
 **Runtime of the 0.30.0-b70.2 recipe** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
 kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro

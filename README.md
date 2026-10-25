@@ -13,7 +13,7 @@ the full-attention layers attend over the whole context) and **sparse** (QSA wit
 
 | | |
 |---|---|
-| release | [`v0.32.0-b70.1`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.1), 2026-10-25; the line we serve since 2026-10-24 |
+| release | [`v0.32.0-b70.1`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.1), 2026-10-25; the configuration validated on 2026-10-24 |
 | code | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers: fork tag [`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1) (`103f2f2eb9`), exported to [`v0.32/patches/vllm/`](v0.32/patches/vllm/) (49 patches) |
 | model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound recommended** (the only build measured on 0.32); AWQ is validated on the 0.30 line; Minachist's recalibrated experts are a supported variant ([Models](#models)) |
 | GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
@@ -27,15 +27,20 @@ the full-attention layers attend over the whole context) and **sparse** (QSA wit
 
 Measured against the 0.30 fallback, same harness, same host, one after another:
 
-| | 0.30.0-b70.2 (MTP k=3, 16 slots) | **0.32.0-b70.1** (DFlash2 K=7, 8 slots) |
-|---|---|---|
-| decode, 1 stream | 107.5 tok/s | **169.3 tok/s** |
-| decode, 4 concurrent | 295 tok/s total | **306.2 tok/s** |
-| decode, 8 streams | 370 tok/s total | **605.5 tok/s** |
-| prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
-| GPU KV cache | ~311K tokens | **397K tokens** |
-| agent-session replay (243 requests) | 401 s | **268 s** |
-| MMLU / TruthfulQA | — | not significantly different (paired, at every step) |
+| | 0.30.0-b70.2 (MTP k=3, 16 slots) | 0.30 perf line (DFlash2 K=7, 8 slots) | **0.32.0-b70.1** (DFlash2 K=7, 8 slots) |
+|---|---|---|---|
+| decode, 1 stream | 107.5 tok/s | 166 tok/s | **169.3 tok/s** |
+| decode, 4 concurrent | 295 tok/s total | 287 tok/s total (repeat 296) | **306.2 tok/s** |
+| decode, 8 streams | 370 tok/s total | 588 / 601 tok/s total | **605.5 tok/s** |
+| prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | 6,125 / 6,092 / 4,648 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
+| GPU KV cache | ~311K tokens | 406K tokens | **397K tokens** |
+| agent-session replay (243 requests) | 401 s | 302 s | **268 s** |
+| MMLU / TruthfulQA | — | not significantly different | not significantly different (paired, at every step) |
+
+The gain over 0.30.0-b70.2 comes from DFlash2 K=7, async scheduling, 4096-token prefill chunks and our bundles A/B,
+which also run on 0.30 (the middle column); 0.32 against that 0.30 perf line is within noise: it matches, it does not
+win. Speed rows are greedy (temperature 0, thinking off), where the K=7 greedy-verify path is active; requests that
+sample (production's default temperature is not 0) do not take that path.
 
 Single runs on an idle engine; this harness is not the one behind the 0.30 per-build tables further down. Method, the
 intermediate 0.30 perf line, and the caveats: [v0.32/README.md](v0.32/README.md#numbers). How to build and run it:
@@ -198,10 +203,11 @@ AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
 
 Minachist's recalibrated int4 routed experts (group 128, symmetric, F16 scales; its card reports a lower KL than its own
 `main`), placed into Intel's checkpoint: `tools/minachist_repack.py convert <intel snapshot> <minachist download>
-<new snapshot>` repacks the experts from compressed-tensors into Intel's GPTQ layout (exact: max |diff| 0 on every
-sampled layer) and keeps every other tensor Intel's, byte for byte (attention, GDN, shared expert, HC, embed/head,
+<new snapshot>` repacks the experts from compressed-tensors into Intel's GPTQ layout and keeps every other tensor Intel's, byte for byte (attention, GDN, shared expert, HC, embed/head,
 MTP). Minachist's own INT6/INT8 layers are not used: the XPU path does not load them. Download: the checkpoint without
-its BF16 n-gram table, ~73 GB. License: qwen-community-1.0, as the base model.
+its BF16 n-gram table, ~73 GB. License: qwen-community-1.0, as the base model. The repack was exact (max |diff| 0
+on every sampled layer) when measured with the script it was ported from; this port, `tools/minachist_repack.py`, has
+been tested on synthetic tensors only, not yet run on the real checkpoint. Run its `verify` mode on your snapshot.
 
 Engine settings: the Intel model file and serve config unchanged, only the snapshot path points at the new snapshot.
 Measured on the 0.30 perf line (fork branch
@@ -274,7 +280,7 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 
 | line | what | state |
 |---|---|---|
-| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`), torch 2.14, vllm-xpu-kernels `release/0.1.15.4` + our three kernel PRs ([v0.32/](v0.32/README.md)) | **what we serve since 2026-10-24**; gates, quality and speed measured, no multi-day run yet. Dense attention released; sparse (QSA) in preparation |
+| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`), torch 2.14, vllm-xpu-kernels `release/0.1.15.4` + our three kernel PRs ([v0.32/](v0.32/README.md)) | **the configuration validated on 2026-10-24**; gates, quality and speed measured, no multi-day run yet. Dense attention released; sparse (QSA) in preparation |
 | **stable fallback `0.30.0-b70.N`** | stock vLLM v0.30.0 + the series in `patches/` (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | the multi-day validated line (Intel and AWQ); the fallback |
 | edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
 
