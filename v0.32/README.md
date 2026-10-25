@@ -39,7 +39,7 @@ configuration). The headline table on the main README cover is taken from this o
 | GPU KV cache (tokens) | ~311K | 406,432 | **397,309** |
 | agent replay: wall time, TTFT p50 / p90, preemptions | 401 s, 2.90 / 6.57 s, 0 | 302 s, 2.25 / 4.85 s, 0 | **268 s, 2.13 / 4.71 s, 0** |
 | quality, MMLU 300 / TruthfulQA 200 | 259 / 177 | paired vs the left column: n.s. | paired vs the 0.30 perf line: 1+1 / 0+1 discordant, p = 1.0 / 1.0 |
-| gates | pass | pass | burst 0/150, structured output clean, mix 7/7, greedy compare pass |
+| gates | pass | pass | burst 0/150, structured output clean, mix 7/7, greedy token compare: no garbage, first divergences at small baseline margins (not an equivalence check, see row 7) |
 | host MemAvailable while serving (256 GB host, ~20 GB of other work on it) | — | ~44–46 GiB | **35–39 GiB** |
 
 How each row was taken:
@@ -56,10 +56,17 @@ How each row was taken:
    128 GiB CPU tier. The 0.32 row ran on `serve-no-plugin.env` (the KV offload code is the same; the plugin was added
    after it); the plain 0.32 def without the private pool needed 281 s with 2 preemptions.
 6. **Quality.** MMLU 300 and TruthfulQA MC1 200, the same items for every configuration, paired McNemar test against
-   the configuration it replaced. Every step of the chain was not significantly different.
+   the configuration it replaced. Every step of the chain was not significantly different: no difference was detected,
+   which at these sample sizes (one or two discordant pairs) is not an equivalence bound; differences of a few points
+   would not be detected.
 7. **Gates.** Burst: 150 requests landing in the same steps at concurrency 3, 4 and 8, checked for NaN and garbage
    output. Structured output with speculative decoding. A mixed long/short probe. Greedy token compare at
-   concurrency 1 and 8 against the previous configuration (near-tie flips only).
+   concurrency 1 and 8 against the previous configuration: no garbage markers, and where the outputs diverge, the
+   first divergence sits at a small margin between the baseline's top two tokens. It does **not** show equivalence:
+   the compare did not check that the candidate chose the baseline's runner-up token at a divergence, and it compared
+   only the overlapping prefix of the two outputs (an empty or shorter output was not caught). The final captures for
+   this release (8 prompts × 256 tokens at concurrency 1 and 8) have full-length outputs for every prompt. A stricter compare is being built; these rows will be re-run
+   with it.
 8. **Long context**, decode at one stream, two runs each: 8K / 64K / 128K prompts 209 / 200 / 172 tok/s on 0.32 vs
    217 / 220 / 169 on the 0.30 perf line (noise level at n = 2).
 
@@ -267,7 +274,7 @@ Until then, use the dense release above.
    it was not booted on this line.
 6. **AWQ / 0.30 items still apply** where the code is shared: card hangs after a GT reset ([docs/known-issues.md](../docs/known-issues.md)
    item 1), liveness must generate, and pinned memory escapes container limits.
-7. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the token
-   compare and the burst gate before serving.
+7. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the burst gate and
+   a token compare (garbage and divergence check, not an equivalence test) before serving.
 8. **The kernels build is not attached.** Build it as in step 3 (~26 min on our build host with flash-attention and
    MQA off; much longer with them on).

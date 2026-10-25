@@ -2,7 +2,7 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
-## Repository changes — 2026-10-25: attribution and scope of the headline numbers
+## Repository changes — 2026-10-25: attribution and scope of the headline numbers and gates
 
 Documentation only; no series change, no new tag.
 
@@ -13,6 +13,11 @@ Documentation only; no series change, no new tag.
   cover and in `v0.32/README.md`.
 - "The line we serve since 2026-10-24" → "the configuration validated on 2026-10-24": what the engine runs moves
   between this configuration and fallbacks during development windows.
+- **The greedy token compare is described as what it tested**: no garbage markers, first divergences at small
+  baseline margins. It did not check that the candidate chose the baseline's runner-up token at a divergence, and it
+  compared only the overlapping prefix (the release's final captures are full length). It is not an equivalence check;
+  a stricter compare will re-run these rows. MMLU / TruthfulQA paired tests: no difference detected, not an equivalence
+  bound.
 - Minachist: the "max |diff| 0" repack check was measured with the unpublished script `tools/minachist_repack.py` was
   ported from; the port is tested on synthetic tensors only, not yet on the real checkpoint (README, PROVENANCE, the
   tool's docstring).

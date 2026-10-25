@@ -35,7 +35,7 @@ Measured against the 0.30 fallback, same harness, same host, one after another:
 | prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | 6,125 / 6,092 / 4,648 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
 | GPU KV cache | ~311K tokens | 406K tokens | **397K tokens** |
 | agent-session replay (243 requests) | 401 s | 302 s | **268 s** |
-| MMLU / TruthfulQA | — | not significantly different | not significantly different (paired, at every step) |
+| MMLU / TruthfulQA | — | not significantly different | no difference detected (paired, at every step; not an equivalence bound) |
 
 The gain over 0.30.0-b70.2 comes from DFlash2 K=7, async scheduling, 4096-token prefill chunks and our bundles A/B,
 which also run on 0.30 (the middle column); 0.32 against that 0.30 perf line is within noise: it matches, it does not
