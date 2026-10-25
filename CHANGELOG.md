@@ -2,6 +2,34 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## 0.32.0-b70.1 — 2026-10-25: vLLM 0.32, DFlash2 K=7
+
+What we serve since 2026-10-24, published as a second line next to 0.30.0-b70.2 (unchanged). Everything is in `v0.32/`.
+
+- **Code.** Fork branch `b70/v0.32.0` fast-forwarded to `103f2f2eb9`, tag `v0.32.0-b70.1`: 49 commits on vLLM v0.32.0
+  (`5df63a7203`): wu1ff's 1.0.5 chain (15 patches, unchanged) and his notice; our 0.30 layers ported (INT8 PLE from NVMe
+  on wu1ff's host-prepared PLE, chat defaults, dense-QSA indexer skip, offload trace/junction/backstep/guard, step trace,
+  tests); vllm-project/vllm#63564 and #63566 cherry-picked (they replace our 0029b and 0014b); the 0.32 fixes
+  B70-V32-PR2, -0053 (FP8 head), -03 (host PLE ids), -07 (HC ordered GEMM ≤ 32 rows), -08 (no prefill HC graphs), -RC1
+  (private pinned KV offload pool), plus diagnostics and rejected arms kept off. Exported to `v0.32/patches/vllm/`;
+  `v0.32/scripts/check-series.sh` checks it against the tag.
+- **Serving shape.** Intel AutoRound weights, incoai DFlash2 drafter with 7 draft tokens, async scheduling, 8 sequences,
+  prefill chunks of 4096, util 0.89, FULL_AND_PIECEWISE graphs at multiples of 8, 128 GiB CPU KV tier in a private
+  pinned pool (no `/dev/shm` requirement), INT8 PLE from NVMe, compute-runtime copy-through-lock off, expandable
+  segments with the oneCCL legacy plugin rebuilt with uxlfoundation/oneCCL#229. `v0.32/engines/serve.{args,env}`;
+  fallback without the plugin `serve-no-plugin.env`.
+- **Kernels.** vllm-xpu-kernels `release/0.1.15.4` + #658, #660 and #662 (we serve an earlier pinned-only form of #662),
+  oneDNN on; wu1ff's Python hunks and
+  B70-V32-05/06 in `v0.32/patches/vllm-xpu-kernels-py/`; wu1ff's native libraries built from his 1.0.5 sources, with
+  `libgdn_index64.so` carrying #660 (`v0.32/patches/libgdn-index64/`). Build recipe in `v0.32/README.md`; no wheel
+  attached.
+- **Runtime.** torch 2.14.0+xpu, oneAPI runtime 2026.1.1, oneCCL 2022.1.2, compute-runtime 26.35.39758.10.
+- **Measured** against 0.30.0-b70.2 with one harness: 1 stream 107.5 → 169.3 tok/s, 8 streams 370 → 605, prefill
+  +51…57 %, KV ~311K → 397K tokens, agent replay 401 → 268 s; quality not significantly different at every step.
+  Not yet: a multi-day run on 0.32, AWQ weights on 0.32, a container image.
+- **Upstream.** README section listing the six fixes posted on 2026-10-25 (vllm-xpu-kernels #658, #660, #662; vLLM
+  #63564, #63566; oneCCL #229). Credits: incoai and Niluthon added; NOTICE item 6.
+
 ## 0.30.0-b70.2 — 2026-10-07: the stable set
 
 AWQ serving fully validated; Intel verification in progress. The configuration we serve since 2026-10-04: the AWQ W4A16

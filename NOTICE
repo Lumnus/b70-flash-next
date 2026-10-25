@@ -58,3 +58,18 @@ Third-party material
    config.json; engines/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
 
 5. Patch 0022 ports vllm-project/vllm#55506 (Apache-2.0, by its authors) to v0.30.0.
+
+6. Release 0.32.0-b70.1 (v0.32/):
+   - v0.32/patches/vllm/0002–0016 are wu1ff's 1.0.5 patch chain for vLLM 0.32 (the vllm/ hunks of
+     model-packs/Qwen3.8-Flash-Next/patches/production/patch-chain in wu1ff/B70-LLM-Controller @ 5e5cf43, MIT),
+     unchanged and authored to wu1ff; 0001 adds his license text and pack notice under b70/third_party/wu1ff/.
+     v0.32/patches/vllm-xpu-kernels-py/0001–0007 are the vllm_xpu_kernels/ hunks of the same chain (MIT, wu1ff).
+     The rest of v0.32/patches/vllm/ modifies vLLM v0.32.0 (Apache-2.0); 0036 and 0037 are our own upstream pull
+     requests vllm-project/vllm#63564 and #63566.
+   - v0.32/patches/libgdn-index64/ is the C++ part of vllm-project/vllm-xpu-kernels#660 (Apache-2.0), to be applied to
+     the vllm-xpu-kernels headers carried in wu1ff's pack.
+   - B70-V32-0053 (the FP8 lm_head) and B70-V32-0054 are ports of patches from Niluthon/qwen38-flash-tp2 @ e536e33
+     (Apache-2.0).
+   - The oneCCL plugin is built from uxlfoundation/oneCCL (Apache-2.0) with pull request #229; no oneCCL source is
+     stored here.
+   - The drafter incoai/Qwen3.8-Flash-Next-DFlash2 (revision a22a1744, Apache-2.0) is referenced, not included.

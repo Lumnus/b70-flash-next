@@ -1,4 +1,4 @@
-# PROVENANCE — b70-flash-next 0.30.0-b70.1 and 0.30.0-b70.2
+# PROVENANCE — b70-flash-next 0.30.0-b70.1, 0.30.0-b70.2 and 0.32.0-b70.1
 
 Where every piece of the image comes from, and the hashes that prove it. Grades: **[M]** measured by us ·
 **[W]** third-party claim, not reproduced · **UNVERIFIED**. The source of the vLLM patches is the fork branch
@@ -270,3 +270,24 @@ PLE rows (shard 16) with devan's table is UNVERIFIED.
 **Runtime we serve on** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
 kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro
 B70. Our host image is internal and not published.
+
+## 8. Release 0.32.0-b70.1 (2026-10-25)
+
+| piece | pin |
+|---|---|
+| vLLM base | v0.32.0 `5df63a7203cdb9328d824a27b682e77c7b9928be` |
+| fork | github.com/Lumnus/vllm `b70/v0.32.0` = tag `v0.32.0-b70.1` → `103f2f2eb94074e91e91f0c13652272f819bef70` (49 commits; the first 34 were published on 2026-10-23 as `979482e2e`) |
+| wu1ff pack | wu1ff/B70-LLM-Controller `5e5cf43f048d9b32146bb22925d4a2cf198400b0` (release `qwen3.8-flash-next-v1.0.5`, MIT) |
+| kernels | vllm-project/vllm-xpu-kernels `release/0.1.15.4` `ddf336d86e3c8602888572a3502f951abd51df12` + `848aca4` (#660), `71b7c5a` (#658; same code as the posted head `ab17bc7`), `3c8d392` (an earlier, pinned-only form of #662, whose posted head is `dc16c9f`) |
+| oneCCL plugin | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
+| weights | Intel/Qwen3.8-Flash-Next-W4A16-AutoRound `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`; drafter incoai/Qwen3.8-Flash-Next-DFlash2 `a22a1744e85c17364dcc54a6a420af7135d4c7f6` (model.safetensors sha256 `d6723f2a…4d3186f`) |
+| serve config | `engines/serve-config-intel-autoround.json`, sha256 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7` (byte-identical to the served file) |
+| runtime | compute-runtime 26.35.39758.10; torch 2.14.0+xpu; triton-xpu 3.8.0; intel-sycl-rt 2026.1.1; oneccl 2022.1.2; transformers 5.17.0; auto-round-lib 0.16.0; icpx 2026.1.1 for builds |
+
+Publication: the 15 commits after `979482e2e` were moved from the test host's tree with `git format-patch`/`git am`
+onto the published 0.32 branch; the resulting tree equals the served tree except for files already neutralized on
+2026-10-23. Every one of them is authored and committed by `Lumnus` (author dates kept); commit messages drop
+assistant co-author and sign-off trailers, name the upstream PR in the two cherry-picks, and one message drops a lab
+library path. Code diffs are unchanged. The two kernels-Python patches of ours (`0008`, `0009`) carry `Lumnus` as
+`From:`. Not GPU-booted from a clean clone in this form: the served engine runs the same commits from the test host's
+tree.

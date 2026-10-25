@@ -14,6 +14,28 @@ and a vllm-xpu-kernels build with the fixes this model needs.
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
 | software | torch 2.13.0+xpu, compute-runtime 26.35.39758.10, vllm-xpu-kernels 0.1.14.1+b70.3 |
 
+## Latest: 0.32.0-b70.1 on vLLM 0.32 (2026-10-25)
+
+What we serve since 2026-10-24: vLLM v0.32.0 with wu1ff's 1.0.5 chain and our layers, **DFlash2 speculative decoding
+with 7 draft tokens**, async scheduling, 8 sequences, 4096-token prefill chunks, the 128 GiB host-RAM KV tier and the
+INT8 PLE table on NVMe, Intel AutoRound weights. Everything is in [`v0.32/`](v0.32/README.md): the series (fork tag
+[`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1)), engine files with every knob explained, the
+kernels and oneCCL build recipe, and the measurements. Same harness, same host, one after another:
+
+| | 0.30.0-b70.2 (MTP k=3, 16 slots) | **0.32.0-b70.1** (DFlash2 K=7, 8 slots) |
+|---|---|---|
+| decode, 1 stream | 107.5 tok/s | **169.3 tok/s** |
+| decode, 4 concurrent | 295 tok/s total | **306 tok/s** |
+| decode, 8 streams | 370 tok/s total | **605 tok/s** |
+| prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
+| GPU KV cache | ~311K tokens | **397K tokens** |
+| agent-session replay (243 requests) | 401 s | **268 s** |
+| MMLU / TruthfulQA | — | not significantly different (paired, at every step) |
+
+Single runs on an idle engine; this harness is not the one behind the tables below. Method, the intermediate 0.30
+perf line, and the caveats (no multi-day run on 0.32 yet; only Intel weights measured on it):
+[v0.32/README.md](v0.32/README.md#numbers). The 0.30.0-b70.2 recipe below is unchanged and stays the fallback line.
+
 **Release [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2): the stable set.**
 AWQ serving fully validated; Intel verification in progress. One code branch, the model is a serving parameter. It runs
 from source trees; the vllm-xpu-kernels wheel is attached to the release, and no container image is built for b70.2
@@ -165,6 +187,7 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 | line | what | state |
 |---|---|---|
 | **stable `0.30.0-b70.N`** | stock vLLM v0.30.0 + this series (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | **recommended**; what we serve |
+| **`0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`), torch 2.14, vllm-xpu-kernels 0.1.15.4 + our three kernel PRs | **what we serve since 2026-10-24** ([v0.32/](v0.32/README.md)); no multi-day run yet |
 | edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
 
 ## Quick start (source tree, how we run it)
@@ -204,6 +227,7 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 
 | path / repo | what |
 |---|---|
+| [`v0.32/`](v0.32/README.md) | the 0.32.0-b70.1 release: `patches/vllm/` (49 commits on v0.32.0), `patches/vllm-xpu-kernels-py/`, `patches/libgdn-index64/`, `engines/` (`serve.args`, `serve.env`, `serve-no-plugin.env`), `scripts/check-series.sh`, build recipe and numbers |
 | `patches/vllm/`, `patches/vllm-tests/` | the series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
 | `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
 | `patches/series.txt` | which fork commit goes to which file |
@@ -212,7 +236,7 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 | `engines/` | environments and `vllm serve` flags, incl. the configuration we serve (`s16-kv128-mtp3` + `models/awq.env`; [engines/README.md](engines/README.md)) |
 | `docs/` | [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
 | `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `repro_band.py` (reproduce the offload miss) |
-| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
+| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.32.0` (tag `v0.32.0-b70.1`, the 0.32 line), `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
 | [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, what we serve), `b70/v0.1.15` (edge) |
 | [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
 
@@ -257,6 +281,19 @@ Every switch: [docs/switches.md](docs/switches.md).
 Changes are made on the fork branch, then exported here with `scripts/export-series.sh`; `scripts/check-series.sh`
 fails on any drift.
 
+## Upstream
+
+Fixes from this work, posted upstream on 2026-10-25 (open as of that day). The 0.32 release carries all six.
+
+| issue → PR | what |
+|---|---|
+| vllm-xpu-kernels [#657](https://github.com/vllm-project/vllm-xpu-kernels/issues/657) → [#658](https://github.com/vllm-project/vllm-xpu-kernels/pull/658) | GDN `causal_conv1d` conv-state offsets in 64 bits |
+| vllm-xpu-kernels [#659](https://github.com/vllm-project/vllm-xpu-kernels/issues/659) → [#660](https://github.com/vllm-project/vllm-xpu-kernels/pull/660) | GDN kernels skip rows whose state index is `NULL_BLOCK_ID` |
+| vllm-xpu-kernels [#661](https://github.com/vllm-project/vllm-xpu-kernels/issues/661) → [#662](https://github.com/vllm-project/vllm-xpu-kernels/pull/662) | `swap_blocks_batch`: `snapshot_src=False` for pinned and registered host sources |
+| vLLM [#63563](https://github.com/vllm-project/vllm/issues/63563) → [#63564](https://github.com/vllm-project/vllm/pull/63564) | Model Runner V2: bound prompt-logprobs chunks by `max_num_reqs` |
+| vLLM [#63565](https://github.com/vllm-project/vllm/issues/63565) → [#63566](https://github.com/vllm-project/vllm/pull/63566) | KV offload: pin a shared-prefix junction when a sparse group cuts the offload hit |
+| oneCCL [#228](https://github.com/uxlfoundation/oneCCL/issues/228) → [#229](https://github.com/uxlfoundation/oneCCL/pull/229) | legacy plugin: device USM that `msync()` sees as host takes the GPU path |
+
 ## Credits
 
 This work stands on other people's:
@@ -264,7 +301,9 @@ This work stands on other people's:
 1. **wu1ff — [B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller)** (MIT). The Qwen3.8-Flash-Next B70
    pack: the XPU gate, the pinned-host PLE table, the HC down-GEMM K-split, the GDN spec-metadata fusion, the 64-bit
    GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. Patches 0001–0005 are
-   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. Thank you.
+   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. The 0.32
+   line is built on wu1ff's 1.0.5 chain for vLLM 0.32 (DFlash2 path, C1 verify/target graphs, the astra500 MoE,
+   hyper-connection and prefill kernels), taken unchanged with his authorship and MIT notice. Thank you.
 2. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
    weights (the documented alternative to the AWQ build), made with [AutoRound](https://github.com/intel/auto-round);
    [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels), whose upstream fixes #600, #563, #564, #578 and
@@ -278,8 +317,14 @@ This work stands on other people's:
    the model to XPU (`devan-carlin/vllm@xpu-qwen4exp`).
 5. **TSUMUGI-XE** — [intel/compute-runtime#968](https://github.com/intel/compute-runtime/issues/968), the analysis of
    Level Zero peer residency mirroring device memory into host memory, and the first shim that works around it.
-6. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
-7. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
+6. **incoai** — the [`Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
+   block-diffusion drafter (Apache-2.0) behind the 0.32 release's speculative decoding.
+7. **Niluthon** — [qwen38-flash-tp2](https://github.com/Niluthon/qwen38-flash-tp2) (Apache-2.0), a two-card fork of
+   our b70.2: the FP8 `lm_head`, the resident decode MoE op, the step trace and the `bench_det` harness came from there;
+   the 0.32 FP8 head (B70-V32-0053) is a port of its 0053, and the 1- and 4-stream numbers in the 0.32 table use
+   `bench_det`.
+8. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
+9. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
    vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
 
 ## License
