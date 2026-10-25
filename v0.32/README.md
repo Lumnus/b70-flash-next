@@ -48,6 +48,8 @@ How each row was taken:
    per step, converted with the measured tokens accepted per step. Greedy: temperature 0, thinking off. At temperature
    0 the K=7 configurations use the vocab-parallel greedy verify; sampled requests (production's default temperature
    is not 0) do not take that path, and no speed number at a sampling temperature is in this table.
+   Rows 1–3 of the 0.32.0-b70.1 column were taken with the patched plugin (`serve-plugin.env`); the default `serve.env`
+   was measured within noise of it, so the same numbers stand for both.
 2. **8 streams.** Eight parallel generations, total generated tokens over wall time. The second 8-stream run of the
    served configuration overlapped other traffic and is not reported.
 3. **Prefill.** One uncached, salted prompt of 8K, 32K or 131K tokens; prompt tokens over time to first token.
