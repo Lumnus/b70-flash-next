@@ -1,0 +1,101 @@
+From 1af5978907f6c4d180396fc7003fefb9bbbb5939 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 13/49] W032-12: wu1ff astra500-beyond.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-beyond.patch (sha256 540ef96c87e99fc4…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ .../qwen4_exp/nvidia/b70_target_graph.py      | 70 +++++++++++++------
+ 1 file changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index 14fec2f1a0..b4da5a138e 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -112,28 +112,39 @@ def stage(value, memo, bound):
+ 
+ 
+ def update(destination, source, seen):
+-    if id(destination) in seen:
+-        return
+-    seen.add(id(destination))
+-    if isinstance(destination, torch.Tensor):
+-        assert destination.shape == source.shape and destination.dtype == source.dtype
+-        destination.copy_(source)
+-    elif isinstance(destination, dict):
+-        assert destination.keys() == source.keys()
+-        for key in destination:
+-            update(destination[key], source[key], seen)
+-    elif dataclasses.is_dataclass(destination):
+-        for field in dataclasses.fields(destination):
+-            if field.name == "max_seq_len":
+-                assert getattr(source, field.name) <= destination.max_seq_len
+-                continue
+-            update(getattr(destination, field.name), getattr(source, field.name), seen)
+-    elif isinstance(destination, (tuple, list)):
+-        assert len(destination) == len(source)
+-        for a, b in zip(destination, source):
+-            update(a, b, seen)
+-    else:
+-        assert destination == source, (destination, source)
++    """Validate the schema, then submit required device copies together."""
++    destinations, sources = [], []
++    def visit(destination, source):
++        if id(destination) in seen:
++            return
++        seen.add(id(destination))
++        if isinstance(destination, torch.Tensor):
++            assert destination.shape == source.shape and destination.dtype == source.dtype
++            assert destination.device == source.device
++            if destination.device.type == "xpu":
++                destinations.append(destination)
++                sources.append(source)
++            else:
++                destination.copy_(source)
++        elif isinstance(destination, dict):
++            assert destination.keys() == source.keys()
++            for key in destination:
++                visit(destination[key], source[key])
++        elif dataclasses.is_dataclass(destination):
++            for field in dataclasses.fields(destination):
++                if field.name == "max_seq_len":
++                    assert getattr(source, field.name) <= destination.max_seq_len
++                    continue
++                visit(getattr(destination, field.name), getattr(source, field.name))
++        elif isinstance(destination, (tuple, list)):
++            assert len(destination) == len(source)
++            for a, b in zip(destination, source):
++                visit(a, b)
++        else:
++            assert destination == source, (destination, source)
++    visit(destination, source)
++    if destinations:
++        torch._foreach_copy_(destinations, sources)
+ 
+ 
+ @contextmanager
+@@ -183,7 +194,20 @@ class TargetGraphs:
+             self.fallback("disabled", key)
+             return eager(runner, batch, metadata, inputs)
+         context = get_forward_context()
+-        current = (inputs, metadata, context.slot_mapping, context.is_padding)
++        # The runner's forward context includes target AND draft metadata.
++        # Only bind consumers in this target model: draft softmax workspaces
++        # and mappings are neither inputs nor outputs of the target graph.
++        names = getattr(self, "target_context_names", None)
++        if names is None:
++            modules = set(runner.model.modules())
++            names = self.target_context_names = frozenset(
++                name for name, module in runner.vllm_config.compilation_config.static_forward_context.items()
++                if module in modules
++            )
++            assert names and all(name in names for name in metadata if name.startswith("language_model."))
++        target_metadata = {name: value for name, value in metadata.items() if name in names}
++        target_slots = {name: value for name, value in context.slot_mapping.items() if name in names}
++        current = (inputs, target_metadata, target_slots, context.is_padding)
+         entry = self.entries.get(key)
+         if entry is not None:
+             try:

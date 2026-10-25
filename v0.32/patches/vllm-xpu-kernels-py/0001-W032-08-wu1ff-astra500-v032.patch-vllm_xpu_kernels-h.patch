@@ -1,0 +1,84 @@
+From 60464f7ebc7eef6c7c13918a74a6b4c59d5d8751 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 1/7] W032-08: wu1ff astra500-v032.patch (vllm_xpu_kernels/
+ hunks)
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-v032.patch. MIT.
+---
+ vllm_xpu_kernels/astra500_moe.py        | 31 +++++++++++++++++++++++++
+ vllm_xpu_kernels/fused_moe_interface.py |  6 +++--
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+ create mode 100644 vllm_xpu_kernels/astra500_moe.py
+
+diff --git a/vllm_xpu_kernels/astra500_moe.py b/vllm_xpu_kernels/astra500_moe.py
+new file mode 100644
+index 0000000..2ad1058
+--- /dev/null
++++ b/vllm_xpu_kernels/astra500_moe.py
+@@ -0,0 +1,31 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Measured BF16/W4 small-batch GEMM with a 64-element inner tile."""
++
++from pathlib import Path
++
++import torch
++
++torch.ops.load_library(str(Path(__file__).with_name("libastra_moe.so")))
++
++
++def astra_grouped_gemm(**kwargs):
++    a, weight, scales, out = (
++        kwargs["ptr_A"], kwargs["ptr_B"], kwargs.get("ptr_B_scale"), kwargs["ptr_D"]
++    )
++    if (
++        a.dtype == torch.bfloat16
++        and weight.dtype == torch.int8
++        and a.shape[0] <= 320
++        and scales is not None
++        and scales.dtype == torch.bfloat16
++        and scales.ndim == 3
++        and scales.shape[2] * 128 == kwargs["K"]
++        and kwargs.get("ptr_bias") is None
++        and kwargs.get("ptr_A_scale") is None
++    ):
++        torch.ops.astra_moe_k.grouped(
++            a, weight, scales, out, kwargs["rows_per_expert"],
++            kwargs["N"], kwargs["K"], kwargs["num_experts"], 6,
++        )
++        return out
++    return torch.ops._xpu_C.cutlass_grouped_gemm_interface(**kwargs)
+diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
+index 629cef3..810b6f4 100644
+--- a/vllm_xpu_kernels/fused_moe_interface.py
++++ b/vllm_xpu_kernels/fused_moe_interface.py
+@@ -4,6 +4,8 @@ from typing import Optional
+ 
+ import torch
+ 
++from .astra500_moe import astra_grouped_gemm
++
+ try:
+     from . import _C  # noqa: F401
+     from . import _moe_C  # noqa: F401
+@@ -421,7 +423,7 @@ class XpuFusedMoe:
+         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
+                                 dtype=output.dtype,
+                                 device=output.device)
+-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        astra_grouped_gemm(
+             ptr_A=remapped_hidden_states,
+             ptr_A_scale=remapped_scales,
+             ptr_B=self.w13,
+@@ -475,7 +477,7 @@ class XpuFusedMoe:
+                 gemm2_act_scale = None
+         else:
+             gemm2_act_scale = None
+-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        astra_grouped_gemm(
+             ptr_A=act_output,
+             ptr_A_scale=gemm2_act_scale,
+             ptr_B=self.w2,
+-- 
+2.43.0
+

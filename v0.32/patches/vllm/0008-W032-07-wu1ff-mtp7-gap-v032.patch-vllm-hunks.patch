@@ -1,0 +1,180 @@
+From 11360fa823885dc54cc9f419ee22014848592b1c Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 08/49] W032-07: wu1ff mtp7-gap-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/mtp7-gap-v032.patch (sha256 9106f52abba30649…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/_xpu_ops.py                              | 30 ++++++
+ .../qwen4_exp/nvidia/b70_target_attention.py  | 97 +++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_target_graph.py      |  9 +-
+ 3 files changed, 135 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_target_attention.py
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index ccdb1139e4..68811eecd6 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -1083,6 +1083,36 @@ class xpu_ops:
+             assert len(window_size) == 2
+             real_window_size = (window_size[0], window_size[1])  # noqa: F841
+ 
++        from vllm.models.qwen4_exp.nvidia import b70_target_attention
++
++        splits = b70_target_attention.fixed_splits(
++            q,
++            k,
++            v,
++            cu_seqlens_q,
++            seqused_k,
++            block_table,
++            max_seqlen_q,
++            causal,
++            real_window_size,
++            softcap,
++            alibi_slopes,
++            s_aux,
++            return_softmax_lse,
++            q_descale,
++        )
++        if splits is not None:
++            return b70_target_attention.forward(
++                q,
++                k,
++                v,
++                out,
++                seqused_k,
++                block_table,
++                max_seqlen_k,
++                softmax_scale,
++                splits,
++            )
+         return flash_attn_varlen_func(
+             out=out,
+             q=q,
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_attention.py b/vllm/models/qwen4_exp/nvidia/b70_target_attention.py
+new file mode 100644
+index 0000000000..f712ed3b4a
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_attention.py
+@@ -0,0 +1,97 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Batch-invariant native BF16 attention for the C1 DFlash2 target."""
++
++import os
++
++import torch
++
++
++def fixed_splits(
++    q,
++    k,
++    v,
++    cu,
++    used,
++    blocks,
++    max_query,
++    causal,
++    window,
++    softcap,
++    alibi,
++    sink,
++    return_lse,
++    q_descale=None,
++):
++    value = os.getenv("VLLM_XPU_DFLASH_FIXED_SPLITS", "0")
++    if value not in ("32", "64"):
++        return None
++    if (
++        blocks is None
++        or used is None
++        or not causal
++        or return_lse
++        or alibi is not None
++        or sink is not None
++        or softcap not in (None, 0.0)
++        or q_descale is not None
++        or tuple(window) != (-1, -1)
++        or q.dtype != torch.bfloat16
++        or k.dtype != q.dtype
++        or v.dtype != q.dtype
++        or cu.numel() != 2
++        or used.numel() != 1
++        or not 1 <= max_query <= 8
++        or q.shape != (max_query, 6, 256)
++        or k.ndim != 4
++        or k.shape[1:] != (832, 1, 256)
++        or v.shape != k.shape
++        or blocks.dtype != torch.int32
++    ):
++        return None
++    return int(value)
++
++
++def forward(q, k, v, out, used, blocks, max_seq_len, scale, splits):
++    # A fixed allocation and reduction schedule serves both one-token decode
++    # and verification. Live per-position lengths retain causal masking and
++    # the native short-sequence single-split rule in eager and graph replay.
++    width = q.shape[0]
++    if scale is None:
++        scale = q.shape[-1] ** -0.5
++    cu = torch.arange(width + 1, dtype=torch.int32, device=q.device)
++    dummy = torch.zeros_like(cu)
++    positions = torch.arange(width, dtype=used.dtype, device=q.device)
++    lengths = (used.reshape(1) - (width - 1 - positions)).clamp_min(1).int()
++    tables = blocks.repeat_interleave(width, dim=0)
++    result, _ = torch.ops._vllm_fa2_C.varlen_fwd(
++        q,
++        k,
++        v,
++        out,
++        cu,
++        dummy,
++        lengths,
++        None,
++        tables,
++        None,
++        1,
++        max_seq_len,
++        0.0,
++        None,
++        None,
++        None,
++        scale,
++        None,
++        False,
++        False,
++        -1,
++        -1,
++        0.0,
++        False,
++        None,
++        splits,
++        False,
++        None,
++        None,
++    )
++    return result
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index cf9c8f70d7..c83fe18033 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -162,7 +162,14 @@ class TargetGraphs:
+         # The runner admits one uniform C1 verification. Partial blocks use eager.
+         if batch.num_tokens != 8:
+             return eager(runner, batch, metadata, inputs)
+-        bound = max(512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length())
++        if os.getenv("VLLM_XPU_DFLASH_FIXED_SPLITS", "0") in ("32", "64"):
++            # The target split schedule no longer depends on this host bound.
++            # One graph follows live device lengths across context boundaries.
++            bound = runner.model_config.max_model_len
++        else:
++            bound = max(
++                512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length()
++            )
+         if bound in self.disabled:
+             self.fallbacks += 1
+             return eager(runner, batch, metadata, inputs)

@@ -1,0 +1,32 @@
+From 623526f0cab6bad40cb3dbebd6c8ffbc4e80cca6 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 05:19:50 +0000
+Subject: [PATCH 48/49] B70-V32-08: B70_PREFILL_HC_GRAPHS=0 turns off the
+ prefill HC graph regions
+
+---
+ vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py b/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
+index a7eb642674..7889ee16d9 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
+@@ -51,8 +51,17 @@ class Regions:
+ 
+ _regions = None
+ 
++import os as _os
++
++# B70-V32-08: B70_PREFILL_HC_GRAPHS=0 turns off the 33-256-row prefill HC graph regions (one captured graph
++# per HC module plus their pool memory, sized before KV): KV memory over short-prefill speed.
++_B70_PREFILL_HC_GRAPHS = _os.environ.get("B70_PREFILL_HC_GRAPHS", "1") == "1"
++
++
+ def prefill_hc(module, name, fn, args):
+     global _regions
++    if not _B70_PREFILL_HC_GRAPHS:
++        return None
+     rows = args[0].shape[0]
+     if rows <= 32 or torch.xpu.is_current_stream_capturing():
+         return None

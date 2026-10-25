@@ -1,0 +1,38 @@
+# serve.args — `vllm serve` flags for 0.32.0-b70.1, one flag and its value per line (same format as engines/*.args).
+# Run: vllm serve <serve dir> $(these flags). The serve dir is the Intel AutoRound snapshot with
+# engines/serve-config-intel-autoround.json copied over its config.json (see v0.32/README.md, step 7).
+--served-model-name qwen38-flash-next
+--host 0.0.0.0
+--port 8000
+--dtype bfloat16
+--tensor-parallel-size 4
+--enable-expert-parallel
+--trust-remote-code
+# 0.88 leaves too little KV for one 262,144-token request on this stack; 0.89 is the highest value vLLM's start-up
+# free-memory check accepts on compute-runtime 26.35.
+--gpu-memory-utilization 0.89
+--max-model-len 262144
+# prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
+--max-num-batched-tokens 4096
+# 8 concurrent sequences
+--max-num-seqs 8
+--limit-mm-per-prompt {"image":2,"video":0}
+# FULL graphs for uniform decode, piecewise for the rest. Capture sizes are multiples of 1+K = 8 (K = 7 draft tokens),
+# so a uniform spec-decode step is never padded, plus three prefill sizes.
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,256,512,1024]}
+--cudagraph-metrics
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
+--reasoning-parser qwen3
+# server default temperature 0.7; a request's own value wins
+--override-generation-config {"temperature": 0.7}
+# when the per-effort thinking budget (B70_THINKING_BUDGET) runs out, close thinking with a short transition
+--reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
+# CPU KV tier: 128 GiB in host RAM = 32 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm)
+--kv-offloading-size 128
+--kv-offloading-backend native
+# DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
+# 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it.
+--speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
+# clients see cached prompt tokens in usage
+--enable-prompt-tokens-details

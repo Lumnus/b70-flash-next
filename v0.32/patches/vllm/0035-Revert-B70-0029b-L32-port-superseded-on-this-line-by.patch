@@ -1,0 +1,37 @@
+From 10d4774b7fb19d0e7f8363f80b9bc9ef8cda3caa Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 23:38:03 +0000
+Subject: [PATCH 35/49] Revert B70-0029b (L32 port): superseded on this line by
+ the upstream fix (vllm-project/vllm#63564, next commit)
+
+---
+ vllm/v1/worker/gpu/sample/prompt_logprob.py | 16 +---------------
+ 1 file changed, 1 insertion(+), 15 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/prompt_logprob.py b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+index 344f857297..0fbdbc4134 100644
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -17,21 +17,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
+     compute_topk_scores,
+ )
+ 
+-# B70-0029b (L32 port): rows per prompt-logprobs chunk on Model Runner V2.
+-# Upstream 1024 = the whole step at --max-num-batched-tokens 1024; the
+-# [rows, vocab] transients (~1.07 GiB/rank) spilled into host RAM on B70 at
+-# util 0.88. Rows are independent, so the result does not depend on the chunk.
+-# B70_PROMPT_LOGPROBS_CHUNK (default 128; 0 = upstream 1024).
+-def _b70_chunk() -> int:
+-    import os
+-    try:
+-        v = int(os.environ.get("B70_PROMPT_LOGPROBS_CHUNK", "128"))
+-    except ValueError:
+-        v = 128
+-    return v if v > 0 else 1024
+-
+-
+-CHUNK_SIZE = _b70_chunk()
++CHUNK_SIZE = 1024
+ 
+ 
+ @dataclass

@@ -1,0 +1,256 @@
+From 9449b362707e3d5f9e4ae930c27e19d6b37ecbfb Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Tue, 29 Sep 2026 21:38:00 +0000
+Subject: [PATCH 30/49] 0014b-b70-offload-junction: heal a hybrid prefix after
+ one miss (B70_OFFLOAD_JUNCTION=1)
+
+Default off. On a hybrid (full attention + Mamba/GDN) model with sparse Mamba
+retention (prefix_cache_retention_interval=0, the default), a request stores one
+Mamba checkpoint at aligned(num_prompt_tokens-1). A revisit whose suffix differs
+before that boundary finds full-attention chunks but no Mamba state at or below
+the full-attention hit, so the whole lookup returns 0. The offload path never
+sets a shared-prefix junction (only a GPU prefix-cache hit does,
+kv_cache_manager.get_computed_blocks), so the recompute stores its checkpoint
+inside the varying suffix again and the prefix misses forever.
+
+With B70_OFFLOAD_JUNCTION=1, when the first Mamba group cuts the hit below
+the boundary the full-attention groups confirmed, the connector sets
+request.shared_prefix_boundary to that boundary (never lowering an existing
+one). The core scheduler already honours it: the chunk splitter stops there,
+MambaManager.cache_blocks adds it to reachable_boundaries so the state block is
+hashed, and the aligned boundary hand-off stores it to the CPU tier. The first
+revisit misses; later revisits hit.
+
+Tests: tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+
+(cherry picked from commit 0369d95b15016061f925f8123eca7ed589e00695)
+---
+ .../offloading_connector/test_b70_offload.py  | 124 ++++++++++++++++++
+ .../kv_connector/v1/offloading/scheduler.py   |  49 ++++++-
+ 2 files changed, 170 insertions(+), 3 deletions(-)
+ create mode 100644 tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+new file mode 100644
+index 0000000000..f7bb858117
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70 patch 0014: env-gated offload fixes for hybrid (full + Mamba) models."""
++
++import pytest
++import torch
++
++from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
++    _make_partial_tail_request,
++    _make_partial_tail_scheduler,
++)
++from tests.v1.kv_connector.unit.offloading_connector.utils import (
++    generate_store_output,
++)
++from vllm.v1.core.single_type_kv_cache_manager import MambaManager
++from vllm.v1.kv_cache_interface import MambaSpec
++from vllm.v1.kv_offload.base import LookupResult, get_offload_group_idx
++
++FULL, MAMBA = 0, 1  # group ids of _make_mamba_hybrid_kv_cache_config
++
++
++def _hybrid(monkeypatch, **env):
++    for name in (
++        "B70_OFFLOAD_TRACE",
++        "B70_OFFLOAD_JUNCTION",
++        "B70_OFFLOAD_EMPTY_ADVANCE_GUARD",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    for name, value in env.items():
++        monkeypatch.setenv(name, value)
++    scheduler = _make_partial_tail_scheduler()
++    request = _make_partial_tail_request(scheduler)  # 30 tokens, 16-token chunks
++    request.shared_prefix_boundary = 0
++    request.skip_reading_prefix_cache = False
++    return scheduler, request
++
++
++def _lookup_with(stored: set, full_hits: bool = True):
++    def lookup(key, req_context):
++        if get_offload_group_idx(key) == FULL:
++            return LookupResult.HIT if full_hits else LookupResult.MISS
++        return LookupResult.HIT if key in stored else LookupResult.MISS
++
++    return lookup
++
++
++@pytest.mark.parametrize("trace", ["0", "1"])
++def test_junction_set_when_mamba_group_zeroes_full_attention_hit(monkeypatch, trace):
++    scheduler, request = _hybrid(
++        monkeypatch, B70_OFFLOAD_JUNCTION="1", B70_OFFLOAD_TRACE=trace
++    )
++    stored: set = set()
++    scheduler.manager.lookup.side_effect = _lookup_with(stored)
++
++    # Full attention holds chunk 0 (tokens 0..16), the Mamba group holds no
++    # state at 16: the whole request misses, as in the Flash-Next repro.
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 0
++    # ... and the recompute is told to retain the Mamba state at 16.
++    assert request.shared_prefix_boundary == 16
++
++    # The recompute's aligned hand-off at the junction is stored ...
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(MAMBA, 77, 16)]})
++    assert len(jobs) == 1
++    [job] = scheduler._jobs.values()
++    [key] = job.keys
++    stored.add(key)
++
++    # ... so the next revisit hits the shared prefix.
++    scheduler._req_status["req"].transfer_jobs.clear()
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 16
++
++
++def test_junction_off_leaves_request_untouched(monkeypatch):
++    scheduler, request = _hybrid(monkeypatch)
++    scheduler.manager.lookup.side_effect = _lookup_with(set())
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 0
++    assert request.shared_prefix_boundary == 0
++
++
++def test_junction_not_set_when_full_attention_misses(monkeypatch):
++    scheduler, request = _hybrid(monkeypatch, B70_OFFLOAD_JUNCTION="1")
++    scheduler.manager.lookup.side_effect = _lookup_with(set(), full_hits=False)
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 0
++    assert request.shared_prefix_boundary == 0
++
++
++def test_junction_never_lowers_an_existing_junction(monkeypatch):
++    scheduler, request = _hybrid(monkeypatch, B70_OFFLOAD_JUNCTION="1")
++    request.shared_prefix_boundary = 24  # e.g. from a GPU prefix-cache hit
++    scheduler.manager.lookup.side_effect = _lookup_with(set())
++    scheduler.get_num_new_matched_tokens(request, 0)
++    assert request.shared_prefix_boundary == 24
++
++
++def test_gpu_mamba_manager_retains_state_at_junction():
++    """The GPU side: with sparse retention (interval 0) the Mamba manager keeps
++    only the replay boundary -- plus the junction when one is set."""
++    spec = MambaSpec(
++        block_size=16,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    common = dict(
++        start_block=0,
++        end_block=4,
++        alignment_tokens=16,
++        kv_cache_spec=spec,
++        use_eagle=False,
++        retention_interval=0,
++    )
++    without = MambaManager.reachable_block_mask(reachable_boundaries=[63], **common)
++    with_junction = MambaManager.reachable_block_mask(
++        reachable_boundaries=[63, 32], **common
++    )
++    assert without == [False, False, True, False]
++    assert with_junction == [False, True, True, False]
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 7d40246d91..bf18ab644a 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -650,6 +650,7 @@ class OffloadingConnectorScheduler:
+ 
+         # B70 0014 (env-gated; every flag off = upstream behaviour).
+         self._b70_trace = _b70.trace_enabled()
++        self._b70_junction = _b70.junction_enabled()
+         self._b70_counts: Counter | None = None
+         self._b70_ctx: dict | None = None
+         # req_id -> [stores submitted, stores completed, loads submitted,
+@@ -670,13 +671,15 @@ class OffloadingConnectorScheduler:
+             slot_bytes = int(getattr(spec, "kv_bytes_per_chunk", 0) or 0)
+             _b70.log(
+                 "enabled scheduler trace: groups=%s retention_interval=%s "
+-                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f",
++                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f "
++                "junction=%s",
+                 dict(Counter(self._b70_kind_by_group.values())),
+                 self.config.retention_interval,
+                 self.config.alignment_tokens,
+                 self.config.supports_partial_tail,
+                 slot_bytes,
+                 _b70.trace_period_s(),
++                self._b70_junction,
+             )
+             self._b70_state_logger = _b70.PeriodicStateLogger(
+                 _b70.trace_period_s(), lambda: self._b70_state_line(slot_bytes)
+@@ -714,6 +717,43 @@ class OffloadingConnectorScheduler:
+             *counts,
+         )
+ 
++    def _b70_maybe_set_junction(
++        self, req_status: RequestOffloadState, result: int, ctx: dict
++    ) -> None:
++        """0014b: pin a shared-prefix junction where the offload hit was cut.
++
++        The full-attention groups are looked up first; the first Mamba group
++        then starts from the boundary they confirmed. If that sparse group has
++        no stored state at or below it, the whole request misses (or hits
++        shorter), and without a junction the recompute stores its only Mamba
++        checkpoint at ``aligned(num_prompt_tokens - 1)`` again -- inside the
++        part that varies -- so the prefix misses forever. Setting
++        ``request.shared_prefix_boundary`` makes the core scheduler stop a
++        prefill chunk there, the Mamba manager retain (hash) that state, and
++        the aligned hand-off store it, so the next revisit hits.
++        """
++        boundary = None
++        fa_seen = False
++        for gidx, _start, _n_keys, n_hit, _counts, max_before in ctx["groups"]:
++            kind = self._b70_kind(gidx)
++            if kind == "full":
++                if n_hit is None:
++                    return  # deferred: the full-attention prefix is unconfirmed
++                fa_seen = True
++                continue
++            if kind == "mamba" and fa_seen:
++                boundary = max_before
++            break
++        if boundary is None:
++            return
++        req = req_status.req
++        if req_status.num_locally_computed_tokens + result >= boundary:
++            return  # the sparse group did not cut the hit
++        if boundary <= req.shared_prefix_boundary:
++            return
++        req.shared_prefix_boundary = boundary
++        ctx["junction"] = boundary
++
+     def _b70_log_lookup(
+         self, req_status: RequestOffloadState, result: int | None, ctx: dict
+     ) -> None:
+@@ -874,7 +914,7 @@ class OffloadingConnectorScheduler:
+         req_status: RequestOffloadState,
+         max_num_new_tokens: int | None = None,
+     ) -> int | None:
+-        if not self._b70_trace:
++        if not (self._b70_trace or self._b70_junction):
+             return self._lookup_complete_chunks_impl(req_status, max_num_new_tokens)
+         ctx: dict = {"groups": [], "junction": None}
+         self._b70_ctx = ctx
+@@ -883,7 +923,10 @@ class OffloadingConnectorScheduler:
+         finally:
+             self._b70_ctx = None
+             self._b70_counts = None
+-        self._b70_log_lookup(req_status, result, ctx)
++        if self._b70_junction and result is not None:
++            self._b70_maybe_set_junction(req_status, result, ctx)
++        if self._b70_trace:
++            self._b70_log_lookup(req_status, result, ctx)
+         return result
+ 
+     def _lookup_complete_chunks_impl(

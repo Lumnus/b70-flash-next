@@ -1,0 +1,64 @@
+From 3ffc275542fa6f4a081a4f12d526d21d56b83d39 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 15/49] W032-15: wu1ff long-prefill.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/long-prefill.patch (sha256 391975bcd98a90a0…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py | 24 +++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index 139b5e736c..7b2814f296 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -2,11 +2,14 @@
+ """Fixed-order BF16 HC down projection with FP32 accumulation."""
+ 
+ import os
++from pathlib import Path
+ 
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
+ 
++_large_hc = None
++
+ 
+ @triton.jit(do_not_specialize=["M"])
+ def _ordered_hc_gemm(
+@@ -50,10 +53,31 @@ def _ordered_hc_gemm(
+ 
+ 
+ def ordered_hc_gemm(x, weight, valid_columns):
++    global _large_hc
+     assert x.dtype == weight.dtype == torch.bfloat16
+     rows, inner = x.shape
+     columns = weight.shape[0]
+     assert inner == weight.shape[1] and 0 < valid_columns <= columns
++    if (
++        256 < rows <= 1024
++        and inner == 10240
++        and columns in (320, 336)
++        and valid_columns == (324 if columns == 336 else 320)
++        and x.device.type == "xpu"
++        and x.is_contiguous()
++        and weight.is_contiguous()
++    ):
++        # Block loads and DPAS consume the existing BF16 checkpoint layout.
++        # The native FP32 accumulation matches the ordered projection exactly;
++        # neither a transposed weight copy nor padded token rows are needed.
++        if _large_hc is None:
++            import vllm_xpu_kernels
++
++            torch.ops.load_library(str(
++                Path(vllm_xpu_kernels.__file__).with_name("liblong_hc.so")
++            ))
++            _large_hc = torch.ops.long_hc.forward
++        return _large_hc(x, weight, valid_columns, 1)
+     if (
+         (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
+         and x.stride(1) == weight.stride(1) == 1

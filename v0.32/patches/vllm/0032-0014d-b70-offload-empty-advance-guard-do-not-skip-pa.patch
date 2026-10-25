@@ -1,0 +1,233 @@
+From 977cda85dc25261db90e7fd82f937b93e86a9bbb Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Tue, 29 Sep 2026 21:40:43 +0000
+Subject: [PATCH 32/49] 0014d-b70-offload-empty-advance-guard: do not skip past
+ write-pending keys (B70_OFFLOAD_EMPTY_ADVANCE_GUARD=1)
+
+Default off. vllm#56795: _build_store_jobs advances every group's
+next_stored_chunk_idx when prepare_store returns no keys to store, and past all
+offered chunks when it returns some. CPUOffloadingManager.prepare_store skips a
+key that is present, including one still write-pending under another request's
+store. If that store later fails (the key is removed), this request never
+offers the chunk again and the prefix has a permanent hole.
+
+With B70_OFFLOAD_EMPTY_ADVANCE_GUARD=1, offered keys that prepare_store
+skipped and that the manager reports HIT_PENDING hold the group's stored index
+at the first such chunk, so the range is re-offered on later steps until the
+store lands (then the index advances as upstream) or the key disappears (then
+this request stores it). Mask/threshold skips are unchanged. With
+B70_OFFLOAD_TRACE=1 a guard-hold line is logged when the held set changes.
+
+(cherry picked from commit b714309e9e69ea41e38a2e0a7e17f30477b71b77)
+---
+ .../offloading_connector/test_b70_offload.py  | 80 +++++++++++++++++++
+ .../kv_connector/v1/offloading/scheduler.py   | 66 ++++++++++++++-
+ 2 files changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+index fb86321f44..e9cf129782 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+@@ -165,3 +165,83 @@ def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
+             reachable_boundaries=boundaries,
+         )
+         assert mask == [True, True, True, False]
++
++
++def _store_setup(monkeypatch, guard: bool, trace: str = "0"):
++    from types import SimpleNamespace
++
++    from vllm.v1.request import RequestStatus
++
++    env = {"B70_OFFLOAD_TRACE": trace}
++    if guard:
++        env["B70_OFFLOAD_EMPTY_ADVANCE_GUARD"] = "1"
++    scheduler, request = _hybrid(monkeypatch, **env)
++    request.num_computed_tokens = 0
++    request.status = RequestStatus.RUNNING
++    req_status = scheduler._req_status["req"]
++    req_status.group_states[FULL].block_ids[:] = [11]
++    req_status.group_states[MAMBA].block_ids[:] = [99]
++    req_status.update_offload_keys()
++    output = SimpleNamespace(num_scheduled_tokens={"req": 16}, finished_req_ids=set())
++    return scheduler, req_status, output
++
++
++def _present_manager(scheduler, present: set, pending: set):
++    from vllm.v1.kv_offload.base import PrepareStoreOutput
++
++    from tests.v1.kv_connector.unit.offloading_connector.utils import (
++        MockLoadStoreSpec,
++    )
++
++    def prepare_store(keys, req_context):
++        keys = [k for k in keys if k not in present]
++        return PrepareStoreOutput(
++            keys_to_store=keys, store_spec=MockLoadStoreSpec(keys), evicted_keys=[]
++        )
++
++    def lookup(key, req_context):
++        if key in pending:
++            return LookupResult.HIT_PENDING
++        return LookupResult.HIT if key in present else LookupResult.MISS
++
++    scheduler.manager.prepare_store.side_effect = prepare_store
++    scheduler.manager.lookup.side_effect = lookup
++
++
++@pytest.mark.parametrize("trace", ["0", "1"])
++def test_guard_holds_index_while_skipped_key_is_write_pending(monkeypatch, trace):
++    scheduler, req_status, output = _store_setup(monkeypatch, True, trace)
++    key = req_status.group_states[FULL].offload_keys[0]
++    present, pending = {key}, {key}  # stored by another request, not landed yet
++    _present_manager(scheduler, present, pending)
++
++    assert scheduler._build_store_jobs(output) == {}
++    assert req_status.group_states[FULL].next_stored_chunk_idx == 0  # held
++
++    pending.clear()  # the other request's store completed
++    assert scheduler._build_store_jobs(output) == {}
++    assert req_status.group_states[FULL].next_stored_chunk_idx == 1
++
++
++def test_guard_off_keeps_upstream_advance(monkeypatch):
++    scheduler, req_status, output = _store_setup(monkeypatch, False)
++    key = req_status.group_states[FULL].offload_keys[0]
++    _present_manager(scheduler, {key}, {key})
++    assert scheduler._build_store_jobs(output) == {}
++    # upstream (#56795): advances past the not-yet-ready key
++    assert req_status.group_states[FULL].next_stored_chunk_idx == 1
++
++
++def test_guard_reoffers_a_key_whose_pending_store_failed(monkeypatch):
++    scheduler, req_status, output = _store_setup(monkeypatch, True)
++    key = req_status.group_states[FULL].offload_keys[0]
++    present, pending = {key}, {key}
++    _present_manager(scheduler, present, pending)
++    assert scheduler._build_store_jobs(output) == {}
++    # the other store failed and its key was removed: this request stores it
++    present.clear()
++    pending.clear()
++    jobs = scheduler._build_store_jobs(output)
++    assert len(jobs) == 1
++    [job] = scheduler._jobs.values()
++    assert job.keys == {key}
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index bf18ab644a..62adc52edb 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -651,6 +651,8 @@ class OffloadingConnectorScheduler:
+         # B70 0014 (env-gated; every flag off = upstream behaviour).
+         self._b70_trace = _b70.trace_enabled()
+         self._b70_junction = _b70.junction_enabled()
++        self._b70_guard = _b70.guard_enabled()
++        self._b70_guard_logged: dict[ReqId, tuple[int, ...]] = {}
+         self._b70_counts: Counter | None = None
+         self._b70_ctx: dict | None = None
+         # req_id -> [stores submitted, stores completed, loads submitted,
+@@ -672,7 +674,7 @@ class OffloadingConnectorScheduler:
+             _b70.log(
+                 "enabled scheduler trace: groups=%s retention_interval=%s "
+                 "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f "
+-                "junction=%s",
++                "junction=%s empty_advance_guard=%s",
+                 dict(Counter(self._b70_kind_by_group.values())),
+                 self.config.retention_interval,
+                 self.config.alignment_tokens,
+@@ -680,6 +682,7 @@ class OffloadingConnectorScheduler:
+                 slot_bytes,
+                 _b70.trace_period_s(),
+                 self._b70_junction,
++                self._b70_guard,
+             )
+             self._b70_state_logger = _b70.PeriodicStateLogger(
+                 _b70.trace_period_s(), lambda: self._b70_state_line(slot_bytes)
+@@ -709,6 +712,7 @@ class OffloadingConnectorScheduler:
+         counts[1 if job_status.is_store else 3] += 1
+ 
+     def _b70_req_done(self, req_id: ReqId) -> None:
++        self._b70_guard_logged.pop(req_id, None)
+         counts = self._b70_req_jobs.pop(req_id, [0, 0, 0, 0])
+         _b70.log(
+             "req-done req=%s store_jobs submitted=%d completed=%d "
+@@ -754,6 +758,53 @@ class OffloadingConnectorScheduler:
+         req.shared_prefix_boundary = boundary
+         ctx["junction"] = boundary
+ 
++    def _b70_pending_skipped(
++        self,
++        req_status: RequestOffloadState,
++        offered: Iterable[OffloadKey],
++        stored: Iterable[OffloadKey],
++    ) -> set[OffloadKey]:
++        """0014d: offered keys prepare_store skipped as present that are still
++        write-pending (a store in flight, possibly under another request)."""
++        stored = set(stored)
++        return {
++            key
++            for key in offered
++            if key not in stored
++            and self.manager.lookup(key, req_status.req_context)
++            is LookupResult.HIT_PENDING
++        }
++
++    def _b70_guard_hold(
++        self,
++        req_status: RequestOffloadState,
++        group_store_ranges: list[tuple[int, int]],
++        pending: set[OffloadKey],
++    ) -> None:
++        """0014d: keep next_stored_chunk_idx at the first write-pending chunk
++        so the range is offered again until that store lands (vllm#56795)."""
++        held = []
++        for group_config, group_state, (start, end) in zip(
++            self.config.kv_group_configs, req_status.group_states, group_store_ranges
++        ):
++            for idx in range(start, min(end, len(group_state.offload_keys))):
++                if group_state.offload_keys[idx] in pending:
++                    if idx < group_state.next_stored_chunk_idx:
++                        group_state.next_stored_chunk_idx = idx
++                    held.append(idx)
++                    break
++        if self._b70_trace:
++            sig = (len(pending), *sorted(set(held)))
++            req_id = req_status.req.request_id
++            if self._b70_guard_logged.get(req_id) != sig:
++                self._b70_guard_logged[req_id] = sig
++                _b70.log(
++                    "guard-hold req=%s pending_keys=%d held_at_chunks=%s",
++                    req_id,
++                    len(pending),
++                    sorted(set(held)),
++                )
++
+     def _b70_log_lookup(
+         self, req_status: RequestOffloadState, result: int | None, ctx: dict
+     ) -> None:
+@@ -1978,6 +2029,13 @@ class OffloadingConnectorScheduler:
+                 continue
+ 
+             if not store_output.keys_to_store:
++                if self._b70_guard:
++                    pending = self._b70_pending_skipped(
++                        req_status, new_offload_keys, ()
++                    )
++                    if pending:
++                        self._b70_guard_hold(req_status, group_store_ranges, pending)
++                        continue
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+                 continue
+ 
+@@ -2031,6 +2089,12 @@ class OffloadingConnectorScheduler:
+                 group_state.next_stored_chunk_idx = max(
+                     group_state.next_stored_chunk_idx, num_chunks
+                 )
++            if self._b70_guard:
++                pending = self._b70_pending_skipped(
++                    req_status, new_offload_keys, keys_to_store
++                )
++                if pending:
++                    self._b70_guard_hold(req_status, group_store_ranges, pending)
+ 
+             src_spec = GPULoadStoreSpec(
+                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices

@@ -1,0 +1,91 @@
+From eced9cb2c593bfaaf5869b5478aa2d05f7f428f3 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 2/7] W032-09: wu1ff astra500-structural.patch
+ (vllm_xpu_kernels/ hunks)
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-structural.patch. MIT.
+---
+ vllm_xpu_kernels/astra_structural.py    | 47 +++++++++++++++++++++++++
+ vllm_xpu_kernels/fused_moe_interface.py |  4 +++
+ 2 files changed, 51 insertions(+)
+ create mode 100644 vllm_xpu_kernels/astra_structural.py
+
+diff --git a/vllm_xpu_kernels/astra_structural.py b/vllm_xpu_kernels/astra_structural.py
+new file mode 100644
+index 0000000..20f75b0
+--- /dev/null
++++ b/vllm_xpu_kernels/astra_structural.py
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Native HC fusion and direct-token W4A16 MoE verification."""
++
++from pathlib import Path
++import os
++
++import torch
++
++_directory = Path(__file__).parent
++torch.ops.load_library(str(_directory / "libastra_hc.so"))
++torch.ops.load_library(str(_directory / "libastra_direct.so"))
++
++
++def prepare_hc_weight(weight):
++    if (os.getenv("VLLM_XPU_ASTRA_HC_FUSION", "1") == "1"
++            and weight.device.type == "xpu" and weight.dtype == torch.bfloat16
++            and weight.shape == (10240, 320)):
++        # The native kernel addresses each stream directly; retain only a view.
++        return weight.detach()
++    return None
++
++
++def hc_up_mix(lora, weight, normalized):
++    output = torch.empty((lora.shape[0], 2560), device=lora.device, dtype=lora.dtype)
++    torch.ops.astra_hc_v3.up(lora, weight, normalized, output)
++    return output
++
++
++def direct_moe(module, output, hidden, weights, ids, expert_map, activation_scales):
++    if not (
++        os.getenv("VLLM_XPU_ASTRA_DIRECT_MOE", "1") == "1"
++        and hidden.shape == (8, 2560) and hidden.dtype == torch.bfloat16
++        and module.recipe == "int4" and module.inter_size == 640
++        and module.num_experts == 128 and module.activation == "silu"
++        and module.w13_bias is None and module.w2_bias is None
++        and not module.gemm1_clamp_limit and activation_scales is None
++        and ids.shape == (8, 10) and weights.dtype == torch.float32
++    ):
++        return False
++    mapping = module.expert_map if expert_map is None else expert_map
++    if mapping is None or mapping.numel() != 512:
++        return False
++    torch.ops.astra_direct_v2.forward(
++        hidden, module.w13, module.gemm1_wei_scales, module.w2,
++        module.gemm2_wei_scales, ids, weights, mapping, output,
++    )
++    return True
+diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
+index 810b6f4..a74739a 100644
+--- a/vllm_xpu_kernels/fused_moe_interface.py
++++ b/vllm_xpu_kernels/fused_moe_interface.py
+@@ -5,6 +5,7 @@ from typing import Optional
+ import torch
+ 
+ from .astra500_moe import astra_grouped_gemm
++from .astra_structural import direct_moe
+ 
+ try:
+     from . import _C  # noqa: F401
+@@ -368,6 +369,9 @@ class XpuFusedMoe:
+         expert_map=None,
+         a1q_scale=None,
+     ):
++        if direct_moe(self, output, hidden_states, topk_weights, topk_ids,
++                      expert_map, a1q_scale):
++            return
+         num_rows, hidden_size = hidden_states.shape
+         num_moe_inputs = self.n_experts_per_token * num_rows
+         act_quant = a1q_scale is not None
+-- 
+2.43.0
+

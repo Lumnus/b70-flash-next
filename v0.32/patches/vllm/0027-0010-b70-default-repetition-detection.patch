@@ -1,0 +1,57 @@
+From ab6fb7cceff3203e4c47bf45fa3fc252043468de Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Tue, 29 Sep 2026 13:31:11 +0000
+Subject: [PATCH 27/49] 0010-b70-default-repetition-detection
+
+B70-0010: server-side default for vLLM's built-in n-gram repetition stop
+(SamplingParams.repetition_detection -> finish_reason "repetition"), for clients
+that never send the field (Hermes). A request's own repetition_detection wins.
+Env B70_DEFAULT_REPETITION_DETECTION="max=1,min=1,count=128"; unset = upstream.
+Catches the token-1023 "duct" NaN loop independently of the logits.
+Chat endpoint only. Apply after 0009.
+
+(cherry picked from commit 21546bab3a9c1234dff5294e6de1cd30814c140e)
+---
+ .../openai/chat_completion/protocol.py        | 22 ++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 33cf7a9717..3df3f91bea 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -248,6 +248,26 @@ def _b70_presence_penalty(req):
+     return float(v) if v else req.presence_penalty
+ 
+ 
++def _b70_repetition_detection(req):
++    # B70-0010: server-side default for vLLM's built-in n-gram
++    # repetition stop, so clients that never send `repetition_detection`
++    # (Hermes) still get a bound on degenerate single-token loops.
++    # Env B70_DEFAULT_REPETITION_DETECTION="max=1,min=1,count=128".
++    # A request's own repetition_detection wins (field explicitly set).
++    import os
++    if "repetition_detection" in req.model_fields_set:
++        return req.repetition_detection
++    spec = os.environ.get("B70_DEFAULT_REPETITION_DETECTION")
++    if not spec:
++        return req.repetition_detection
++    kv = dict(x.strip().split("=", 1) for x in spec.split(",") if "=" in x)
++    return RepetitionDetectionParams(
++        max_pattern_size=int(kv.get("max", 1)),
++        min_pattern_size=int(kv.get("min", 1)),
++        min_count=int(kv.get("count", 128)),
++    )
++
++
+ class ChatCompletionRequest(OpenAIBaseModel):
+     # B70-0012: OpenRouter-style clients (Hermes) send the effort as
+     # {"reasoning": {"effort": "medium"}} (extra_body), which vLLM ignores, so
+@@ -839,7 +859,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             allowed_token_ids=self.allowed_token_ids,
+             extra_args=extra_args or None,
+             skip_clone=True,  # Created fresh per request, safe to skip clone
+-            repetition_detection=self.repetition_detection,
++            repetition_detection=_b70_repetition_detection(self),  # B70-0010
+             routed_experts_prompt_start=self.routed_experts_prompt_start,
+         )
+ 

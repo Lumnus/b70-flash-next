@@ -1,0 +1,67 @@
+From e3e85424038195396f80a3ffcc44fc744604f559 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 10/49] W032-09: wu1ff astra500-structural.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-structural.patch (sha256 b57de90e36b8b186…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   | 22 +++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index c15f2bc31e..4fe2515aec 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -112,6 +112,8 @@ class GatedResidual(nn.Module):
+         self.hc_count = config.hc_count
+         self.hidden_size = config.hidden_size
+         self.use_combine = use_combine
++        self._astra_hc_up_weight = None
++        self._astra_hc_up_prepared = False
+         spec = get_current_vllm_config().speculative_config
+         self._ordered_hc = (
+             spec is not None
+@@ -218,6 +220,20 @@ class GatedResidual(nn.Module):
+             weight.shape[0],
+         )
+ 
++    def _mix_up(self, lora: torch.Tensor, normalized: torch.Tensor) -> torch.Tensor:
++        if self._ordered_hc and not self._astra_hc_up_prepared:
++            from vllm_xpu_kernels.astra_structural import prepare_hc_weight
++
++            # Resolve the supported checkpoint layout before graph capture.
++            # This aliases the loaded weight and allocates no duplicate table.
++            self._astra_hc_up_weight = prepare_hc_weight(self.input_mix_weight_up.weight)
++            self._astra_hc_up_prepared = True
++        if self._astra_hc_up_weight is not None and 1 <= lora.shape[0] <= 8:
++            from vllm_xpu_kernels.astra_structural import hc_up_mix
++
++            return hc_up_mix(lora, self._astra_hc_up_weight, normalized)
++        return hc_gate_mix(normalized, self.input_mix_weight_up(lora), self.hc_count)
++
+     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+         """Use ordered DFlash2 projection or the legacy target-only policy."""
+         if self._ordered_hc:
+@@ -280,8 +296,7 @@ class GatedResidual(nn.Module):
+             injection = None
+ 
+         lora = hc_silu(lora, self.hc_count)
+-        gate = self.input_mix_weight_up(lora)  # [M, D]
+-        block_input = hc_gate_mix(xn, gate, self.hc_count)
++        block_input = self._mix_up(lora, xn)
+ 
+         return hidden_states, block_input, injection
+ 
+@@ -336,8 +351,7 @@ class GatedResidual(nn.Module):
+             injection = None
+ 
+         lora = hc_silu(lora, self.hc_count)
+-        gate = self.input_mix_weight_up(lora)  # [M, D]
+-        block_input = hc_gate_mix(xn, gate, self.hc_count)
++        block_input = self._mix_up(lora, xn)
+ 
+         return hidden_states, block_input, injection
+ 

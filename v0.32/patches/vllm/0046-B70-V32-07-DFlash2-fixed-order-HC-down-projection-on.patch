@@ -1,0 +1,46 @@
+From bc041ac319d9c6abf121a87dc7623b70b744ebd5 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 04:53:16 +0000
+Subject: [PATCH 46/49] B70-V32-07: DFlash2 fixed-order HC down projection only
+ up to B70_HC_ORDERED_MAX_ROWS rows
+
+Wider batches take the stock BF16 GEMM. Measured on one B70 (K=10240, N=336): ordered Triton
+0.65 / 1.22 / 0.50 / 1.88 ms vs F.linear 0.15 / 0.06 / 0.22 / 0.28 ms at 64 / 256 / 1024 / 4096
+rows. Default unbounded (wu1ff behaviour).
+---
+ vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index 4fe2515aec..48f70620c2 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -23,6 +23,8 @@ Typical usage inside a transformer decoder layer::
+     )
+ """
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -48,6 +50,10 @@ from .ops.hc import (
+ )
+ 
+ logger = init_logger(__name__)
++# B70-V32-07: rows up to which the DFlash2 fixed-order HC down projection is used; wider batches (8-stream
++# decode, prefill chunks) take the stock BF16 GEMM. The ordered Triton GEMM is 4.5x (64 rows) to 6.7x
++# (4096 rows) slower than F.linear on B70. Default: unbounded (wu1ff behaviour).
++_B70_HC_ORDERED_MAX_ROWS = int(os.environ.get("B70_HC_ORDERED_MAX_ROWS", str(1 << 30)))
+ 
+ 
+ def _is_xpu() -> bool:
+@@ -236,7 +242,7 @@ class GatedResidual(nn.Module):
+ 
+     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+         """Use ordered DFlash2 projection or the legacy target-only policy."""
+-        if self._ordered_hc:
++        if self._ordered_hc and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS:
+             from .b70_hc_gemm import ordered_hc_gemm
+ 
+             linear = (

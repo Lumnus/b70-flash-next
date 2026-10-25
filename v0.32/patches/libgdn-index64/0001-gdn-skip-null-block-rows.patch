@@ -1,0 +1,121 @@
+The C++ part of vllm-project/vllm-xpu-kernels#660 ("[GDN] Skip rows whose state index is NULL_BLOCK_ID", fixes #659),
+for wu1ff's libgdn_index64.so. vLLM 0.32 runs the GDN attention op from that library, not from the wheel, so the
+fix has to go into its copy of the kernel headers: apply this patch inside
+model-packs/Qwen3.8-Flash-Next/patches/production/dependencies/gdn-headers of wu1ff/B70-LLM-Controller @ 5e5cf43
+(patch -p1), then build libgdn_index64.so with wu1ff's native build recipe. Apache-2.0 (vllm-xpu-kernels).
+
+diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+index b533cf9..cac230e 100644
+--- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
++++ b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+@@ -164,7 +164,7 @@ struct causal_conv1d_kernel {
+     // get states cache location
+     int states_id = cache_indices[batch_id];
+ 
+-    if (states_id == pad_slot_id) {
++    if (states_id <= pad_slot_id) {
+       return;
+     }
+ 
+@@ -685,7 +685,7 @@ struct causal_conv1d_spec_kernel {
+     // cannot be used to recover this dimension.
+     const int state_len = Width - 1 + (num_spec_tokens - 1);
+     const int state_id = cache_indices[batch_id * cache_indices_stride_0 + 0];
+-    const bool has_conv_state = (state_id != pad_slot_id);
++    const bool has_conv_state = (state_id > pad_slot_id);
+     T* state_line_ptr = has_conv_state
+                             ? conv_states + state_id * conv_states_stride_0
+                             : nullptr;
+diff --git a/csrc/xpu/gdn_attn/gated_delta_rule.hpp b/csrc/xpu/gdn_attn/gated_delta_rule.hpp
+index 87190a9..e561fc6 100644
+--- a/csrc/xpu/gdn_attn/gated_delta_rule.hpp
++++ b/csrc/xpu/gdn_attn/gated_delta_rule.hpp
+@@ -106,9 +106,13 @@ struct gated_delta_rule_kernel {
+     float k_local[k_bucket_size];
+     float v_local[v_dim_per_sg];
+ 
++    // Padding row (NULL_BLOCK_ID or PAD_SLOT_ID): touch no state.
++    const int state_idx = cache_indices[batch_id];
++    if (state_idx <= 0) {
++      return;
++    }
+     StateT* ssm_state_ptr =
+-        ssm_state +
+-        static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0;
++        ssm_state + static_cast<int64_t>(state_idx) * ssm_state_stride_0;
+ 
+     // load state
+     if (has_initial_state == nullptr || has_initial_state[batch_id]) {
+@@ -395,6 +399,10 @@ struct gated_delta_rule_spec_kernel {
+     if (init_col < 0) init_col = 0;
+     const int init_state_idx =
+         cache_indices[batch_id * cache_indices_stride_0 + init_col];
++    // Padding row (NULL_BLOCK_ID or PAD_SLOT_ID): touch no state.
++    if (init_state_idx <= 0) {
++      return;
++    }
+     const StateT* init_state_ptr =
+         ssm_state + static_cast<int64_t>(init_state_idx) * ssm_state_stride_0;
+ #pragma unroll
+@@ -509,6 +517,9 @@ struct gated_delta_rule_spec_kernel {
+       // num_accepted_tokens.
+       const int final_state_idx =
+           cache_indices[batch_id * cache_indices_stride_0 + t_local];
++      if (final_state_idx <= 0) {
++        continue;
++      }
+       StateT* final_state_ptr =
+           ssm_state +
+           static_cast<int64_t>(final_state_idx) * ssm_state_stride_0;
+diff --git a/csrc/xpu/gdn_attn/gdn_attn_interface.cpp b/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
+index f5c0aea..f340b8e 100644
+--- a/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
++++ b/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
+@@ -177,7 +177,9 @@ std::vector<torch::Tensor> causal_conv1d_spec(
+   } else {
+     TORCH_CHECK(false);
+   }
+-  const int pad_slot_id = -1;
++  // Rows whose state index is <= pad_slot_id are padding: vLLM marks them
++  // with NULL_BLOCK_ID (0) or PAD_SLOT_ID (-1).
++  const int pad_slot_id = 0;
+ 
+   std::optional<torch::Tensor> empty_tensor{std::nullopt};
+ 
+@@ -385,7 +387,9 @@ std::vector<torch::Tensor> causal_conv1d_non_spec(
+   } else {
+     TORCH_CHECK(false);
+   }
+-  const int pad_slot_id = -1;
++  // Rows whose state index is <= pad_slot_id are padding: vLLM marks them
++  // with NULL_BLOCK_ID (0) or PAD_SLOT_ID (-1).
++  const int pad_slot_id = 0;
+ 
+   std::optional<torch::Tensor> empty_tensor{std::nullopt};
+ 
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
+index 21a73cc..30063c2 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_tiled_xe2.hpp
+@@ -207,7 +207,7 @@ struct chunk_causal_conv1d_tiled_kernel {
+     }
+ 
+     int states_id = cache_indices[batch_id];
+-    if (states_id == pad_slot_id) {
++    if (states_id <= pad_slot_id) {
+       return;
+     }
+ 
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+index ccb6006..da1d845 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+@@ -156,7 +156,7 @@ struct chunk_causal_conv1d_kernel {
+     // get states cache location
+     int states_id = cache_indices[batch_id];
+ 
+-    if (states_id == pad_slot_id) {
++    if (states_id <= pad_slot_id) {
+       return;
+     }
+ 

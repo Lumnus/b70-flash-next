@@ -1,0 +1,52 @@
+From 484a91493ce6cd01bd2c07b8c7b28ef54f3fe2de Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 23:38:03 +0000
+Subject: [PATCH 38/49] B70-V32-PR2: XPU swap_blocks_batch passes
+ snapshot_src=False for stable (CPU->GPU) sources when the kernels support it
+
+vllm-xpu-kernels snapshot_src (pinned H2D sources copied directly in stream
+order). Used only when is_src_access_order_any, i.e. no stream writes the
+source while the copy is queued (KV offload loads). Older kernels: unchanged.
+---
+ vllm/_custom_ops.py | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index e786207308..2719df1a91 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2860,6 +2860,16 @@ def swap_blocks(
+     torch.ops._C_cache_ops.swap_blocks(src, dst, block_size_in_bytes, block_mapping)
+ 
+ 
++@cache
++def _xpu_swap_blocks_batch_has_snapshot_src() -> bool:
++    """Whether the XPU kernels' swap_blocks_batch takes snapshot_src."""
++    try:
++        schema = torch.ops._C_cache_ops.swap_blocks_batch.default._schema
++    except (AttributeError, RuntimeError):
++        return False
++    return any(a.name == "snapshot_src" for a in schema.arguments)
++
++
+ def swap_blocks_batch(
+     src_ptrs: torch.Tensor,
+     dst_ptrs: torch.Tensor,
+@@ -2882,7 +2892,16 @@ def swap_blocks_batch(
+         is always safe.
+     """
+     if current_platform.is_xpu():
+-        torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
++        if is_src_access_order_any and _xpu_swap_blocks_batch_has_snapshot_src():
++            # The caller guarantees no stream writes the source while the
++            # copy is queued (the CPU->GPU direction of the KV offload pool),
++            # so pinned sources need no call-time snapshot: they are copied
++            # directly in stream order (vllm-xpu-kernels snapshot_src=False).
++            torch.ops._C_cache_ops.swap_blocks_batch(
++                src_ptrs, dst_ptrs, sizes, False
++            )
++        else:
++            torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+     else:
+         torch.ops._C_cache_ops.swap_blocks_batch(
+             src_ptrs, dst_ptrs, sizes, is_src_access_order_any

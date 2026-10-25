@@ -1,0 +1,148 @@
+From e6c025c8832dfe69dc4ed474df0b62ee135f6019 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 08:55:14 +0000
+Subject: [PATCH 31/49] 0014c (L32 port): retain Mamba states N blocks below
+ the replay boundary (B70_OFFLOAD_GDN_BACKSTEP=N)
+
+Re-done on 0.32 (replay boundaries became the module function replay_boundaries); semantics of b70/v0.30.0 80aacb5725, tests from that commit.
+---
+ .../offloading_connector/test_b70_offload.py  | 43 +++++++++++++++++++
+ vllm/v1/core/kv_cache_coordinator.py          | 32 ++++++++++++++
+ vllm/v1/core/sched/scheduler.py               | 14 ++++++
+ 3 files changed, 89 insertions(+)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+index f7bb858117..fb86321f44 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_b70_offload.py
+@@ -122,3 +122,46 @@ def test_gpu_mamba_manager_retains_state_at_junction():
+     )
+     assert without == [False, False, True, False]
+     assert with_junction == [False, True, True, False]
++
++
++def test_backstep_boundaries_sit_below_the_replay_boundary():
++    from vllm.v1.core.kv_cache_coordinator import b70_backstep_boundaries
++
++    # Flash-Next geometry: 832-token blocks, doc of 59,919 prompt tokens.
++    assert b70_backstep_boundaries(59_919, 832, 2) == (59_072, 58_240)
++    assert b70_backstep_boundaries(59_919, 832, 0) == ()
++    assert b70_backstep_boundaries(900, 832, 3) == ()  # never 0 or below
++
++
++@pytest.mark.parametrize("steps", [0, 2])
++def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
++    from types import SimpleNamespace
++
++    from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
++
++    coord = object.__new__(UnitaryKVCacheCoordinator)
++    coord.eagle_group_ids = ()
++    coord.scheduler_block_size = 16
++    coord.b70_gdn_backstep = steps
++    request = SimpleNamespace(num_prompt_tokens=64)
++    boundaries = coord.get_replay_boundaries(request)
++    if steps == 0:
++        assert boundaries == (63,)  # upstream behaviour
++    else:
++        assert boundaries == (16, 32, 63)
++        spec = MambaSpec(
++            block_size=16,
++            shapes=((1, 1),),
++            dtypes=(torch.float32,),
++            mamba_cache_mode="align",
++        )
++        mask = MambaManager.reachable_block_mask(
++            start_block=0,
++            end_block=4,
++            alignment_tokens=16,
++            kv_cache_spec=spec,
++            use_eagle=False,
++            retention_interval=0,
++            reachable_boundaries=boundaries,
++        )
++        assert mask == [True, True, True, False]
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 7d4f2d5a2b..7ba95f9975 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -62,8 +62,40 @@ def _validate_prefix_cache_retention_interval(
+         )
+ 
+ 
++def b70_gdn_backstep() -> int:
++    """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
++    import os
++    raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
++    try:
++        return max(0, int(raw)) if raw else 0
++    except ValueError:
++        return 0
++
++
++def b70_backstep_boundaries(
++    num_prompt_tokens: int, block_size: int, steps: int
++) -> tuple[int, ...]:
++    """Block boundaries 1..steps blocks below the replay boundary."""
++    base = (num_prompt_tokens - 1) // block_size * block_size
++    return tuple(
++        base - k * block_size for k in range(1, steps + 1) if base - k * block_size > 0
++    )
++
++
+ def replay_boundaries(
+     num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
++) -> tuple[int, ...]:
++    """B70 0014c wrapper: upstream boundaries plus N backstep boundaries."""
++    base = _replay_boundaries(num_prompt_tokens, scheduler_block_size, use_eagle)
++    steps = b70_gdn_backstep()
++    if not steps:
++        return base
++    return tuple(sorted(set(base) | set(
++        b70_backstep_boundaries(num_prompt_tokens, scheduler_block_size, steps))))
++
++
++def _replay_boundaries(
++    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
+ ) -> tuple[int, ...]:
+     """Positions a later request replaying a prompt can resume at.
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 5644ba7a65..cf577f411b 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -82,6 +82,9 @@ logger = init_logger(__name__)
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # B70 0014c default (off) for instances built without __init__.
++    b70_gdn_backstep: int = 0
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -377,6 +380,10 @@ class Scheduler(SchedulerInterface):
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
++        # B70 0014c: prefill chunks also stop at the backstep boundaries so
++        # their Mamba states are materialized (they are block aligned).
++        from vllm.v1.core.kv_cache_coordinator import b70_gdn_backstep
++        self.b70_gdn_backstep = b70_gdn_backstep()
+         # TODO: Support models with multiple Mamba specs that require different
+         # prefill checkpoint alignments instead of selecting the first one.
+         self.mamba_prefill_checkpoint_alignment = next(
+@@ -551,6 +558,13 @@ class Scheduler(SchedulerInterface):
+             # requests sharing the prefix can reuse it.
+             junction_stop if start < junction < end else 0,
+         )
++        # B70 0014c; getattr: some callers pass a namespace instead of a Scheduler.
++        b70_steps = getattr(self, "b70_gdn_backstep", 0)
++        if b70_steps:
++            from vllm.v1.core.kv_cache_coordinator import b70_backstep_boundaries
++            stops += b70_backstep_boundaries(
++                request.num_prompt_tokens, block_size, b70_steps
++            )
+         # Stop at the earliest mandatory position strictly inside the chunk.
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)

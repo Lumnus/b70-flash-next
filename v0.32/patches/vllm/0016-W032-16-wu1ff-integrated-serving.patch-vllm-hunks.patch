@@ -1,0 +1,116 @@
+From 17bb3efb826373cc414f46280a10d17d4e80ec05 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 16/49] W032-16: wu1ff integrated-serving.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/integrated-serving.patch (sha256 6cd8586e496f0dca…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/v1/core/sched/scheduler.py               | 14 +++++++++-
+ vllm/v1/sample/ops/topk_topp_triton.py        |  2 +-
+ .../v1/worker/gpu/sample/xpu_filter_warmup.py | 26 +++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py                  |  4 +++
+ 4 files changed, 44 insertions(+), 2 deletions(-)
+ create mode 100644 vllm/v1/worker/gpu/sample/xpu_filter_warmup.py
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index cec96d2a49..8a9cdc09b4 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -900,6 +900,7 @@ class Scheduler(SchedulerInterface):
+         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+             step_skipped_waiting: deque[Request] = deque()
+             step_skipped_kv_holding: deque[Request] = deque()
++            alignment_reserved_slot = 0
+ 
+             def skip_request(from_queue: RequestQueue) -> None:
+                 request_to_skip = from_queue.pop_request()
+@@ -920,7 +921,7 @@ class Scheduler(SchedulerInterface):
+                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                 # in `running` but still hold a model-runner request slot.
+                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+-                if num_running >= self.max_num_active_reqs:
++                if num_running >= self.max_num_active_reqs - alignment_reserved_slot:
+                     break
+ 
+                 request = request_queue.peek_request()
+@@ -1178,6 +1179,17 @@ class Scheduler(SchedulerInterface):
+                             num_external_computed_tokens,
+                         )
+                         if num_new_tokens == 0:
++                            # An aligned chunk cannot use the remaining budget.
++                            # Reuse the skipped-request queue and keep a slot for
++                            # its first request when its next chunk can fit.
++                            if (
++                                num_scheduled_tokens
++                                and num_running < self.max_num_active_reqs - 1
++                                and not self._holds_kv_blocks(request)
++                            ):
++                                alignment_reserved_slot = 1
++                                skip_request(request_queue)
++                                continue
+                             break
+                         if (
+                             pad_spec_decode
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 151f641d21..d0ac6213df 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -103,7 +103,7 @@ def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, senti
+     return min_larger, num_min_larger
+ 
+ 
+-@triton.jit(do_not_specialize_on_alignment=["BATCH_SIZE"])
++@triton.jit(do_not_specialize=["BATCH_SIZE"])
+ def _topk_topp_kernel(
+     LOGITS,
+     LOGITS_STRIDE_0,
+diff --git a/vllm/v1/worker/gpu/sample/xpu_filter_warmup.py b/vllm/v1/worker/gpu/sample/xpu_filter_warmup.py
+new file mode 100644
+index 0000000000..b01d0f4b5c
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/xpu_filter_warmup.py
+@@ -0,0 +1,26 @@
++"""Bounded initialized warmup for the XPU DFlash2 sampling filter."""
++import time
++import torch
++from vllm.logger import init_logger
++
++@torch.inference_mode()
++def warmup_filter(runner):
++    spec = runner.speculative_config
++    if (spec is None or spec.method != "dflash"
++        or runner.model_config.hf_text_config.model_type != "qwen4_exp_text"):
++        return
++    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
++    started = time.perf_counter()
++    before = torch.xpu.memory_allocated()
++    # Dedicated initialized tensors; no live request, KV, RNG or sampler state.
++    logits = torch.arange(runner.vocab_size, device=runner.device,
++                          dtype=torch.float32).unsqueeze(0) / runner.vocab_size
++    k = torch.full((1,), 20, device=runner.device, dtype=torch.int32)
++    p = torch.full((1,), .95, device=runner.device, dtype=torch.float32)
++    for topk, topp in ((k, p), (k, None), (None, p)):
++        apply_top_k_top_p_triton(logits.clone(), topk, topp)
++    torch.xpu.synchronize()
++    del logits, k, p
++    init_logger(__name__).info(
++        "Initialized XPU filter warmup: %.3f s, retained tensor bytes=%d",
++        time.perf_counter() - started, torch.xpu.memory_allocated() - before)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 04feb5da02..188fe9a8d8 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1073,6 +1073,10 @@ class Worker(WorkerBase):
+ 
+             trigger_inductor_lazy_init(self.device)
+ 
++        if self.device.type == "xpu" and self.use_v2_model_runner:
++            from vllm.v1.worker.gpu.sample.xpu_filter_warmup import warmup_filter
++            warmup_filter(self.model_runner)
++
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         self._maybe_activate_jit_monitor()

@@ -1,0 +1,470 @@
+From f99f23e7f8548d6322ee74efa6ebefa5a4d7b55b Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:24 +0000
+Subject: [PATCH 03/49] W032-02: wu1ff dflash2-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/dflash2-v032.patch (sha256 cc9bc66d5645ab29…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/model_executor/models/config.py          |  16 ++
+ vllm/models/qwen4_exp/nvidia/b70_disk.py      |  22 +-
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py   |  69 +++++++
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   |  42 ++--
+ vllm/models/qwen4_exp/nvidia/c1_verify.py     | 194 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |   9 +-
+ 6 files changed, 337 insertions(+), 15 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/c1_verify.py
+
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index d64e51bfa8..259aa5df99 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -948,10 +948,26 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+         spec_config = vllm_config.speculative_config
++        if spec_config is not None and spec_config.method == "dflash":
++            draft = spec_config.draft_model_config.hf_config
++            if (
++                draft.architectures != ["DFlash2DraftModel"]
++                or draft.dflash_config.get("target_layer_ids") != [5, 15, 25, 35, 45]
++                or draft.hidden_size != text_config.hidden_size
++                or draft.vocab_size != text_config.vocab_size
++                or text_config.hc_count != 4
++                or text_config.num_hidden_layers != 48
++                or spec_config.num_speculative_tokens != 3
++            ):
++                raise NotImplementedError(
++                    "Qwen4Exp DFlash2 requires the five-layer HC4 Flash-Next "
++                    "feature contract and three proposals"
++                )
+         if spec_config is not None and spec_config.method not in {
+             "mtp",
+             "ngram",
+             "ngram_gpu",
++            "dflash",
+         }:
+             raise NotImplementedError(
+                 "Qwen4Exp speculative decoding supports only its native MTP "
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_disk.py b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+index 4bcf7d6d4e..a3faf24a7b 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_disk.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+@@ -46,11 +46,29 @@ def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens)
+         or p.decode_context_parallel_size != 1
+         or p.prefill_context_parallel_size != 1
+         or s.max_num_seqs != 4
+-        or config.speculative_config is not None
+     ):
+         raise ValueError(
+-            "Phase 1 Disk PLE requires target-only BF16 TP4+EP/PP1/DP1, four slots"
++            "Disk PLE requires BF16 TP4+EP/PP1/DP1, four slots"
+         )
++    spec = config.speculative_config
++    if spec is not None:
++        draft = spec.draft_model_config
++        if (
++            spec.method != "dflash"
++            or draft.architectures != ["DFlash2DraftModel"]
++            or draft.dtype != torch.bfloat16
++            or draft.quantization is not None
++            or spec.draft_parallel_config.tensor_parallel_size != 4
++            or spec.num_speculative_tokens != 3
++            or spec.draft_sample_method != "probabilistic"
++            or spec.rejection_sample_method != "standard"
++            or spec.uses_dynamic_speculative_decoding()
++            or spec.enable_adaptive_verification
++        ):
++            raise ValueError(
++                "Disk PLE speculation requires BF16 TP4 DFlash2, three fixed "
++                "proposals, conditional probabilistic drafting and standard rejection"
++            )
+     if any(
+         os.environ.get(n) == "1"
+         for n in (
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+new file mode 100644
+index 0000000000..bdb98a5998
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fixed-order BF16 HC down projection with FP32 accumulation."""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _ordered_hc_gemm(
++    x,
++    weight,
++    output,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    XS0: tl.constexpr,
++    XS1: tl.constexpr,
++    WS0: tl.constexpr,
++    WS1: tl.constexpr,
++    VALID_N: tl.constexpr,
++    BM: tl.constexpr = 16,
++    BN: tl.constexpr = 32,
++    BK: tl.constexpr = 128,
++):
++    rows = tl.program_id(0) * BM + tl.arange(0, BM)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    inner = tl.arange(0, BK)
++    accumulator = tl.zeros((BM, BN), tl.float32)
++    for step in range(triton.cdiv(K, BK)):
++        kk = step * BK + inner
++        a = tl.load(
++            x + rows[:, None] * XS0 + kk[None, :] * XS1,
++            (rows[:, None] < M) & (kk[None, :] < K),
++            other=0,
++        )
++        b = tl.load(
++            weight + cols[None, :] * WS0 + kk[:, None] * WS1,
++            (cols[None, :] < VALID_N) & (kk[:, None] < K),
++            other=0,
++        )
++        accumulator += tl.dot(a, b)
++    tl.store(
++        output + rows[:, None] * N + cols[None, :],
++        accumulator,
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++def ordered_hc_gemm(x, weight, valid_columns):
++    assert x.dtype == weight.dtype == torch.bfloat16
++    rows, inner = x.shape
++    columns = weight.shape[0]
++    assert inner == weight.shape[1] and 0 < valid_columns <= columns
++    output = torch.empty((rows, columns), device=x.device, dtype=x.dtype)
++    _ordered_hc_gemm[(triton.cdiv(rows, 16), triton.cdiv(columns, 32))](
++        x,
++        weight,
++        output,
++        rows,
++        columns,
++        inner,
++        *x.stride(),
++        *weight.stride(),
++        valid_columns,
++        num_warps=4,
++        num_stages=2,
++    )
++    return output
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index 0f426693b6..fb04bef4ee 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -27,6 +27,7 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++from vllm.config import get_current_vllm_config
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+@@ -68,8 +69,9 @@ def _is_xpu() -> bool:
+ # (M in {64, 128, 256}; 0/512 flips at M=256). See
+ # docs/HC_DOWN_GEMM_FIX_RECON.md for the offline campaign.
+ #
+-# Widths <= 64 keep the stock single GEMM (bitwise-clean there, and decode
+-# graphs never exceed 8 rows, so M1 FULL decode keeps stock numerics).
++# The v0.32 Torch 2.14 BF16 path also changes valid outputs at M=1.
++# DFlash2 therefore uses an explicitly ordered projection at every width.
++# The legacy target-only split policy below remains unchanged.
+ # CUDA is untouched: the halves are prepared only on XPU
+ # (UnquantizedLinearMethod.process_weights_after_loading calls the
+ # ``hc_ksplit_prepare`` marker set below), so the split branch is never
+@@ -110,6 +112,19 @@ class GatedResidual(nn.Module):
+         self.hc_count = config.hc_count
+         self.hidden_size = config.hidden_size
+         self.use_combine = use_combine
++        spec = get_current_vllm_config().speculative_config
++        self._ordered_hc = (
++            spec is not None
++            and spec.method == "dflash"
++            and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
++            and config.params_dtype == torch.bfloat16
++            and _is_xpu()
++        )
++        if self._ordered_hc:
++            logger.info_once(
++                "DFlash2 target HC uses fixed-order BF16 down projection "
++                "with FP32 accumulation"
++            )
+ 
+         norm_size = (
+             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
+@@ -178,7 +193,7 @@ class GatedResidual(nn.Module):
+ 
+     def _prepare_kdown_ksplit(self) -> None:
+         """One-time contiguous K-half prep for the deterministic XPU split."""
+-        if self._kdown_lo is not None:
++        if self._ordered_hc or self._kdown_lo is not None:
+             return
+         down_linear = (
+             self.input_mix_weight_down_block_inject
+@@ -204,14 +219,17 @@ class GatedResidual(nn.Module):
+         )
+ 
+     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+-        """Down projection; width-gated deterministic K-split on XPU.
+-
+-        Row widths <= 64 (all decode graphs) keep the stock single GEMM,
+-        which is bitwise-clean there. Wider rows (prefill chunks) take the
+-        two-GEMM split over the contiguous K-halves. The branch conditions
+-        are shape/attribute reads only, so stream capture bakes the correct
+-        arm per graph and replays deterministically.
+-        """
++        """Use ordered DFlash2 projection or the legacy target-only policy."""
++        if self._ordered_hc:
++            from .b70_hc_gemm import ordered_hc_gemm
++
++            linear = (
++                self.input_mix_weight_down_block_inject
++                if self.use_combine
++                else self.input_mix_weight_down
++            )
++            valid = self.lora_rank + (self.hc_count if self.use_combine else 0)
++            return ordered_hc_gemm(xn, linear.weight, valid)
+         if (
+             self._kdown_lo is not None
+             and _is_xpu()
+@@ -222,7 +240,7 @@ class GatedResidual(nn.Module):
+                 _HC_KSPLIT_WIDTHS_LOGGED.add(width)
+                 logger.info(
+                     "HC down GEMM: deterministic K-split engaged at row width "
+-                    "%d (stock single GEMM kept for widths <= %d)",
++                    "%d (stock single GEMM only at widths <= %d)",
+                     width,
+                     _HC_KSPLIT_MAX_STOCK_WIDTH,
+                 )
+diff --git a/vllm/models/qwen4_exp/nvidia/c1_verify.py b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+new file mode 100644
+index 0000000000..3926e2510f
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+@@ -0,0 +1,194 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Eager C1 DFlash2 verification with canonical one-token target execution."""
++
++import copy
++from dataclasses import replace
++
++import numpy as np
++import torch
++
++from vllm.config.compilation import CUDAGraphMode
++from vllm.forward_context import BatchDescriptor, set_forward_context
++from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
++
++
++def enabled(runner, batch) -> bool:
++    spec = runner.speculative_config
++    return (
++        spec is not None
++        and spec.method == "dflash"
++        and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
++        and runner.device.type == "xpu"
++        and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
++        and batch.num_reqs == 1
++        and not batch.has_prefill
++        and 1 < batch.num_tokens <= 4
++    )
++
++
++def conv_view(module, base: int) -> tuple[torch.Tensor, int]:
++    conv = module.kv_cache[0][base]
++    if conv.shape[0] > conv.shape[1]:
++        conv = conv.T
++    window = getattr(module, "conv_state_len", 3)
++    capacity = window + 3
++    return conv[-capacity:] if hasattr(module, "conv_state_len") else conv, window
++
++
++def stage_prefixes(conv, histories, recurrent, states, indices) -> None:
++    """Retain each logical prefix in the native accepted-column/window layout."""
++    packed = torch.cat([histories[0], *[h[-1:] for h in histories[1:]]])
++    conv[: packed.shape[0]].copy_(packed)
++    if recurrent is not None:
++        for column, state in enumerate(states):
++            recurrent[int(indices[column].item())].copy_(state)
++
++
++def verify(runner, batch, metadata, model_inputs):
++    # Builders reuse device scratch. Preserve the verification metadata while
++    # constructing the one-token forwards below.
++    saved_metadata = {}
++    for name, meta in metadata.items():
++        clone = copy.copy(meta)
++        for key, value in vars(meta).items():
++            if isinstance(value, torch.Tensor):
++                setattr(clone, key, value.clone())
++        saved_metadata[name] = clone
++    routes = []
++    context = runner.vllm_config.compilation_config.static_forward_context
++    for name, meta in saved_metadata.items():
++        module = context[name]
++        cache = getattr(module, "kv_cache", None)
++        if not isinstance(cache, (tuple, list)) or not cache:
++            continue
++        indices = meta.spec_state_indices_tensor[0].flatten()
++        base = int(indices[0].item())
++        offset = int(meta.num_accepted_tokens[0].item()) - 1
++        conv, window = conv_view(module, base)
++        conv[:window].copy_(conv[offset : offset + window].clone())
++        recurrent = cache[1] if len(cache) == 2 else None
++        if recurrent is not None:
++            recurrent[base].copy_(recurrent[int(indices[offset].item())].clone())
++        routes.append((module, base, indices, [], []))
++
++    req = int(batch.idx_mapping[0].item())
++    positions = batch.positions
++    start = int(positions[0].item())
++    width = batch.num_tokens
++    computed = runner.req_states.num_computed_tokens.gpu[req].clone()
++    accepted = runner.model_state.num_accepted_tokens_gpu[req].clone()
++    old_tokens = runner.req_states.all_token_ids.gpu[req, start : start + width].clone()
++    state_scratch = {
++        name: value.clone()
++        for name, value in vars(runner.model_state).items()
++        if name in ("_mamba_state_idx_gpu", "_mamba_src_col_gpu", "_mamba_src_off_gpu")
++        and isinstance(value, torch.Tensor)
++    }
++    outputs, features = [], []
++    try:
++        runner.req_states.all_token_ids.gpu[req, start : start + width].copy_(
++            batch.input_ids
++        )
++        for column in range(width):
++            position = start + column
++            runner.req_states.num_computed_tokens.gpu[req] = position
++            runner.model_state.num_accepted_tokens_gpu[req] = 1
++            qsl = torch.tensor([0, 1], dtype=torch.int32, device=runner.device)
++            single = replace(
++                batch,
++                num_tokens=1,
++                num_tokens_after_padding=1,
++                num_scheduled_tokens=np.array([1], np.int32),
++                num_draft_tokens=0,
++                num_draft_tokens_per_req=np.array([0], np.int32),
++                query_start_loc=qsl,
++                query_start_loc_np=np.array([0, 1], np.int32),
++                seq_lens=torch.tensor(
++                    [position + 1], dtype=torch.int32, device=runner.device
++                ),
++                seq_lens_cpu_upper_bound=torch.tensor(
++                    [position + 1], dtype=torch.int32
++                ),
++                num_computed_tokens_np=np.array([position], np.int32),
++                input_ids=batch.input_ids[column : column + 1],
++                positions=positions[column : column + 1],
++                is_padding=batch.is_padding[column : column + 1],
++                logits_indices=torch.zeros(1, dtype=torch.int64, device=runner.device),
++                cu_num_logits=qsl,
++                cu_num_logits_np=np.array([0, 1], np.int32),
++                max_query_len=1,
++            )
++            tables = runner.block_tables.gather_block_tables(batch.idx_mapping, 1)
++            slots = runner.block_tables.compute_slot_mappings(
++                batch.idx_mapping,
++                qsl,
++                single.positions,
++                1,
++                out=torch.empty_like(runner.block_tables.slot_mappings),
++            )
++            runner.model_state.preprocess_state(
++                single,
++                tables,
++                runner.kv_cache_config,
++                runner.req_states.num_computed_tokens.gpu,
++            )
++            spec_config = runner.vllm_config.speculative_config
++            try:
++                runner.vllm_config.speculative_config = None
++                step_metadata = runner.model_state.prepare_attn(
++                    single,
++                    CUDAGraphMode.NONE,
++                    tables,
++                    slots,
++                    runner.attn_groups,
++                    runner.kv_cache_config,
++                )
++            finally:
++                runner.vllm_config.speculative_config = spec_config
++            inputs = dict(model_inputs)
++            inputs.update(input_ids=single.input_ids, positions=single.positions)
++            if model_inputs.get("inputs_embeds") is not None:
++                inputs["inputs_embeds"] = model_inputs["inputs_embeds"][
++                    column : column + 1
++                ]
++            inputs.update(runner.model_state.prepare_inputs(single, runner.req_states))
++            runner.eplb.prepare_forward(runner.model_config, 1, None)
++            with set_forward_context(
++                step_metadata,
++                runner.vllm_config,
++                num_tokens=1,
++                batch_descriptor=BatchDescriptor(num_tokens=1),
++                slot_mapping=build_slot_mappings_by_layer(
++                    slots, runner.kv_cache_config
++                ),
++                is_padding=single.is_padding,
++            ):
++                hidden, aux = runner.model(**inputs)
++            outputs.append(hidden.clone())
++            features.append([tensor.clone() for tensor in aux])
++            runner.req_states.num_computed_tokens.gpu[req] = position + 1
++            runner.model_state.postprocess_state(
++                batch.idx_mapping,
++                torch.ones(1, dtype=torch.int32, device=runner.device),
++                runner.req_states.num_computed_tokens.gpu,
++            )
++            for module, base, indices, histories, states in routes:
++                conv, window = conv_view(module, base)
++                histories.append(conv[:window].clone())
++                if len(module.kv_cache) == 2:
++                    states.append(module.kv_cache[1][base].clone())
++        for module, base, indices, histories, states in routes:
++            conv, _ = conv_view(module, base)
++            recurrent = module.kv_cache[1] if states else None
++            stage_prefixes(conv, histories, recurrent, states, indices)
++        return torch.cat(outputs), [torch.cat(parts) for parts in zip(*features)]
++    finally:
++        runner.req_states.num_computed_tokens.gpu[req] = computed
++        runner.model_state.num_accepted_tokens_gpu[req] = accepted
++        runner.req_states.all_token_ids.gpu[req, start : start + width].copy_(
++            old_tokens
++        )
++        for name, value in state_scratch.items():
++            getattr(runner.model_state, name).copy_(value)
++        metadata.clear()
++        metadata.update(saved_metadata)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 57cef586f8..1ac67b20ee 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2041,7 +2041,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     )
+                 else:
+                     # Eager (NONE): call the raw model directly.
+-                    model_output = self.model(**model_inputs)
++                    from vllm.models.qwen4_exp.nvidia import c1_verify
++
++                    if c1_verify.enabled(self, input_batch):
++                        model_output = c1_verify.verify(
++                            self, input_batch, attn_metadata, model_inputs
++                        )
++                    else:
++                        model_output = self.model(**model_inputs)
+ 
+         self.kv_connector.finish_forward()
+ 

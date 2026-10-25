@@ -1,0 +1,184 @@
+From 716659841014ead06d26ca46667ff18db0be9532 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 02:32:22 +0000
+Subject: [PATCH 42/49] B70-V32-03: PLE NVMe n-gram ids hashed on the host
+ (B70_PLE_INT8_NVME host path, B70_PLE_HOST_IDS=1)
+
+The NVMe PLE producer needs the step ids on the host; under async scheduling the tokens exist
+only on the device, so a sync is inherent. Before: ~50 eager hash ops queued after the previous
+step, then a blocking D2H of the [T, heads] ids. Now: one D2H of tokens + n-gram context, the
+same arithmetic in numpy (b70_host_ngram_ids; int64 products wrap as torch's do), ids passed to
+prepare(host_ids=...). CPU test: numpy == torch eager path, 200 random layouts.
+---
+ tests/b70/test_b70_v32_host_ngram_ids.py      | 20 +++++++
+ vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py  |  8 ++-
+ vllm/models/qwen4_exp/nvidia/model_state.py   | 20 +++++++
+ .../qwen4_exp/nvidia/ngram_embedding.py       | 60 +++++++++++++++++++
+ 4 files changed, 106 insertions(+), 2 deletions(-)
+ create mode 100644 tests/b70/test_b70_v32_host_ngram_ids.py
+
+diff --git a/tests/b70/test_b70_v32_host_ngram_ids.py b/tests/b70/test_b70_v32_host_ngram_ids.py
+new file mode 100644
+index 0000000000..badd276f75
+--- /dev/null
++++ b/tests/b70/test_b70_v32_host_ngram_ids.py
+@@ -0,0 +1,20 @@
++import types, torch, numpy as np
++from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding as C, b70_host_ngram_ids
++rng = np.random.default_rng(0)
++for trial in range(200):
++    n = int(rng.integers(2, 5)); hpn = int(rng.integers(1, 5)); heads = (n - 1) * hpn
++    eos = 7
++    mult = [2 * int(rng.integers(1, 2**60)) + 1 for _ in range(n)]
++    sizes = torch.tensor(rng.integers(1000, 2**31, heads), dtype=torch.long)
++    offs = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.long), sizes[:-1]]), 0)
++    f = types.SimpleNamespace(layer_multipliers=torch.tensor(mult, dtype=torch.long), ngram_heads_vocab_sizes=sizes,
++        ngram_heads_offsets=offs, eos_token_id=eos, heads_per_ngram=hpn, ngram_size=n,
++        _shift_precompute=C._shift_precompute, _shift_apply=C._shift_apply)
++    R = int(rng.integers(1, 9)); lens = rng.integers(1, 12, R)
++    qsl = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64); T = int(qsl[-1])
++    ids = rng.integers(0, 20, T).astype(np.int64)
++    ctx = rng.integers(0, 20, (R, n - 1)).astype(np.int64)
++    ref = C.compute_ngram_ids(f, torch.from_numpy(ids), torch.from_numpy(qsl), torch.from_numpy(ctx)).numpy()
++    got = b70_host_ngram_ids(ids, qsl, ctx, mult, sizes.numpy(), offs.numpy(), eos, hpn, n)
++    assert ref.shape == got.shape and np.array_equal(ref, got), (trial, ref, got)
++print("host ngram ids == torch eager path: 200/200")
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+index 99818a8b0e..255bc38986 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+@@ -241,7 +241,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         self._dirty = num_tokens
+ 
+     def prepare(self, ngram_ids: torch.Tensor | None, num_tokens: int,
+-                num_tokens_padded: int) -> None:
++                num_tokens_padded: int, host_ids: np.ndarray | None = None) -> None:
+         self._check_capacity(num_tokens_padded)
+         if not 0 <= num_tokens <= num_tokens_padded:
+             raise ValueError("B70 PLE NVMe invalid actual/padded token counts")
+@@ -255,7 +255,11 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+                     stream != self._owner_stream or thread != self._owner_thread):
+                 self._owner_stream.synchronize()
+             self._owner_stream, self._owner_thread = stream, thread
+-            if ngram_ids is None:
++            if host_ids is not None:
++                if tuple(host_ids.shape) != (num_tokens, self._heads):
++                    raise ValueError("B70 PLE NVMe: host ids shape mismatch")
++                self._fill_stage(host_ids, num_tokens, num_tokens_padded)
++            elif ngram_ids is None:
+                 self._fill_stage(None, 0, num_tokens_padded)
+             else:
+                 if tuple(ngram_ids.shape) != (num_tokens_padded, self._heads):
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index bc1c1bdb91..56a224b91a 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -15,6 +15,11 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ 
++import os
++
++_B70_HOST_IDS = os.environ.get("B70_PLE_HOST_IDS", "0") == "1"
++
++
+ class Qwen4ExpModelState(MambaHybridModelState):
+     """Add rollback-safe PLE n-gram context to the model inputs."""
+ 
+@@ -128,6 +133,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 raise ValueError("Disk BF16 PLE input length differs from dispatch")
+             if num_tokens_padded == 0:
+                 continue
++            if _B70_HOST_IDS and hasattr(module, "compute_ngram_ids_host"):
++                # B70-V32-03: one small D2H of the tokens + context, ids hashed on the host: the
++                # step's only host sync no longer waits behind ~50 eager hash kernels.
++                num_reqs = input_batch.num_reqs
++                num_tokens = input_batch.num_tokens
++                ctx = model_inputs["ngram_context"][:num_reqs]
++                flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
++                flat = flat.to("cpu", non_blocking=False).numpy()
++                ids = module.compute_ngram_ids_host(
++                    flat[:num_tokens],
++                    input_batch.query_start_loc_np[: num_reqs + 1],
++                    flat[num_tokens:].reshape(num_reqs, -1),
++                )
++                module.ngram_embedding.prepare(None, num_tokens, num_tokens_padded, host_ids=ids)
++                continue
+             # Existing GPU IDs use the authoritative committed context above.
+             # This producer runs before FULL replay as well as ordinary forward.
+             ids = module.compute_ngram_ids(
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index a46c3c8ee3..9426443e09 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -293,6 +293,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
+         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
+ 
++    def compute_ngram_ids_host(self, input_ids, query_start_loc, ngram_context):
++        """B70-V32-03: compute_ngram_ids on the host (numpy), same arithmetic as the eager torch path.
++
++        input_ids [T], query_start_loc [R+1], ngram_context [R, n-1]: int64 numpy arrays of the actual
++        (unpadded) batch. Returns int64 [T, heads]. int64 products wrap exactly as torch's do."""
++        import numpy as np
++
++        consts = getattr(self, "_b70_host_consts", None)
++        if consts is None:
++            consts = self._b70_host_consts = (
++                [int(x) for x in self.layer_multipliers.cpu().tolist()],
++                self.ngram_heads_vocab_sizes.cpu().numpy().astype(np.int64),
++                self.ngram_heads_offsets.cpu().numpy().astype(np.int64),
++            )
++        return b70_host_ngram_ids(input_ids, query_start_loc, ngram_context, consts[0], consts[1],
++                                  consts[2], int(self.eos_token_id), int(self.heads_per_ngram),
++                                  int(self.ngram_size))
++
+     def compute_ngram_ids(
+         self,
+         input_ids: torch.Tensor,
+@@ -492,3 +510,45 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             self.ngram_embedding.load_host_table(self)
+             loaded.add("ngram_embedding.weight")
+         return loaded
++
++
++def b70_host_ngram_ids(input_ids, query_start_loc, ngram_context, multipliers, sizes, offsets, eos, heads_per_ngram,
++                       ngram_size):
++    """B70-V32-03: numpy twin of Qwen4ExpNGramEmbedding.compute_ngram_ids (eager path)."""
++    import numpy as np
++
++    input_ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
++    qsl = np.asarray(query_start_loc, dtype=np.int64)
++    num_reqs = qsl.size - 1
++    num_tokens = input_ids.shape[0]
++    positions = np.arange(num_tokens, dtype=np.int64)
++    packed = np.full((num_reqs, num_tokens), eos, dtype=np.int64)
++    request_indices = np.searchsorted(qsl, positions, side="right") - 1
++    request_indices = np.minimum(request_indices, num_reqs - 1)
++    columns = np.clip(positions - qsl[request_indices], 0, packed.shape[1] - 1)
++    packed[request_indices, columns] = input_ids
++    context = np.concatenate([np.asarray(ngram_context, dtype=np.int64)[:num_reqs], packed], axis=1)
++    batch, seq = context.shape
++    pos = np.arange(seq, dtype=np.int64)
++    eos_pos = np.where(context == eos, pos[None, :], -1)
++    prev_incl = np.maximum.accumulate(eos_pos, axis=1)
++    prev = np.concatenate([np.full((batch, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1)
++    in_segment = pos[None, :] - prev - 1
++    shifted = [context]
++    for shift in range(1, ngram_size):
++        source = pos - shift
++        gathered = context[:, np.maximum(source, 0)]
++        valid = (source[None, :] >= 0) & (in_segment >= shift)
++        shifted.append(np.where(valid, gathered, eos))
++    adjusted = columns + ngram_size - 1
++    blocks = []
++    with np.errstate(over="ignore"):
++        for ngram in range(2, ngram_size + 1):
++            start = (ngram - 2) * heads_per_ngram
++            end = start + heads_per_ngram
++            mixed = shifted[0] * np.int64(multipliers[0])
++            for index in range(1, ngram):
++                mixed = np.bitwise_xor(mixed, shifted[index] * np.int64(multipliers[index]))
++            ids = np.remainder(mixed[..., None], sizes[start:end]) + offsets[start:end]
++            blocks.append(ids[request_indices, adjusted])
++    return np.concatenate(blocks, axis=-1)

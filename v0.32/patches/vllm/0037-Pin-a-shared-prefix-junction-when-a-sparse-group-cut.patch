@@ -1,0 +1,214 @@
+From 273c0671221ec84f66845b45acc54cc5ba36f49f Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 20:20:12 +0000
+Subject: [PATCH 37/49] Pin a shared-prefix junction when a sparse group cuts
+ the offload hit
+
+On a hybrid model (full attention + Mamba or sliding window) under sparse
+retention (prefix_cache_retention_interval=0, the default), a request keeps
+one sparse-group state per replay boundary, in the last block of its prompt.
+A later request that shares the prefix but diverges before that block finds
+its full-attention chunks in the offload tier but no sparse state at or
+below them, so the whole offload hit drops to 0.
+
+The local prefix cache handles this by pinning a shared-prefix junction at
+the longest single-group hit (KVCacheManager.get_computed_blocks), so the
+recompute retains the sparse state there. The offload lookup never set one,
+so once the prefix had left the GPU cache every recompute stored its state
+inside the differing suffix again and the prefix was never reused.
+
+The OffloadingConnector now records the boundary the full-attention groups
+proved before any sparse group narrowed it and, when the final hit is
+shorter, raises request.shared_prefix_boundary to it. The core scheduler
+already honours the junction (chunk stop, retention mask, aligned-boundary
+hand-off), so the first revisit misses and later revisits hit.
+
+Cherry-picked from vllm-project/vllm#63566 (fixes #63565).
+---
+ .../offloading_connector/test_scheduler.py    | 74 +++++++++++++++++++
+ .../kv_connector/v1/offloading/scheduler.py   | 38 ++++++++++
+ 2 files changed, 112 insertions(+)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+index e71c3dbf18..606a848cb1 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+@@ -69,6 +69,7 @@ from vllm.v1.kv_offload.base import (
+     OffloadingEvent,
+     OffloadingKVEventsConfig,
+     OffloadingManager,
++    OffloadKey,
+     OffloadPolicy,
+     ReqContext,
+     RequestOffloadingContext,
+@@ -501,6 +502,79 @@ def test_max_load_tokens_caps_tokens_beyond_gpu_prefix():
+     assert scheduler._req_status["req"].partial_tail_boundary == 24
+ 
+ 
++def _hybrid_lookup(stored: set[OffloadKey]):
++    """Full attention (group 0) holds every chunk; Mamba (group 1) only
++    the boundary states in ``stored``."""
++
++    def lookup(key: OffloadKey, req_context: ReqContext) -> LookupResult:
++        if get_offload_group_idx(key) == 0:
++            return LookupResult.HIT
++        return LookupResult.HIT if key in stored else LookupResult.MISS
++
++    return lookup
++
++
++def _make_sparse_retention_scheduler() -> OffloadingConnectorScheduler:
++    # prefix_cache_retention_interval=0, the engine default: one Mamba state
++    # per replay boundary.
++    scheduler = _make_partial_tail_scheduler()
++    scheduler.config = scheduler.config._replace(retention_interval=0)
++    return scheduler
++
++
++def test_sparse_group_miss_registers_shared_prefix_junction():
++    """A revisit that diverges before the only stored Mamba state heals.
++
++    The first request stored one Mamba state at the end of its prompt.
++    The revisit shares the first chunk (16 tokens) but not that state,
++    so the whole lookup misses. The connector must pin a junction at 16
++    so the recompute retains and offloads the Mamba state there; the next
++    revisit then hits the shared prefix.
++    """
++    scheduler = _make_sparse_retention_scheduler()
++    request = _make_partial_tail_request(scheduler)
++    request.shared_prefix_boundary = 0
++    stored: set[OffloadKey] = set()
++    scheduler.manager.lookup.side_effect = _hybrid_lookup(stored)
++
++    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
++    assert request.shared_prefix_boundary == 16
++
++    # The recompute's Mamba state at the junction is handed off and stored.
++    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 77, 16)]})
++    [job_id] = jobs
++    stored.update(scheduler._jobs[job_id].keys)
++
++    scheduler._req_status["req"].transfer_jobs.clear()
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 16
++
++
++def test_shared_prefix_junction_is_not_lowered():
++    scheduler = _make_sparse_retention_scheduler()
++    request = _make_partial_tail_request(scheduler)
++    # e.g. a longer junction from the local prefix cache
++    request.shared_prefix_boundary = 24
++    scheduler.manager.lookup.side_effect = _hybrid_lookup(set())
++
++    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
++    assert request.shared_prefix_boundary == 24
++
++
++def test_no_shared_prefix_junction_when_sparse_group_hits():
++    scheduler = _make_sparse_retention_scheduler()
++    request = _make_partial_tail_request(scheduler)
++    request.shared_prefix_boundary = 0
++    scheduler.manager.lookup.return_value = LookupResult.HIT
++
++    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
++    assert tokens == 28
++    assert request.shared_prefix_boundary == 0
++
++
+ def test_max_load_tokens_rounds_down_without_partial_tail():
+     scheduler = _make_partial_tail_scheduler()
+     scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 62adc52edb..374449ce8c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -384,6 +384,9 @@ class RequestOffloadState:
+     # Loaded attention keys cover their token positions. Recurrent state
+     # supports the whole reused external prefix.
+     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
++    # Hit boundary proven by the full-attention groups in the latest lookup,
++    # before any sliding-window/Mamba group narrowed it; 0 if not reached.
++    full_attention_hit_boundary: int = 0
+     # True once on_request_finished has been signaled to the manager.
+     finished_signaled: bool = False
+ 
+@@ -994,6 +997,7 @@ class OffloadingConnectorScheduler:
+         happens until num_hit_tokens converges.
+         """
+         num_computed_tokens = req_status.num_locally_computed_tokens
++        req_status.full_attention_hit_boundary = 0
+         max_hit_size_tokens: int = req_status.req.num_tokens
+         if max_num_new_tokens is not None:
+             max_hit_size_tokens = min(
+@@ -1023,6 +1027,8 @@ class OffloadingConnectorScheduler:
+         # in the current convergence iteration. Reset when a non-eagle group
+         # tightens the hit boundary, requiring a fresh pop.
+         eagle_verified: set[int] = set()
++        full_attention_confirmed = False
++        full_attention_boundary_recorded = False
+         while lookup_groups:
+             looked_up_sliding_window: bool = False
+             groups_iter = iter(lookup_groups)
+@@ -1058,6 +1064,14 @@ class OffloadingConnectorScheduler:
+                 sliding_window_size_in_chunks = (
+                     group_config.sliding_window_size_in_chunks
+                 )
++                if (
++                    sliding_window_size_in_chunks is not None
++                    and not full_attention_boundary_recorded
++                ):
++                    # Groups before the first sparse group are full attention.
++                    full_attention_boundary_recorded = True
++                    if full_attention_confirmed and not defer_lookup:
++                        req_status.full_attention_hit_boundary = max_hit_size_tokens
+ 
+                 # For eagle groups, query one extra chunk that will be popped.
+                 # Widening applies to every group type: without it, the pop
+@@ -1133,6 +1147,8 @@ class OffloadingConnectorScheduler:
+                         max_hit_size_tokens,
+                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                     )
++                    if sliding_window_size_in_chunks is None:
++                        full_attention_confirmed = True
+ 
+                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                 if new_num_hit_tokens < tokens_per_chunk:
+@@ -1270,6 +1286,27 @@ class OffloadingConnectorScheduler:
+             return None
+         return complete_hit
+ 
++    def _maybe_register_shared_prefix_junction(
++        self, req_status: RequestOffloadState, num_hit_tokens: int
++    ) -> None:
++        """Pin a shared-prefix junction where a sparse group cut the hit.
++
++        Offload-tier counterpart of the junction ``get_computed_blocks`` pins
++        for a local hit: under sparse retention the recompute then retains
++        (and hands off for offload) the sliding-window/Mamba state at the
++        boundary the full-attention groups proved, instead of storing it
++        again at its replay boundary inside the part that differs.
++        """
++        if self.config.retention_interval is None:
++            return
++        boundary = req_status.full_attention_hit_boundary
++        if boundary <= req_status.num_locally_computed_tokens + num_hit_tokens:
++            return
++        request = req_status.req
++        # Never lower a junction the local prefix cache already set.
++        if boundary > request.shared_prefix_boundary:
++            request.shared_prefix_boundary = boundary
++
+     def on_new_request(self, request: Request) -> None:
+         """Called when a new request is added to the scheduler."""
+         req_context = _create_req_context(request)
+@@ -1338,6 +1375,7 @@ class OffloadingConnectorScheduler:
+                     req_status.deferred_lookup_start_time = lookup_start
+             else:
+                 self._maybe_observe_lookup_async_delay(req_status)
++                self._maybe_register_shared_prefix_junction(req_status, num_hit_tokens)
+         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+ 
+         return num_hit_tokens, bool(num_hit_tokens)

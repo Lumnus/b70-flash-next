@@ -1,0 +1,32 @@
+From 979482e2ee34388aa7324e647501e1babd3a69c7 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 11:59:55 +0000
+Subject: [PATCH 34/49] B70-L32-0013 fix: pinned PLE stage/slab allocated on
+ CPU explicitly (model init runs under torch.device(xpu))
+
+---
+ vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+index 24ec26a361..99818a8b0e 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+@@ -109,7 +109,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         self._prefetch_buffer = torch.empty(self._capacity, self._heads, self._storage,
+                                             dtype=torch.uint8, device="xpu")
+         self._stage = torch.zeros(self._capacity, self._heads, self._storage,
+-                                  dtype=torch.uint8, pin_memory=True)
++                                  dtype=torch.uint8, device="cpu", pin_memory=True)
+         if not self._stage.is_pinned():
+             raise RuntimeError("B70 PLE NVMe stage failed to pin")
+         self._stage_np = self._stage.numpy()
+@@ -192,7 +192,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         if capacity < needed:
+             raise RuntimeError(f"B70_PLE_INT8_NVME_CACHE_GIB={total_gib}: {capacity} rows/rank "
+                                f"< {needed} (2 steps x {self._capacity} tokens x own heads)")
+-        slab = torch.empty(capacity, self._storage, dtype=torch.uint8, pin_memory=True)
++        slab = torch.empty(capacity, self._storage, dtype=torch.uint8, device="cpu", pin_memory=True)
+         self._slab = slab
+         self._slab_np = slab.numpy()
+         cache = PleRowCache(tp_end - tp_start, capacity, self._storage, slab=self._slab_np)

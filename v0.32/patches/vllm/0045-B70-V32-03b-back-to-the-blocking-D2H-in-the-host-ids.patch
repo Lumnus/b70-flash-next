@@ -1,0 +1,33 @@
+From 95589bd04e5e232ac8ab206de406cf20b690af8f Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 03:46:42 +0000
+Subject: [PATCH 45/49] B70-V32-03b: back to the blocking D2H in the host-ids
+ producer (event polling bought nothing; unbounded spin)
+
+---
+ vllm/models/qwen4_exp/nvidia/model_state.py | 12 +-----------
+ 1 file changed, 1 insertion(+), 11 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index a8c7ff844e..659f6798f9 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -143,17 +143,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 num_tokens = input_batch.num_tokens
+                 ctx = model_inputs["ngram_context"][:num_reqs]
+                 flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
+-                # A blocking D2H wakes up ~2-3 ms late on this stack; poll an event instead.
+-                host = getattr(self, "_b70_ids_host", None)
+-                if host is None or host.numel() < flat.numel():
+-                    host = self._b70_ids_host = torch.empty(
+-                        max(flat.numel(), 4096), dtype=torch.long, pin_memory=True)
+-                    self._b70_ids_event = torch.xpu.Event()
+-                host[: flat.numel()].copy_(flat, non_blocking=True)
+-                self._b70_ids_event.record()
+-                while not self._b70_ids_event.query():
+-                    pass
+-                flat = host[: flat.numel()].numpy()
++                flat = flat.to("cpu", non_blocking=False).numpy()
+                 _b70p.mark("ple-hash")
+                 ids = module.compute_ngram_ids_host(
+                     flat[:num_tokens],

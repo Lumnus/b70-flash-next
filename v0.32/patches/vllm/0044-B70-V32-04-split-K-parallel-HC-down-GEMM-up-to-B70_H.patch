@@ -1,0 +1,59 @@
+From 0dd9d4c8b3951d241d1e55a23e0089c585a9da80 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 03:44:31 +0000
+Subject: [PATCH 44/49] B70-V32-04: split-K parallel HC down GEMM up to
+ B70_HC_PARALLEL_MAX_ROWS rows (default 32 = wu1ff)
+
+Also (V32-03 follow-up) the host-ids producer polls an event on a pinned buffer instead of a blocking D2H.
+---
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py |  6 +++++-
+ vllm/models/qwen4_exp/nvidia/model_state.py | 12 +++++++++++-
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index 7b2814f296..289555d2fb 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -9,6 +9,10 @@ import torch
+ from vllm.triton_utils import tl, triton
+ 
+ _large_hc = None
++# B70-V32-04: rows up to which the split-K parallel HC GEMM is used (wu1ff: 32). Above it the
++# ordered GEMM runs one serial K=10240 loop over (rows/16 x cols/32) programs: 40 programs at
++# 64 rows, HC 15.7 ms of a 48 ms 8-stream forward. The split-K tile sum is batch-invariant.
++_PARALLEL_MAX_ROWS = int(os.getenv("B70_HC_PARALLEL_MAX_ROWS", "32"))
+ 
+ 
+ @triton.jit(do_not_specialize=["M"])
+@@ -79,7 +83,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
+             _large_hc = torch.ops.long_hc.forward
+         return _large_hc(x, weight, valid_columns, 1)
+     if (
+-        (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
++        (1 <= rows <= 8 or (9 <= rows <= _PARALLEL_MAX_ROWS and inner == 10240))
+         and x.stride(1) == weight.stride(1) == 1
+         and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
+     ):
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 659f6798f9..a8c7ff844e 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -143,7 +143,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 num_tokens = input_batch.num_tokens
+                 ctx = model_inputs["ngram_context"][:num_reqs]
+                 flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
+-                flat = flat.to("cpu", non_blocking=False).numpy()
++                # A blocking D2H wakes up ~2-3 ms late on this stack; poll an event instead.
++                host = getattr(self, "_b70_ids_host", None)
++                if host is None or host.numel() < flat.numel():
++                    host = self._b70_ids_host = torch.empty(
++                        max(flat.numel(), 4096), dtype=torch.long, pin_memory=True)
++                    self._b70_ids_event = torch.xpu.Event()
++                host[: flat.numel()].copy_(flat, non_blocking=True)
++                self._b70_ids_event.record()
++                while not self._b70_ids_event.query():
++                    pass
++                flat = host[: flat.numel()].numpy()
+                 _b70p.mark("ple-hash")
+                 ids = module.compute_ngram_ids_host(
+                     flat[:num_tokens],

@@ -1,0 +1,232 @@
+From d1719dcf8d27860f83f7c802d8f9b1b5451b024c Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 04/49] W032-03: wu1ff verify-c1-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/verify-c1-v032.patch (sha256 6ab5ddaf5e109b22…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/models/qwen4_exp/nvidia/c1_verify.py | 197 ++++------------------
+ 1 file changed, 29 insertions(+), 168 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/c1_verify.py b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+index 3926e2510f..ee51e31514 100644
+--- a/vllm/models/qwen4_exp/nvidia/c1_verify.py
++++ b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+@@ -1,15 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Eager C1 DFlash2 verification with canonical one-token target execution."""
++"""Eager C1 DFlash2 verification with native speculative prefix-state kernels."""
+ 
+-import copy
+-from dataclasses import replace
++from contextlib import contextmanager
+ 
+-import numpy as np
+ import torch
+ 
+-from vllm.config.compilation import CUDAGraphMode
+-from vllm.forward_context import BatchDescriptor, set_forward_context
+-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
++from vllm.distributed import get_tp_group
+ 
+ 
+ def enabled(runner, batch) -> bool:
+@@ -26,169 +22,34 @@ def enabled(runner, batch) -> bool:
+     )
+ 
+ 
+-def conv_view(module, base: int) -> tuple[torch.Tensor, int]:
+-    conv = module.kv_cache[0][base]
+-    if conv.shape[0] > conv.shape[1]:
+-        conv = conv.T
+-    window = getattr(module, "conv_state_len", 3)
+-    capacity = window + 3
+-    return conv[-capacity:] if hasattr(module, "conv_state_len") else conv, window
++@contextmanager
++def canonical_reductions(width):
++    """Keep C1's BF16 XCCL message width while batching target computation.
+ 
++    XCCL changes the BF16 reduction order with the number of rows. Local GEMMs
++    and recurrent kernels remain batched; only these small TP reductions retain
++    the proven one-row collective. Draft execution uses its ordinary reductions.
++    """
++    comm = get_tp_group().device_communicator
++    original = comm.all_reduce
+ 
+-def stage_prefixes(conv, histories, recurrent, states, indices) -> None:
+-    """Retain each logical prefix in the native accepted-column/window layout."""
+-    packed = torch.cat([histories[0], *[h[-1:] for h in histories[1:]]])
+-    conv[: packed.shape[0]].copy_(packed)
+-    if recurrent is not None:
+-        for column, state in enumerate(states):
+-            recurrent[int(indices[column].item())].copy_(state)
++    def reduce(input_):
++        if (
++            input_.dtype == torch.bfloat16
++            and input_.ndim == 2
++            and input_.shape[0] == width
++        ):
++            return torch.cat([original(row) for row in input_.split(1)], dim=0)
++        return original(input_)
+ 
+-
+-def verify(runner, batch, metadata, model_inputs):
+-    # Builders reuse device scratch. Preserve the verification metadata while
+-    # constructing the one-token forwards below.
+-    saved_metadata = {}
+-    for name, meta in metadata.items():
+-        clone = copy.copy(meta)
+-        for key, value in vars(meta).items():
+-            if isinstance(value, torch.Tensor):
+-                setattr(clone, key, value.clone())
+-        saved_metadata[name] = clone
+-    routes = []
+-    context = runner.vllm_config.compilation_config.static_forward_context
+-    for name, meta in saved_metadata.items():
+-        module = context[name]
+-        cache = getattr(module, "kv_cache", None)
+-        if not isinstance(cache, (tuple, list)) or not cache:
+-            continue
+-        indices = meta.spec_state_indices_tensor[0].flatten()
+-        base = int(indices[0].item())
+-        offset = int(meta.num_accepted_tokens[0].item()) - 1
+-        conv, window = conv_view(module, base)
+-        conv[:window].copy_(conv[offset : offset + window].clone())
+-        recurrent = cache[1] if len(cache) == 2 else None
+-        if recurrent is not None:
+-            recurrent[base].copy_(recurrent[int(indices[offset].item())].clone())
+-        routes.append((module, base, indices, [], []))
+-
+-    req = int(batch.idx_mapping[0].item())
+-    positions = batch.positions
+-    start = int(positions[0].item())
+-    width = batch.num_tokens
+-    computed = runner.req_states.num_computed_tokens.gpu[req].clone()
+-    accepted = runner.model_state.num_accepted_tokens_gpu[req].clone()
+-    old_tokens = runner.req_states.all_token_ids.gpu[req, start : start + width].clone()
+-    state_scratch = {
+-        name: value.clone()
+-        for name, value in vars(runner.model_state).items()
+-        if name in ("_mamba_state_idx_gpu", "_mamba_src_col_gpu", "_mamba_src_off_gpu")
+-        and isinstance(value, torch.Tensor)
+-    }
+-    outputs, features = [], []
++    comm.all_reduce = reduce
+     try:
+-        runner.req_states.all_token_ids.gpu[req, start : start + width].copy_(
+-            batch.input_ids
+-        )
+-        for column in range(width):
+-            position = start + column
+-            runner.req_states.num_computed_tokens.gpu[req] = position
+-            runner.model_state.num_accepted_tokens_gpu[req] = 1
+-            qsl = torch.tensor([0, 1], dtype=torch.int32, device=runner.device)
+-            single = replace(
+-                batch,
+-                num_tokens=1,
+-                num_tokens_after_padding=1,
+-                num_scheduled_tokens=np.array([1], np.int32),
+-                num_draft_tokens=0,
+-                num_draft_tokens_per_req=np.array([0], np.int32),
+-                query_start_loc=qsl,
+-                query_start_loc_np=np.array([0, 1], np.int32),
+-                seq_lens=torch.tensor(
+-                    [position + 1], dtype=torch.int32, device=runner.device
+-                ),
+-                seq_lens_cpu_upper_bound=torch.tensor(
+-                    [position + 1], dtype=torch.int32
+-                ),
+-                num_computed_tokens_np=np.array([position], np.int32),
+-                input_ids=batch.input_ids[column : column + 1],
+-                positions=positions[column : column + 1],
+-                is_padding=batch.is_padding[column : column + 1],
+-                logits_indices=torch.zeros(1, dtype=torch.int64, device=runner.device),
+-                cu_num_logits=qsl,
+-                cu_num_logits_np=np.array([0, 1], np.int32),
+-                max_query_len=1,
+-            )
+-            tables = runner.block_tables.gather_block_tables(batch.idx_mapping, 1)
+-            slots = runner.block_tables.compute_slot_mappings(
+-                batch.idx_mapping,
+-                qsl,
+-                single.positions,
+-                1,
+-                out=torch.empty_like(runner.block_tables.slot_mappings),
+-            )
+-            runner.model_state.preprocess_state(
+-                single,
+-                tables,
+-                runner.kv_cache_config,
+-                runner.req_states.num_computed_tokens.gpu,
+-            )
+-            spec_config = runner.vllm_config.speculative_config
+-            try:
+-                runner.vllm_config.speculative_config = None
+-                step_metadata = runner.model_state.prepare_attn(
+-                    single,
+-                    CUDAGraphMode.NONE,
+-                    tables,
+-                    slots,
+-                    runner.attn_groups,
+-                    runner.kv_cache_config,
+-                )
+-            finally:
+-                runner.vllm_config.speculative_config = spec_config
+-            inputs = dict(model_inputs)
+-            inputs.update(input_ids=single.input_ids, positions=single.positions)
+-            if model_inputs.get("inputs_embeds") is not None:
+-                inputs["inputs_embeds"] = model_inputs["inputs_embeds"][
+-                    column : column + 1
+-                ]
+-            inputs.update(runner.model_state.prepare_inputs(single, runner.req_states))
+-            runner.eplb.prepare_forward(runner.model_config, 1, None)
+-            with set_forward_context(
+-                step_metadata,
+-                runner.vllm_config,
+-                num_tokens=1,
+-                batch_descriptor=BatchDescriptor(num_tokens=1),
+-                slot_mapping=build_slot_mappings_by_layer(
+-                    slots, runner.kv_cache_config
+-                ),
+-                is_padding=single.is_padding,
+-            ):
+-                hidden, aux = runner.model(**inputs)
+-            outputs.append(hidden.clone())
+-            features.append([tensor.clone() for tensor in aux])
+-            runner.req_states.num_computed_tokens.gpu[req] = position + 1
+-            runner.model_state.postprocess_state(
+-                batch.idx_mapping,
+-                torch.ones(1, dtype=torch.int32, device=runner.device),
+-                runner.req_states.num_computed_tokens.gpu,
+-            )
+-            for module, base, indices, histories, states in routes:
+-                conv, window = conv_view(module, base)
+-                histories.append(conv[:window].clone())
+-                if len(module.kv_cache) == 2:
+-                    states.append(module.kv_cache[1][base].clone())
+-        for module, base, indices, histories, states in routes:
+-            conv, _ = conv_view(module, base)
+-            recurrent = module.kv_cache[1] if states else None
+-            stage_prefixes(conv, histories, recurrent, states, indices)
+-        return torch.cat(outputs), [torch.cat(parts) for parts in zip(*features)]
++        yield
+     finally:
+-        runner.req_states.num_computed_tokens.gpu[req] = computed
+-        runner.model_state.num_accepted_tokens_gpu[req] = accepted
+-        runner.req_states.all_token_ids.gpu[req, start : start + width].copy_(
+-            old_tokens
+-        )
+-        for name, value in state_scratch.items():
+-            getattr(runner.model_state, name).copy_(value)
+-        metadata.clear()
+-        metadata.update(saved_metadata)
++        comm.all_reduce = original
++
++
++def verify(runner, batch, metadata, model_inputs):
++    """Run anchor plus proposals once and retain every native accepted prefix."""
++    with canonical_reductions(batch.num_tokens):
++        return runner.model(**model_inputs)

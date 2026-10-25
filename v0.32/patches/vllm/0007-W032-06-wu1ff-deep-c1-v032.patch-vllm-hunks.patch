@@ -1,0 +1,152 @@
+From 473afb9f92766116160746fe2eefebeb0326b567 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 07/49] W032-06: wu1ff deep-c1-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/deep-c1-v032.patch (sha256 d1dae47ea1db3e47…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py   | 84 +++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_target_graph.py      | 14 ++++
+ 2 files changed, 98 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index bdb98a5998..b5faeaed18 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Fixed-order BF16 HC down projection with FP32 accumulation."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
+@@ -52,6 +54,12 @@ def ordered_hc_gemm(x, weight, valid_columns):
+     rows, inner = x.shape
+     columns = weight.shape[0]
+     assert inner == weight.shape[1] and 0 < valid_columns <= columns
++    if (
++        1 <= rows <= 8
++        and x.stride(1) == weight.stride(1) == 1
++        and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
++    ):
++        return parallel_hc_gemm(x, weight, valid_columns)
+     output = torch.empty((rows, columns), device=x.device, dtype=x.dtype)
+     _ordered_hc_gemm[(triton.cdiv(rows, 16), triton.cdiv(columns, 32))](
+         x,
+@@ -67,3 +75,79 @@ def ordered_hc_gemm(x, weight, valid_columns):
+         num_stages=2,
+     )
+     return output
++
++
++@triton.jit
++def _hc_partials(
++    x,
++    weight,
++    partials,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    VALID_N: tl.constexpr,
++    XS: tl.constexpr,
++    WS: tl.constexpr,
++):
++    rows = tl.arange(0, 16)
++    cols = tl.program_id(1) * 32 + tl.arange(0, 32)
++    kk = tl.program_id(0) * 128 + tl.arange(0, 128)
++    a = tl.load(
++        x + rows[:, None] * XS + kk[None, :],
++        (rows[:, None] < M) & (kk[None, :] < K),
++        other=0,
++    )
++    b = tl.load(
++        weight + cols[None, :] * WS + kk[:, None],
++        (cols[None, :] < VALID_N) & (kk[:, None] < K),
++        other=0,
++    )
++    value = tl.dot(a, b)
++    tl.store(
++        partials + tl.program_id(0) * M * N + rows[:, None] * N + cols[None, :],
++        value,
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++@triton.jit
++def _hc_finish(partials, output, M: tl.constexpr, N: tl.constexpr, TILES: tl.constexpr):
++    offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
++    value = tl.full((256,), 0, tl.float32)
++    for step in range(TILES):
++        value += tl.load(partials + step * M * N + offsets, offsets < M * N, other=0)
++    tl.store(output + offsets, value, offsets < M * N)
++
++
++def parallel_hc_gemm(x, weight, valid_columns):
++    """BF16 products with deterministic, batch-invariant FP32 tile summation.
++
++    This changes the FP32 addition order from the serial K-loop. It preserves
++    BF16 inputs/output and avoids both atomics and width-dependent reductions.
++    """
++    rows, inner = x.shape
++    columns = weight.shape[0]
++    tiles = triton.cdiv(inner, 128)
++    partials = torch.empty((tiles, rows, columns), dtype=torch.float32, device=x.device)
++    output = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
++    _hc_partials[(tiles, triton.cdiv(columns, 32))](
++        x,
++        weight,
++        partials,
++        rows,
++        columns,
++        inner,
++        valid_columns,
++        x.stride(0),
++        weight.stride(0),
++        num_warps=4,
++    )
++    _hc_finish[(triton.cdiv(rows * columns, 256),)](
++        partials,
++        output,
++        rows,
++        columns,
++        tiles,
++        num_warps=4,
++    )
++    return output
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index 59d7e6a7c7..cf9c8f70d7 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -3,6 +3,7 @@
+ 
+ import copy
+ import dataclasses
++import os
+ from contextlib import contextmanager
+ 
+ import torch
+@@ -65,6 +66,19 @@ def native_rows(width):
+ 
+     def reduce(x):
+         if x.ndim == 2 and x.shape[0] == width and x.dtype == torch.bfloat16:
++            if (
++                comm.world_size == 4
++                and width == 8
++                and x.shape[1] == 2560
++                and os.getenv("CCL_SYCL_ALLREDUCE_LL_THRESHOLD") == "65536"
++                and os.getenv("VLLM_XPU_C1_PARTITIONED_REDUCE", "1") == "1"
++            ):
++                # The native ring changes its BF16 summation order by partition.
++                # Keep each row's quarters in the same rank-owned partition.
++                # Both 5 KiB rows and this 40 KiB batch use the LL ring path.
++                packed = x.reshape(width, 4, -1).transpose(0, 1).contiguous()
++                dist.all_reduce(packed, group=comm.device_group)
++                return packed.transpose(0, 1).contiguous().reshape_as(x)
+             return torch.cat([original(row) for row in x.split(1)])
+         return original(x)
+ 

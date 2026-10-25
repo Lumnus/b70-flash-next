@@ -1,0 +1,27 @@
+From 8d669dc868a1aa42f411e9cef58e2a36d80aacca Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 04:24:02 +0000
+Subject: [PATCH 9/9] B70-V32-06: B70_ASTRA_OWNERSHIP=0 keeps the EP expert
+ layout
+
+---
+ vllm_xpu_kernels/astra_ownership.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
+index 0752c60..6cc77cb 100644
+--- a/vllm_xpu_kernels/astra_ownership.py
++++ b/vllm_xpu_kernels/astra_ownership.py
+@@ -46,6 +46,9 @@ def exchange(tensor, kind, cpu_group):
+ 
+ def prepare(module):
+     global _prepared_layers
++    if _os.getenv("B70_ASTRA_OWNERSHIP", "1") != "1":
++        # B70-V32-06: keep vLLM's EP expert layout (no cyclic group ownership).
++        return
+     if not (
+         module.recipe == 'int4' and module.ep_size == 4
+         and module.num_experts == 128 and module.inter_size == 640
+-- 
+2.43.0
+

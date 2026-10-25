@@ -1,0 +1,348 @@
+From b0828da8426333e7d4e073685182e3cde81187ba Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 09/49] W032-08: wu1ff astra500-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-v032.patch (sha256 ce19b3bc0531f865…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 17 ++++++-
+ vllm/models/qwen4_exp/nvidia/b70_disk.py      | 10 ++--
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py   | 51 ++++++++++++++-----
+ .../qwen4_exp/nvidia/b70_target_attention.py  | 13 ++---
+ .../qwen4_exp/nvidia/b70_target_graph.py      | 47 +++++++++++------
+ vllm/models/qwen4_exp/nvidia/c1_verify.py     |  8 +--
+ 6 files changed, 102 insertions(+), 44 deletions(-)
+
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 516ef13236..0e304ab94a 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -475,6 +475,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     ) -> None:
+         super().__init__(config, vllm_config, prefix)
+ 
++        self._deterministic_prefill_gates = config.model_type == "qwen4_exp_text"
+         self.num_k_heads = config.linear_num_key_heads
+         self.num_v_heads = config.linear_num_value_heads
+         self.head_k_dim = config.linear_key_head_dim
+@@ -1071,7 +1072,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # Part 1: Input Projection
+         # ============================================================
+         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
++        if (
++            self._deterministic_prefill_gates
++            and hidden_states.shape[0] > 8
++            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
++            and self.in_proj_ba.weight.dtype == torch.bfloat16
++            and self.in_proj_ba.bias is None
++        ):
++            # oneDNN's 85-row gate GEMM changes results for identical inputs.
++            # Fixed K order makes cached and fresh prefill reproducible.
++            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
++
++            weight = self.in_proj_ba.weight
++            projected_states_ba = ordered_hc_gemm(hidden_states, weight, weight.shape[0])
++        else:
++            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+ 
+         # ============================================================
+         # Part 2: Core Attention
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_disk.py b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+index 2222daef68..6b74593773 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_disk.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+@@ -85,11 +85,11 @@ def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens)
+     captures = config.compilation_config.cudagraph_capture_sizes or []
+     if (
+         max_total_tokens != s.max_num_batched_tokens
+-        or max_total_tokens != 256
++        or max_total_tokens not in (256, 512, 1024)
+         or any(n <= 0 or n > max_total_tokens for n in captures)
+     ):
+         raise ValueError(
+-            "Phase 1 Disk PLE requires bounded 256-token dispatch/capture capacity"
++            "Disk PLE requires bounded 256/512/1024-token dispatch/capture capacity"
+         )
+     return max_total_tokens
+ 
+@@ -275,7 +275,9 @@ class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
+ 
+     def _fill_stage(self, ids_cpu: torch.Tensor, num_tokens: int) -> None:
+         """CPU-only selected-row gather; pads/non-owned contributions are zero."""
+-        self._stage.zero_()
++        # Only this prefix is copied to the device and consumed by forward.
++        # Clearing unused capacity made decode cost grow with prefill capacity.
++        self._stage[: ids_cpu.shape[0]].zero_()
+         ids = ids_cpu[:num_tokens].reshape(-1)
+         if ids.numel() and (ids.min() < 0 or ids.max() >= self.org_vocab_size):
+             raise ValueError("Disk BF16 PLE received an out-of-table row ID")
+@@ -321,7 +323,7 @@ class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
+             self._owner_stream, self._owner_thread = stream, thread
+             if ngram_ids is None:
+                 # Deterministic dummy contents before warmup/capture; no table IO.
+-                self._stage.zero_()
++                self._stage[:num_tokens_padded].zero_()
+             else:
+                 if (
+                     self._table is None
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index b5faeaed18..427e6bb96c 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -55,7 +55,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
+     columns = weight.shape[0]
+     assert inner == weight.shape[1] and 0 < valid_columns <= columns
+     if (
+-        1 <= rows <= 8
++        (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
+         and x.stride(1) == weight.stride(1) == 1
+         and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
+     ):
+@@ -119,6 +119,22 @@ def _hc_finish(partials, output, M: tl.constexpr, N: tl.constexpr, TILES: tl.con
+     tl.store(output + offsets, value, offsets < M * N)
+ 
+ 
++@triton.jit
++def _hc_partials_batched(x, weight, out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
++             VALID: tl.constexpr, XS: tl.constexpr, WS: tl.constexpr,
++             BK: tl.constexpr, BN: tl.constexpr):
++    rows = tl.program_id(2) * 16 + tl.arange(0, 16)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    kk = tl.program_id(0) * BK + tl.arange(0, BK)
++    a = tl.load(x + rows[:, None] * XS + kk[None, :],
++                (rows[:, None] < M) & (kk[None, :] < K), other=0)
++    b = tl.load(weight + cols[None, :] * WS + kk[:, None],
++                (cols[None, :] < VALID) & (kk[:, None] < K), other=0)
++    y = tl.dot(a, b)
++    tl.store(out + tl.program_id(0) * M * N + rows[:, None] * N + cols[None, :],
++             y, (rows[:, None] < M) & (cols[None, :] < N))
++
++
+ def parallel_hc_gemm(x, weight, valid_columns):
+     """BF16 products with deterministic, batch-invariant FP32 tile summation.
+ 
+@@ -127,21 +143,28 @@ def parallel_hc_gemm(x, weight, valid_columns):
+     """
+     rows, inner = x.shape
+     columns = weight.shape[0]
+-    tiles = triton.cdiv(inner, 128)
++    block_k = 64 if rows > 8 else 128
++    tiles = triton.cdiv(inner, block_k)
+     partials = torch.empty((tiles, rows, columns), dtype=torch.float32, device=x.device)
+     output = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
+-    _hc_partials[(tiles, triton.cdiv(columns, 32))](
+-        x,
+-        weight,
+-        partials,
+-        rows,
+-        columns,
+-        inner,
+-        valid_columns,
+-        x.stride(0),
+-        weight.stride(0),
+-        num_warps=4,
+-    )
++    if rows > 8:
++        _hc_partials_batched[(tiles, triton.cdiv(columns, 32), triton.cdiv(rows, 16))](
++            x, weight, partials, rows, columns, inner, valid_columns,
++            x.stride(0), weight.stride(0), block_k, 32, num_warps=4,
++        )
++    else:
++        _hc_partials[(tiles, triton.cdiv(columns, 32))](
++            x,
++            weight,
++            partials,
++            rows,
++            columns,
++            inner,
++            valid_columns,
++            x.stride(0),
++            weight.stride(0),
++            num_warps=4,
++        )
+     _hc_finish[(triton.cdiv(rows * columns, 256),)](
+         partials,
+         output,
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_attention.py b/vllm/models/qwen4_exp/nvidia/b70_target_attention.py
+index f712ed3b4a..f18f7d8473 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_attention.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_attention.py
+@@ -38,10 +38,10 @@ def fixed_splits(
+         or q.dtype != torch.bfloat16
+         or k.dtype != q.dtype
+         or v.dtype != q.dtype
+-        or cu.numel() != 2
+-        or used.numel() != 1
++        or not 1 <= used.numel() <= 4
++        or cu.numel() != used.numel() + 1
+         or not 1 <= max_query <= 8
+-        or q.shape != (max_query, 6, 256)
++        or q.shape != (max_query * used.numel(), 6, 256)
+         or k.ndim != 4
+         or k.shape[1:] != (832, 1, 256)
+         or v.shape != k.shape
+@@ -60,9 +60,10 @@ def forward(q, k, v, out, used, blocks, max_seq_len, scale, splits):
+         scale = q.shape[-1] ** -0.5
+     cu = torch.arange(width + 1, dtype=torch.int32, device=q.device)
+     dummy = torch.zeros_like(cu)
+-    positions = torch.arange(width, dtype=used.dtype, device=q.device)
+-    lengths = (used.reshape(1) - (width - 1 - positions)).clamp_min(1).int()
+-    tables = blocks.repeat_interleave(width, dim=0)
++    per_request = width // used.numel()
++    positions = torch.arange(per_request, dtype=used.dtype, device=q.device)
++    lengths = (used.reshape(-1, 1) - (per_request - 1 - positions)).reshape(-1).clamp_min(1).int()
++    tables = blocks.repeat_interleave(per_request, dim=0)
+     result, _ = torch.ops._vllm_fa2_C.varlen_fwd(
+         q,
+         k,
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index c83fe18033..14fec2f1a0 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -68,14 +68,14 @@ def native_rows(width):
+         if x.ndim == 2 and x.shape[0] == width and x.dtype == torch.bfloat16:
+             if (
+                 comm.world_size == 4
+-                and width == 8
++                and width % 8 == 0
+                 and x.shape[1] == 2560
+                 and os.getenv("CCL_SYCL_ALLREDUCE_LL_THRESHOLD") == "65536"
+                 and os.getenv("VLLM_XPU_C1_PARTITIONED_REDUCE", "1") == "1"
+             ):
+                 # The native ring changes its BF16 summation order by partition.
+                 # Keep each row's quarters in the same rank-owned partition.
+-                # Both 5 KiB rows and this 40 KiB batch use the LL ring path.
++                # Full 8/16/24/32-row batches preserve this partition order.
+                 packed = x.reshape(width, 4, -1).transpose(0, 1).contiguous()
+                 dist.all_reduce(packed, group=comm.device_group)
+                 return packed.transpose(0, 1).contiguous().reshape_as(x)
+@@ -156,11 +156,19 @@ class TargetGraphs:
+         self.disabled = set()
+         self.replays = 0
+         self.fallbacks = 0
++        self.fallback_reasons = {}
+         self.pool = torch.xpu.graph_pool_handle()
+ 
++    def fallback(self, reason, key):
++        self.fallbacks += 1
++        count = self.fallback_reasons.get(reason, 0) + 1
++        self.fallback_reasons[reason] = count
++        if count == 1 or count % 1024 == 0:
++            logger.warning("Target graph fallback: key=%s reason=%s count=%d", key, reason, count)
++
+     def run(self, runner, batch, metadata, inputs, eager):
+-        # The runner admits one uniform C1 verification. Partial blocks use eager.
+-        if batch.num_tokens != 8:
++        # Uniform eight-row verification for one through four requests.
++        if batch.num_tokens != 8 * batch.num_reqs:
+             return eager(runner, batch, metadata, inputs)
+         if os.getenv("VLLM_XPU_DFLASH_FIXED_SPLITS", "0") in ("32", "64"):
+             # The target split schedule no longer depends on this host bound.
+@@ -170,20 +178,24 @@ class TargetGraphs:
+             bound = max(
+                 512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length()
+             )
+-        if bound in self.disabled:
+-            self.fallbacks += 1
++        key = (batch.num_reqs, bound)
++        if key in self.disabled:
++            self.fallback("disabled", key)
+             return eager(runner, batch, metadata, inputs)
+         context = get_forward_context()
+         current = (inputs, metadata, context.slot_mapping, context.is_padding)
+-        entry = self.entries.get(bound)
++        entry = self.entries.get(key)
+         if entry is not None:
+             try:
+                 update(entry[2], current, set())
+-            except (AssertionError, TypeError, AttributeError):
+-                self.fallbacks += 1
++            except (AssertionError, TypeError, AttributeError) as exc:
++                self.fallback(type(exc).__name__ + ": " + str(exc), key)
+                 return eager(runner, batch, metadata, inputs)
+             entry[0].replay()
+             self.replays += 1
++            if self.replays % 1024 == 0:
++                logger.info("Target graph counters: replays=%d fallbacks=%d key=%s",
++                            self.replays, self.fallbacks, key)
+             return entry[1]
+ 
+         # Capture must never advance the accepted-prefix state. Several layers
+@@ -198,7 +210,7 @@ class TargetGraphs:
+         try:
+             with (
+                 staged_context(context, model_metadata, slots, padding),
+-                native_rows(8),
++                native_rows(batch.num_tokens),
+             ):
+                 runner.model(**model_inputs)
+                 torch.xpu.synchronize()
+@@ -207,21 +219,24 @@ class TargetGraphs:
+                 with torch.xpu.graph(graph, pool=self.pool):
+                     output = runner.model(**model_inputs)
+             restore(routes, initial)
++            del initial
+             graph.replay()
+             torch.xpu.synchronize()
+-            observed_state = save(routes)
++            # Check every state exactly without another full observed-state copy.
+             passed = compare(expected, output) and all(
+-                torch.equal(a, b) for a, b in zip(expected_state, observed_state)
++                torch.equal(value, tensor[indices])
++                for (_, tensor, indices), value in zip(routes, expected_state)
+             )
+             verdict = torch.tensor(int(passed), dtype=torch.int32)
+             dist.all_reduce(
+                 verdict, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
+             )
+             if verdict.item():
+-                self.entries[bound] = (graph, output, static)
++                self.entries[key] = (graph, output, static)
+                 self.replays += 1
+                 logger.info(
+-                    "C1 native target graph ready: width=8, context bound=%d", bound
++                    "Target graph ready: requests=%d, width=%d, context bound=%d",
++                    batch.num_reqs, batch.num_tokens, bound
+                 )
+                 return output
+             logger.warning(
+@@ -230,6 +245,6 @@ class TargetGraphs:
+         except Exception:
+             logger.exception("C1 target graph capture failed at bound %d", bound)
+         restore(routes, expected_state)
+-        self.disabled.add(bound)
+-        self.fallbacks += 1
++        self.disabled.add(key)
++        self.fallback("capture_or_equality_failure", key)
+         return expected
+diff --git a/vllm/models/qwen4_exp/nvidia/c1_verify.py b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+index d499bc5959..0cec114181 100644
+--- a/vllm/models/qwen4_exp/nvidia/c1_verify.py
++++ b/vllm/models/qwen4_exp/nvidia/c1_verify.py
+@@ -20,9 +20,11 @@ def enabled(runner, batch) -> bool:
+         and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
+         and runner.device.type == "xpu"
+         and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
+-        and batch.num_reqs == 1
++        and 1 <= batch.num_reqs <= 4
+         and not batch.has_prefill
+-        and 1 < batch.num_tokens <= 8
++        and ((batch.num_reqs == 1 and 1 < batch.num_tokens <= 8)
++             or (batch.num_tokens == 8 * batch.num_reqs
++                 and (batch.num_scheduled_tokens == 8).all()))
+     )
+ 
+ 
+@@ -68,7 +70,7 @@ def verify_eager(runner, batch, metadata, model_inputs):
+ 
+ 
+ def verify(runner, batch, metadata, model_inputs):
+-    if batch.num_tokens == 8 and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1":
++    if batch.num_tokens == 8 * batch.num_reqs and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1":
+         from .b70_target_graph import TargetGraphs
+ 
+         graphs = getattr(runner, "_c1_target_graphs", None)

@@ -1,0 +1,312 @@
+From 3b8ef6a14826e9b809c86caefd4adc080b735b00 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Fri, 23 Oct 2026 07:02:55 +0000
+Subject: [PATCH 23/49] B70-0055: step trace (host-stamped marks at module
+ boundaries inside the decode XPU graphs), B70_STEP_TRACE
+
+Port of kernels/b70-step-trace/vllm-step-trace.patch from
+github.com/Niluthon/qwen38-flash-tp2@e536e33 (Apache-2.0), unchanged.
+Off unless B70_STEP_TRACE=<libb70_step_trace.so>. Measurement only.
+
+(cherry picked from commit 0795b7532a7c805409244b03fe92df534565934b)
+---
+ vllm/model_executor/b70_step_trace.py | 256 ++++++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py    |  15 ++
+ 2 files changed, 271 insertions(+)
+ create mode 100644 vllm/model_executor/b70_step_trace.py
+
+diff --git a/vllm/model_executor/b70_step_trace.py b/vllm/model_executor/b70_step_trace.py
+new file mode 100644
+index 0000000000..665a18845e
+--- /dev/null
++++ b/vllm/model_executor/b70_step_trace.py
+@@ -0,0 +1,256 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 step trace: host-stamped marks at module boundaries, captured into the decode XPU graphs.
++
++Off unless B70_STEP_TRACE=<path to libb70_step_trace.so> (kernels/b70-step-trace). Measurement only: a mark is a
++single-work-item kernel that publishes a 32-bit code to host memory, where a pinned host thread stamps it with
++CLOCK_MONOTONIC (the B70 has no device-scope clock); marks change no tensor the model reads. Each forward of a
++hooked model writes a begin code (model id, token count), each hooked module a mark when it starts and ends, and
++every all-reduce a mark before and after. Every B70_STEP_TRACE_EVERY engine steps the worker saves the records
++stamped since the last dump to B70_STEP_TRACE_DIR/rank<r>-<n>.pt (report: tools/bench_tp2/step_trace_report.py).
++
++  B70_STEP_TRACE_DEPTH  module depth below a decoder layer that gets marks (0 = the layer only, default 2)
++  code layout: bit 31 = begin, bits 28-30 = model id, bits 0-27 = label slot (begin: token count)
++"""
++import os
++import re
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_LIB = os.environ.get("B70_STEP_TRACE", "")
++_state = None
++_LAYER_RE = re.compile(r"(^|\.)layers\.\d+$")
++
++
++class _Trace:
++    def __init__(self, device: torch.device, rank: int):
++        torch.ops.load_library(_LIB)
++        self.anchor = torch.zeros(1, device=device)
++        self.out = torch.zeros(1 << 22, 2, dtype=torch.int64)
++        self.rank = rank
++        self.labels: list[dict[str, int]] = []  # per model id: label -> slot
++        self.names: list[str] = []
++        self.stack: list[str] = []
++        self.cur = -1  # model id whose forward is running
++        self.ar_count: dict[str, int] = {}
++        self.every = int(os.environ.get("B70_STEP_TRACE_EVERY", "256"))
++        self.dir = os.environ.get("B70_STEP_TRACE_DIR", "/tmp/b70-step-trace")
++        os.makedirs(self.dir, exist_ok=True)
++        self.steps = 0
++        self.dumps = 0
++        # set up the host mailbox and the poller now: the first mark may come during graph capture
++        torch.ops.b70trace.lost(self.anchor)
++        logger.info("B70 step trace on (rank %d): dumps every %d steps to %s", rank, self.every, self.dir)
++
++    def model_id(self, name: str) -> int:
++        self.names.append(name)
++        self.labels.append({})
++        return len(self.names) - 1
++
++    def slot(self, mid: int, label: str) -> int:
++        d = self.labels[mid]
++        s = d.get(label)
++        if s is None:
++            s = len(d)
++            d[label] = s
++        return s
++
++    def begin(self, mid: int, num_tokens: int) -> None:
++        torch.ops.b70trace.mark(self.anchor, (1 << 31) | (mid << 28) | min(int(num_tokens), (1 << 28) - 1))
++
++    def mark(self, mid: int, label: str) -> None:
++        torch.ops.b70trace.mark(self.anchor, (mid << 28) | self.slot(mid, label))
++
++    def dump(self) -> None:
++        torch.xpu.synchronize()
++        n = torch.ops.b70trace.drain(self.anchor, self.out)
++        if n <= 0:
++            return
++        torch.save({"rank": self.rank, "names": self.names, "labels": [dict(d) for d in self.labels],
++                    "recs": self.out[:n].clone(), "lost": torch.ops.b70trace.lost(self.anchor)},
++                   os.path.join(self.dir, f"rank{self.rank}-{self.dumps:04d}.pt"))
++        self.dumps += 1
++
++
++def enabled() -> bool:
++    return bool(_LIB)
++
++
++def _hook_model(tr: _Trace, model: torch.nn.Module, name: str, depth: int) -> int:
++    mid = tr.model_id(name)
++    n = 0
++
++    def pre_top(mod, args, kwargs):
++        num_tokens = 0
++        for key in ("input_ids", "inputs_embeds", "hidden_states"):
++            a = kwargs.get(key)
++            if isinstance(a, torch.Tensor) and a.dim() >= 1:
++                num_tokens = a.shape[0]
++                break
++        else:
++            p = kwargs.get("positions", args[1] if len(args) > 1 else None)
++            if isinstance(p, torch.Tensor):
++                num_tokens = p.shape[-1]
++            elif args and isinstance(args[0], torch.Tensor):
++                num_tokens = args[0].shape[0]
++        tr.begin(mid, num_tokens)
++        tr.cur = mid
++        tr.stack = [name]
++        tr.ar_count = {}
++
++    def post_top(mod, args, kwargs, out):
++        tr.mark(mid, "forward.end")
++
++    model.register_forward_pre_hook(pre_top, with_kwargs=True)
++    model.register_forward_hook(post_top, with_kwargs=True)
++
++    def make(path):
++        # modules shared by target and draft (embedding, lm_head) carry hooks from both: mark only for the model
++        # whose forward is running, so each row only holds its own model's slots
++        def pre(mod, args):
++            if tr.cur != mid:
++                return
++            tr.stack.append(path)
++            tr.mark(mid, path + ":s")
++
++        def post(mod, args, out):
++            if tr.cur != mid:
++                return
++            tr.mark(mid, path + ":e")
++            if tr.stack and tr.stack[-1] == path:
++                tr.stack.pop()
++        return pre, post
++
++    layer_prefixes = [p for p, _ in model.named_modules() if _LAYER_RE.search(p)]
++    for path, mod in model.named_modules():
++        if not path:
++            continue
++        under = next((lp for lp in layer_prefixes if path == lp or path.startswith(lp + ".")), None)
++        if under is not None:
++            rel = path[len(under):].count(".")
++            if rel > depth:
++                continue
++        elif path.count(".") > 3:
++            continue
++        pre, post = make(path)
++        mod.register_forward_pre_hook(pre)
++        mod.register_forward_hook(post)
++        n += 1
++
++    for meth in ("compute_logits", "get_top_tokens"):
++        f = getattr(model, meth, None)
++        if f is None:
++            continue
++
++        def wrapped(*a, _f=f, _m=meth, **k):
++            if tr.cur != mid:
++                return _f(*a, **k)
++            tr.mark(mid, _m + ":s")
++            r = _f(*a, **k)
++            tr.mark(mid, _m + ":e")
++            return r
++        setattr(model, meth, wrapped)
++    return n
++
++
++def install(model: torch.nn.Module, draft: torch.nn.Module | None, device: torch.device, rank: int) -> None:
++    global _state
++    if not enabled() or _state is not None:
++        return
++    tr = _Trace(device, rank)
++    depth = int(os.environ.get("B70_STEP_TRACE_DEPTH", "2"))
++    nt = _hook_model(tr, model, "target", depth)
++    nd = _hook_model(tr, draft, "draft", depth) if draft is not None else 0
++
++    from vllm.distributed.parallel_state import GroupCoordinator
++    orig = GroupCoordinator.all_reduce
++
++    def all_reduce(self, input_):
++        if self.world_size == 1 or not tr.stack:
++            return orig(self, input_)
++        mid = tr.cur
++        where = tr.stack[-1]
++        k = tr.ar_count.get(where, 0)
++        tr.ar_count[where] = k + 1
++        lab = f"{where}/allreduce{k}"
++        tr.mark(mid, lab + ":s")
++        out = orig(self, input_)
++        tr.mark(mid, lab + ":e")
++        return out
++    GroupCoordinator.all_reduce = all_reduce
++    n_wrapped = _wrap_methods(tr, os.environ.get("B70_STEP_TRACE_WRAP", ""))
++    n_wrapped += _wrap_methods(tr, os.environ.get("B70_STEP_TRACE_OPS", ""), ops=True)
++    _state = tr
++    logger.info("B70 step trace: %d target modules and %d draft modules hooked (depth %d), %d methods wrapped",
++                nt, nd, depth, n_wrapped)
++
++
++def _op_mode(tr: "_Trace", base: str):
++    """A dispatch mode that marks every op reaching the dispatcher (top level only: while an op runs, the mode is
++    popped, so ops inside custom ops are not seen). Views cost a mark too (~1.35 us) and show up as tiny entries."""
++    from torch.utils._python_dispatch import TorchDispatchMode
++
++    class _OpMarks(TorchDispatchMode):
++        def __init__(self):
++            super().__init__()
++            self.k = 0
++
++        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
++            kwargs = kwargs or {}
++            name = str(getattr(func, "overloadpacket", func))
++            if "b70trace" in name:
++                return func(*args, **kwargs)
++            lab = f"{tr.stack[-1] if tr.stack else base}#{self.k:02d}:{name}"
++            self.k += 1
++            tr.stack.append(lab)
++            tr.mark(tr.cur, lab + ":s")
++            out = func(*args, **kwargs)
++            tr.mark(tr.cur, lab + ":e")
++            if tr.stack and tr.stack[-1] == lab:
++                tr.stack.pop()
++            return out
++    return _OpMarks()
++
++
++def _wrap_methods(tr: "_Trace", spec: str, ops: bool = False) -> int:
++    """B70_STEP_TRACE_WRAP=module:Class.method,...: marks around methods that are not module forwards.
++    B70_STEP_TRACE_OPS (ops=True): the same, plus a mark around every op the method dispatches."""
++    import importlib
++
++    n = 0
++    for item in filter(None, (s.strip() for s in spec.split(","))):
++        modname, attr = item.split(":")
++        clsname, meth = attr.split(".")
++        cls = getattr(importlib.import_module(modname), clsname)
++        orig = getattr(cls, meth)
++
++        def wrapped(*a, _orig=orig, _name=f"{clsname}.{meth}", **k):
++            if tr.cur < 0 or not tr.stack:
++                return _orig(*a, **k)
++            lab = f"{tr.stack[-1]}>{_name}"
++            tr.stack.append(lab)
++            tr.mark(tr.cur, lab + ":s")
++            try:
++                if ops:
++                    with _op_mode(tr, lab):
++                        return _orig(*a, **k)
++                return _orig(*a, **k)
++            finally:
++                tr.mark(tr.cur, lab + ":e")
++                if tr.stack and tr.stack[-1] == lab:
++                    tr.stack.pop()
++        setattr(cls, meth, wrapped)
++        n += 1
++    return n
++
++
++def on_step() -> None:
++    tr = _state
++    if tr is None:
++        return
++    tr.steps += 1
++    if tr.steps % tr.every == 0:
++        tr.dump()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 60fa3fbf37..56d4e702eb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -427,6 +427,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             time_after_load - time_before_load,
+         )
+ 
++        from vllm.model_executor import b70_step_trace
++
++        if b70_step_trace.enabled():
++            from vllm.distributed import get_tensor_model_parallel_rank
++
++            b70_step_trace.install(
++                self.model,
++                getattr(self.speculator, "model", None),
++                self.device,
++                get_tensor_model_parallel_rank(),
++            )
++
+         # Initialize the components that require the model.
+         self.model_state = init_model_state(
+             self.vllm_config, self.model, self.encoder_cache, self.device
+@@ -1732,6 +1744,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         randomize_inputs: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
++            from vllm.model_executor import b70_step_trace
++
++            b70_step_trace.on_step()
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)

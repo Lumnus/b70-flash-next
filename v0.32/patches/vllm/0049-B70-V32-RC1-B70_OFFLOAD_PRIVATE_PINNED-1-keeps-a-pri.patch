@@ -1,0 +1,54 @@
+From 103f2f2eb94074e91e91f0c13652272f819bef70 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 07:28:09 +0000
+Subject: [PATCH 49/49] B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a
+ private USM-host KV offload pool per rank on XPU
+
+The shared /dev/shm region is only host-registered, which SYCL reports as
+usm::alloc::unknown, so swap_blocks_batch stages every CPU->GPU load through
+torch caching-host-allocator blocks that stay cached (3.25 GiB/rank measured
+after one kvreplay; ~13 GiB host). A private pinned pool is copied directly
+(snapshot_src=False path) and needs no large /dev/shm.
+---
+ vllm/v1/kv_offload/cpu/spec.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index c26cd32f97..3b2559387d 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any
+ 
+ from typing_extensions import override
+@@ -23,6 +24,10 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ 
+ 
++def envs_b70_private_pinned() -> bool:
++    return os.environ.get("B70_OFFLOAD_PRIVATE_PINNED", "0") == "1"
++
++
+ def _all_workers_barrier() -> None:
+     """Block until every worker rank has reached this point (gloo cpu group).
+ 
+@@ -161,6 +166,16 @@ class CPUOffloadingSpec(OffloadingSpec):
+     def _uses_shared_region(self) -> bool:
+         """Whether the worker CPU buffer is the shared mmap region (vs a private
+         per-rank tensor); replicated-layout dedup is gated on this being True."""
++        # B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a private pinned (USM
++        # host) tensor per rank on XPU, as 0.30 did. The shared /dev/shm region
++        # is only host-registered (prepare_for_device_copy), which SYCL reports
++        # as usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch
++        # goes through a pinned staging buffer from torch's caching host
++        # allocator; those power-of-two blocks stay cached (measured 3.25 GiB
++        # per rank after one kvreplay). A USM host pool is copied directly
++        # (kernels PR3 path, snapshot_src=False) and needs no /dev/shm.
++        if current_platform.is_xpu() and envs_b70_private_pinned():
++            return False
+         return (
+             current_platform.is_cuda_alike() and not current_platform.is_rocm()
+         ) or current_platform.is_xpu()

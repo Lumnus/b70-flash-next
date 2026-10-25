@@ -1,0 +1,1161 @@
+From 9deca43090fd4c387ad35818241cfab3495d8651 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:24 +0000
+Subject: [PATCH 02/49] W032-01: wu1ff target-v032.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/target-v032.patch (sha256 b6907e3ab1921cb1…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/_xpu_ops.py                              |   9 +-
+ vllm/model_executor/layers/linear.py          |   3 +
+ vllm/models/qwen4_exp/__init__.py             |   2 +-
+ vllm/models/qwen4_exp/intel_checkpoint.py     |  52 +++
+ vllm/models/qwen4_exp/nvidia/b70_disk.py      | 380 ++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   | 315 +++++++++++++++
+ .../qwen4_exp/nvidia/dflash2_features.py      |  52 +++
+ vllm/models/qwen4_exp/nvidia/model.py         |  35 +-
+ vllm/models/qwen4_exp/nvidia/model_state.py   |  35 ++
+ .../qwen4_exp/nvidia/ngram_embedding.py       |  14 +
+ 10 files changed, 892 insertions(+), 5 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/intel_checkpoint.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_disk.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/dflash2_features.py
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index 166534e5b1..ccdb1139e4 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -2,9 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Callable
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ import torch
++import vllm_xpu_kernels
+ from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+ from vllm_xpu_kernels.rotary import apply_rotary_emb
+ 
+@@ -16,6 +18,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ logger = init_logger(__name__)
+ 
++# Rebuilt against the pinned 0.1.15.4 headers and Torch 2.14 ABI.
++torch.ops.load_library(
++    str(Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so"))
++)
++
+ if TYPE_CHECKING:
+ 
+     def register_fake(fn):
+@@ -230,7 +237,7 @@ def _gdn_attention_core_xpu_impl(
+         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+     )
+ 
+-    torch.ops._xpu_C.gdn_attention(
++    torch.ops._gdn_index64.gdn_attention(
+         core_attn_out,
+         z,
+         projected_states_qkvz,
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 65cda325a2..521f41752f 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -218,6 +218,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
+             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
+             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
+             # bitwise reproducible. Off by default.
++            prepare_hc = getattr(layer, "hc_ksplit_prepare", None)
++            if prepare_hc is not None:
++                prepare_hc()
+             weight = layer.weight.data
+             if (
+                 envs.VLLM_XPU_FORCE_N_CONTIG_WEIGHT
+diff --git a/vllm/models/qwen4_exp/__init__.py b/vllm/models/qwen4_exp/__init__.py
+index 9e533e28b4..8c3e9bb594 100644
+--- a/vllm/models/qwen4_exp/__init__.py
++++ b/vllm/models/qwen4_exp/__init__.py
+@@ -27,7 +27,7 @@ def __getattr__(name: str) -> Any:
+     }:
+         from vllm.platforms import current_platform
+ 
+-        if current_platform.is_xpu() or current_platform.is_tpu():
++        if current_platform.is_tpu():
+             raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
+         if current_platform.is_rocm():
+             from .amd.model import (
+diff --git a/vllm/models/qwen4_exp/intel_checkpoint.py b/vllm/models/qwen4_exp/intel_checkpoint.py
+new file mode 100644
+index 0000000000..7e5f966145
+--- /dev/null
++++ b/vllm/models/qwen4_exp/intel_checkpoint.py
+@@ -0,0 +1,52 @@
++# Copyright Wulf. Qwen model data remains under the Qwen Community License 1.0.
++"""Pinned Intel PLE layout and bounded private mapping; no model conversion."""
++import json
++import mmap
++import os
++import struct
++
++PLE_FILE = 'model-00016-of-00017.safetensors'
++PLE_PREFIX = 'model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_'
++PLE_ROWS = 2500012
++PLE_WIDTH = 160
++PLE_SHARDS = 128
++PLE_BYTES = PLE_ROWS * PLE_WIDTH * 2
++PLE_OFFSET = 20736
++PLE_FILE_BYTES = 102400512256
++
++
++def ple_layout(path):
++    """Reject changed dtype, numeric shard order, gaps, overlaps and truncation."""
++    with open(path, 'rb') as stream:
++        if os.fstat(stream.fileno()).st_size != PLE_FILE_BYTES:
++            raise ValueError('Intel PLE file size differs from the pinned layout')
++        size = struct.unpack('<Q', stream.read(8))[0]
++        if size != PLE_OFFSET - 8:
++            raise ValueError('Intel PLE header size differs from the pinned layout')
++        header = json.loads(stream.read(size))
++    names = {PLE_PREFIX + str(i) + '.weight' for i in range(PLE_SHARDS)}
++    if set(header) - {'__metadata__'} != names:
++        raise ValueError('Intel PLE tensor inventory differs from the pinned layout')
++    for i in range(PLE_SHARDS):
++        entry = header[PLE_PREFIX + str(i) + '.weight']
++        if (entry['dtype'] != 'BF16' or entry['shape'] != [PLE_ROWS, PLE_WIDTH]
++                or entry['data_offsets'] != [i * PLE_BYTES, (i + 1) * PLE_BYTES]):
++            raise ValueError('Invalid Intel PLE numeric shard layout: ' + str(i))
++    if PLE_OFFSET + PLE_SHARDS * PLE_BYTES > PLE_FILE_BYTES:
++        raise ValueError('Intel PLE payload is truncated')
++    return PLE_OFFSET, PLE_SHARDS * PLE_ROWS, PLE_WIDTH
++
++
++def map_ple_table(path):
++    """Return tensor plus mapping owner; caller protects the mapping before use."""
++    import torch
++    offset, rows, width = ple_layout(path)
++    aligned = offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
++    delta = offset - aligned
++    with open(path, 'rb') as stream:
++        owner = mmap.mmap(stream.fileno(), delta + rows * width * 2,
++                          flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ | mmap.PROT_WRITE,
++                          offset=aligned)
++    table = torch.frombuffer(owner, dtype=torch.bfloat16, count=rows * width,
++                             offset=delta).view(rows, width)
++    return {'mapping': owner, 'table': table}
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_disk.py b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+new file mode 100644
+index 0000000000..4bcf7d6d4e
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_disk.py
+@@ -0,0 +1,380 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bounded BF16 Disk PLE ported from the corrected 1.0.4 release.
++
++The mapping, selected-row gather, TP ownership and DMA/graph lifetime fences
++retain the qualified semantics. v0.32 uses the split start/finalize API.
++"""
++
++import ctypes
++import os
++import threading
++from typing import ClassVar
++
++import torch
++
++from vllm.compilation.breakable_cudagraph import eager_break_during_capture
++from vllm.config import get_current_vllm_config
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++
++from ..common.ngram_embedding import (
++    Qwen4ExpPLEEmbedding,
++    Qwen4ExpPLEEmbeddingMethod,
++    Qwen4ExpPLEPinnedHostEmbedding,
++    Qwen4ExpPLEUnquantizedEmbeddingMethod,
++)
++
++logger = init_logger(__name__)
++_disk_bf16_quarantine: list[object] = []
++
++
++def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens):
++    config = get_current_vllm_config()
++    p, s = config.parallel_config, config.scheduler_config
++    if (
++        not current_platform.is_xpu()
++        or params_dtype != torch.bfloat16
++        or not isinstance(embedding_method, Qwen4ExpPLEUnquantizedEmbeddingMethod)
++        or not os.environ.get("PLE_TABLE_PATH")
++        or p.tensor_parallel_size != 4
++        or not p.enable_expert_parallel
++        or p.pipeline_parallel_size != 1
++        or p.data_parallel_size != 1
++        or p.use_ubatching
++        or p.use_sequence_parallel_moe
++        or p.enable_hc_sp
++        or p.decode_context_parallel_size != 1
++        or p.prefill_context_parallel_size != 1
++        or s.max_num_seqs != 4
++        or config.speculative_config is not None
++    ):
++        raise ValueError(
++            "Phase 1 Disk PLE requires target-only BF16 TP4+EP/PP1/DP1, four slots"
++        )
++    if any(
++        os.environ.get(n) == "1"
++        for n in (
++            "B70_PLE_DIRECT_PINNED",
++            "B70_PLE_FP8",
++            "B70_PLE_INT8",
++            "B70_PLE_INT8_NVME",
++            "B70_PLE_INT8_NVME_LOOKAHEAD",
++            "VLLM_PLE_CPU_OFFLOAD",
++        )
++    ):
++        raise ValueError("Conflicting PLE storage mode")
++    captures = config.compilation_config.cudagraph_capture_sizes or []
++    if (
++        max_total_tokens != s.max_num_batched_tokens
++        or max_total_tokens != 256
++        or any(n <= 0 or n > max_total_tokens for n in captures)
++    ):
++        raise ValueError(
++            "Phase 1 Disk PLE requires bounded 256-token dispatch/capture capacity"
++        )
++    return max_total_tokens
++
++
++def _protect_disk_bf16_mapping(table: torch.Tensor, path: str) -> None:
++    """Make the torch-owned file mapping read-only, without touching its pages."""
++    page_size = os.sysconf("SC_PAGE_SIZE")
++    start = table.data_ptr() // page_size * page_size
++    end = (
++        (table.data_ptr() + table.numel() * table.element_size() + page_size - 1)
++        // page_size
++        * page_size
++    )
++    stat = os.stat(path)
++    cursor = start
++    with open("/proc/self/maps") as maps:
++        for line in maps:
++            fields = line.split(maxsplit=5)
++            left, right = (int(value, 16) for value in fields[0].split("-"))
++            if right <= cursor or left >= end:
++                continue
++            major, minor = (int(value, 16) for value in fields[3].split(":"))
++            if (
++                left > cursor
++                or "p" not in fields[1]
++                or int(fields[4]) != stat.st_ino
++                or os.makedev(major, minor) != stat.st_dev
++            ):
++                raise ValueError(
++                    "PLE tensor is not a private mmap of the selected BF16 file"
++                )
++            cursor = min(right, end)
++    if cursor != end:
++        raise ValueError("PLE tensor mapping does not cover the selected BF16 table")
++    libc = ctypes.CDLL(None, use_errno=True)
++    libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++    libc.mprotect.restype = ctypes.c_int
++    if libc.mprotect(start, end - start, 1) != 0:  # PROT_READ
++        raise OSError(ctypes.get_errno(), "Cannot protect BF16 PLE mmap")
++
++
++class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
++    """Immutable torch mmap plus one serialized, bounded XPU DMA stage.
++
++    Only the producer changes. The inherited forward still reduces owned
++    contributions and copies into graph-owned output before GPU PLE math.
++    """
++
++    disk_bf16: ClassVar[bool] = True
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        *,
++        params_dtype: torch.dtype,
++        padding_size: int,
++        prefix: str,
++        embedding_method: Qwen4ExpPLEEmbeddingMethod,
++        num_ngram_heads: int = 1,
++        max_total_tokens: int = 0,
++        data_parallel_rank: int = 0,
++        reduce_results: bool = True,
++    ) -> None:
++        capacity = _validate_disk_bf16_config(
++            embedding_method,
++            params_dtype,
++            max_total_tokens,
++        )
++        if (num_embeddings, embedding_dim, num_ngram_heads) != (320001536, 160, 16):
++            raise ValueError(
++                "Disk BF16 PLE supports only the original B70 table layout"
++            )
++        Qwen4ExpPLEEmbedding.__init__(
++            self,
++            num_embeddings,
++            embedding_dim,
++            params_dtype=params_dtype,
++            padding_size=padding_size,
++            prefix=prefix,
++            embedding_method=embedding_method,
++            num_ngram_heads=num_ngram_heads,
++            max_total_tokens=max_total_tokens,
++            data_parallel_rank=data_parallel_rank,
++            reduce_results=reduce_results,
++        )
++        if self.etp_data_parallel_size != 1 or self.tp_size != 4:
++            raise ValueError("Disk BF16 PLE requires ETP=TP=4")
++        self._stream_mod = torch.xpu
++        self._capacity = capacity
++        self._heads = num_ngram_heads
++        self._output_dim = num_ngram_heads * embedding_dim
++        self._prefetch_buffer = torch.empty(
++            capacity,
++            num_ngram_heads,
++            embedding_dim,
++            dtype=params_dtype,
++            device="xpu",
++        )
++        self._stage = torch.empty(
++            capacity,
++            num_ngram_heads,
++            embedding_dim,
++            dtype=params_dtype,
++            device="cpu",
++            pin_memory=True,
++        )
++        if not self._stage.is_pinned():
++            raise RuntimeError("Disk BF16 PLE stage failed to pin on XPU")
++        self._mmap_owner = None
++        self._table = None
++        self._pending = False
++        self._copy_event = torch.xpu.Event()
++        self._owner_stream = None
++        self._owner_thread = None
++        self._lock = threading.Lock()
++        self._failed = False
++        self._closed = False
++        self._generation = 0
++        self._prepared_tokens = 0
++
++    def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
++        # Metadata/loaded-name compatibility only: never reserve a TP shard.
++        return torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
++
++    def weight_loader(self, *args, **kwargs) -> None:
++        raise RuntimeError("Disk BF16 PLE rejects checkpoint row-shards and reloads")
++
++    def load_mmap(self, path: str) -> None:
++        if self._mmap_owner is not None or self._closed or self._failed:
++            raise RuntimeError("Disk BF16 PLE rejects mmap reload")
++        from ..intel_checkpoint import map_ple_table
++
++        owner = map_ple_table(path)
++        table = owner["table"] if isinstance(owner, dict) else owner
++        if (
++            not isinstance(table, torch.Tensor)
++            or table.device.type != "cpu"
++            or table.dtype != torch.bfloat16
++            or tuple(table.shape) != (self.org_vocab_size, self.embedding_dim)
++            or not table.is_contiguous()
++            or table.requires_grad
++            or table.is_pinned()
++        ):
++            raise ValueError(
++                "Disk BF16 PLE requires an exact contiguous CPU BF16 table"
++            )
++        _protect_disk_bf16_mapping(table, path)
++        self._mmap_owner = owner
++        self._table = table
++        logger.info(
++            "Disk BF16 PLE mmap ready: shape=%s, capacity=%d, pinned_stage_bytes=%d, "
++            "weight_elements=%d, tp_range=[%d,%d)",
++            tuple(table.shape),
++            self._capacity,
++            self._stage.numel() * self._stage.element_size(),
++            self.weight.numel(),
++            self.shard_indices.org_vocab_start_index,
++            self.shard_indices.org_vocab_end_index,
++        )
++
++    def _check_capacity(self, num_tokens: int) -> None:
++        if not 0 <= num_tokens <= self._capacity:
++            raise ValueError(
++                f"Disk BF16 PLE stage overflow: {num_tokens} > {self._capacity}"
++            )
++        if self._closed or self._failed:
++            raise RuntimeError("Disk BF16 PLE stage is closed or quarantined")
++        if self._stream_mod.is_current_stream_capturing():
++            raise RuntimeError(
++                "Disk BF16 PLE host preparation cannot run inside capture"
++            )
++
++    def _wait_for_stage(self) -> None:
++        if self._pending:
++            try:
++                self._copy_event.synchronize()
++            except BaseException:
++                self._failed = True
++                _disk_bf16_quarantine.append(self)
++                raise
++            self._pending = False
++
++    def _fill_stage(self, ids_cpu: torch.Tensor, num_tokens: int) -> None:
++        """CPU-only selected-row gather; pads/non-owned contributions are zero."""
++        self._stage.zero_()
++        ids = ids_cpu[:num_tokens].reshape(-1)
++        if ids.numel() and (ids.min() < 0 or ids.max() >= self.org_vocab_size):
++            raise ValueError("Disk BF16 PLE received an out-of-table row ID")
++        owned = (ids >= self.shard_indices.org_vocab_start_index) & (
++            ids < self.shard_indices.org_vocab_end_index
++        )
++        # Advanced indexing allocates at most dispatch capacity, never a shard.
++        self._stage[:num_tokens].view(-1, self.embedding_dim)[owned] = self._table[
++            ids[owned]
++        ]
++
++    def prepare(
++        self, ngram_ids: torch.Tensor | None, num_tokens: int, num_tokens_padded: int
++    ) -> None:
++        """Refresh the fixed GPU producer outside forward, including FULL replay."""
++        self._check_capacity(num_tokens_padded)
++        if not 0 <= num_tokens <= num_tokens_padded:
++            raise ValueError("Disk BF16 PLE invalid actual/padded token counts")
++        if not self._lock.acquire(blocking=False):
++            raise RuntimeError("Concurrent Disk BF16 PLE stage preparation")
++        try:
++            stream = self._stream_mod.current_stream()
++            thread = threading.get_ident()
++            # The worker RPC loop serializes prepare -> forward/replay. Host
++            # ownership may change only between these submitted dispatches.
++            # Recheck after acquiring the lock: close/failure may have raced us.
++            self._check_capacity(num_tokens_padded)
++            self._wait_for_stage()  # CPU DMA source must be safe before refill.
++            if self._owner_stream is not None and (
++                stream != self._owner_stream or thread != self._owner_thread
++            ):
++                # The copy event precedes the model's GPU reads. Drain the OLD
++                # stream as well, including FULL replay which bypasses Python.
++                # This occurs only on ownership changes, outside capture; the
++                # ordinary same-owner path retains current-stream ordering.
++                try:
++                    self._owner_stream.synchronize()
++                except BaseException:
++                    self._failed = True
++                    _disk_bf16_quarantine.append(self)
++                    raise
++            # Publish the new owner only after both fences have succeeded.
++            self._owner_stream, self._owner_thread = stream, thread
++            if ngram_ids is None:
++                # Deterministic dummy contents before warmup/capture; no table IO.
++                self._stage.zero_()
++            else:
++                if (
++                    self._table is None
++                    or ngram_ids.dtype != torch.int64
++                    or tuple(ngram_ids.shape) != (num_tokens_padded, self._heads)
++                    or ngram_ids.device != self._prefetch_buffer.device
++                ):
++                    raise ValueError(
++                        "Disk BF16 PLE missing mmap or invalid dispatch IDs"
++                    )
++                ids_cpu = ngram_ids.to(device="cpu", non_blocking=False)
++                self._fill_stage(ids_cpu, num_tokens)
++            if num_tokens_padded:
++                # Same-stream ordering prevents overwrite while a previous graph
++                # reads the GPU buffer. The event protects the CPU source.
++                self._pending = True
++                try:
++                    self._prefetch_buffer[:num_tokens_padded].copy_(
++                        self._stage[:num_tokens_padded],
++                        non_blocking=True,
++                    )
++                    self._copy_event.record(stream)
++                except BaseException:
++                    self._failed = True
++                    _disk_bf16_quarantine.append(self)
++                    raise
++            self._generation += 1
++            self._prepared_tokens = num_tokens_padded
++        finally:
++            self._lock.release()
++
++    def start_prefetch(self, ngram_ids) -> None:
++        return None
++
++    @eager_break_during_capture
++    def _finalize_prefetch(self, prefetch_output, output) -> None:
++        if self._closed or self._failed or self._prepared_tokens != output.shape[0]:
++            raise RuntimeError(
++                "Disk BF16 PLE consumer has no matching prepared dispatch"
++            )
++        embeddings = self._reduce_etp_embeddings(prefetch_output[: output.shape[0]])
++        output.copy_(embeddings.flatten(-2))
++
++    def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
++        output = self._prefetch_buffer.new_empty((total_tokens, self._output_dim))
++        self._finalize_prefetch(self._prefetch_buffer, output)
++        return output
++
++    def close(self) -> None:
++        # Worker lifetime owns all buffers. Explicit teardown fences before free.
++        if getattr(self, "_closed", True):
++            return
++        if not self._lock.acquire(blocking=False):
++            raise RuntimeError("Cannot close a busy Disk BF16 PLE stage")
++        try:
++            if self._failed:
++                raise RuntimeError("Cannot release a quarantined Disk BF16 PLE stage")
++            self._wait_for_stage()
++            # Also drain graph readers of the GPU destination.
++            if self._owner_stream is not None:
++                try:
++                    self._owner_stream.synchronize()
++                except BaseException:
++                    self._failed = True
++                    _disk_bf16_quarantine.append(self)
++                    raise
++            self._closed = True
++        finally:
++            self._lock.release()
++
++    def __del__(self):
++        try:
++            self.close()
++        except BaseException:
++            _disk_bf16_quarantine.append(self)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+new file mode 100644
+index 0000000000..0f426693b6
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -0,0 +1,315 @@
++# Modified by Wulf for B70 Flash-Next Disk; upstream terms are retained.
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""HyperConnection (Gated Residual) utilities — NVIDIA model variant.
++
++Implements the HyperConnection residual scheme proposed in
++"HyperConnections" (https://arxiv.org/abs/2409.19606). This NVIDIA variant
++delays each HC combine to the following HC mix boundary. HC glue kernels,
++including fused combine+RMSNorm, live in ``ops/hc.py``; projections remain
++standard vLLM Linear modules.
++
++Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
++(HC outer, HS inner — checkpoint-native layout).
++
++Typical usage inside a transformer decoder layer::
++
++    self.attn_hc = GatedResidual(hc_config)
++
++    hidden_states, block_input, injection = self.attn_hc.mix(hidden_states)
++    attention_output = attention(block_input)
++    hidden_states, block_input, injection = self.mlp_hc.combine_and_mix(
++        hidden_states, attention_output, injection
++    )
++"""
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import (
++    MergedColumnParallelLinear,
++    ReplicatedLinear,
++)
++from vllm.model_executor.models.utils import maybe_prefix
++
++from ..common.hyperconnection import (
++    GroupedGemmaRMSNorm,
++    HyperConnectionConfig,
++)
++from .ops.hc import (
++    grouped_gemma_rmsnorm,
++    hc_combine,
++    hc_combine_norm,
++    hc_gate_mix,
++    hc_silu,
++)
++
++logger = init_logger(__name__)
++
++
++def _is_xpu() -> bool:
++    from vllm.platforms import current_platform
++
++    return current_platform.is_xpu()
++
++
++# ---------------------------------------------------------------------------
++# XPU HC down-GEMM determinism (K-split)
++#
++# The skinny BF16 HC down projection (K = hyper_hidden_size = 10240 -> N in
++# {336 merged, 320 final mixer}) is run-to-run racy on XPU for row widths
++# > 64: the oneDNN accumulation re-samples its split-K draw every execution,
++# which is what made PIECEWISE-256 prefill replay diverge from eager
++# (bitwise-equal inputs, few-ULP output flips). Replacing the single GEMM
++# with two K=5120 GEMMs over contiguous weight halves is bitwise-deterministic
++# in eager, fresh-clone and graph capture+replay at every width tested
++# (M in {64, 128, 256}; 0/512 flips at M=256). See
++# docs/HC_DOWN_GEMM_FIX_RECON.md for the offline campaign.
++#
++# Widths <= 64 keep the stock single GEMM (bitwise-clean there, and decode
++# graphs never exceed 8 rows, so M1 FULL decode keeps stock numerics).
++# CUDA is untouched: the halves are prepared only on XPU
++# (UnquantizedLinearMethod.process_weights_after_loading calls the
++# ``hc_ksplit_prepare`` marker set below), so the split branch is never
++# armed on non-XPU platforms.
++# ---------------------------------------------------------------------------
++_HC_KSPLIT_MAX_STOCK_WIDTH = 64
++_HC_KSPLIT_WIDTHS_LOGGED: set[int] = set()
++
++
++# ---------------------------------------------------------------------------
++# Gated-residual variant
++# ---------------------------------------------------------------------------
++class GatedResidual(nn.Module):
++    """Gated HyperConnection with learnable low-rank mixing and injection.
++
++    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
++    low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
++    over the HC streams). When passed a pending block output, it fuses its
++    residual combine with the RMSNorm. A missing injection selects unit-weight
++    combine. Final mixers use ``use_combine=False`` and do not produce a new
++    injection.
++
++    Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
++    are vLLM Linear modules (merged replicated linear for down+inject), so
++    GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
++    standard quant_method mechanism.
++    """
++
++    def __init__(
++        self,
++        config: HyperConnectionConfig,
++        use_combine: bool = True,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.config = config
++        self.lora_rank = config.hc_lowrank
++        self.hc_count = config.hc_count
++        self.hidden_size = config.hidden_size
++        self.use_combine = use_combine
++
++        norm_size = (
++            self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
++        )
++        group_size = config.hidden_size if config.hc_per_branch_norm else None
++        # Normalize each H-sized HC stream independently while retaining a
++        # separate affine weight for every element of the HC*H layout.
++        self.hc_norm = GroupedGemmaRMSNorm(
++            norm_size,
++            eps=config.rms_norm_eps,
++            group_size=group_size,
++            dtype=config.params_dtype,
++        )
++
++        # -- vLLM Linear weights --------------------------------------------
++        # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
++        # good alignment and performant implementation chosen by CuBLAS heuristics.
++        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
++        if use_combine:
++            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
++                self.hyper_hidden_size,
++                [self.lora_rank, self.hc_count]
++                + ([self.pad_size] if self.pad_size else []),
++                bias=False,
++                params_dtype=config.params_dtype,
++                quant_config=None,
++                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
++                return_bias=False,
++                disable_tp=True,
++            )
++        else:
++            self.input_mix_weight_down = ReplicatedLinear(
++                self.hyper_hidden_size,
++                self.lora_rank,
++                bias=False,
++                params_dtype=config.params_dtype,
++                quant_config=None,
++                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
++                return_bias=False,
++            )
++        self.input_mix_weight_up = ReplicatedLinear(
++            self.lora_rank,
++            self.hyper_hidden_size,
++            bias=False,
++            params_dtype=config.params_dtype,
++            quant_config=None,
++            prefix=maybe_prefix(prefix, "input_mix_weight_up"),
++            return_bias=False,
++        )
++
++        # -- XPU deterministic K-split state --------------------------------
++        # Contiguous K=5120 halves of the down weight, prepared once at load
++        # time on XPU only (see _prepare_kdown_ksplit). ``None`` everywhere
++        # else, which keeps the stock single GEMM armed.
++        self._kdown_lo: torch.Tensor | None = None
++        self._kdown_hi: torch.Tensor | None = None
++        self._kdown_k = 0
++        down_linear = (
++            self.input_mix_weight_down_block_inject
++            if use_combine
++            else self.input_mix_weight_down
++        )
++        # Marker consumed by
++        # UnquantizedLinearMethod.process_weights_after_loading (XPU only).
++        down_linear.hc_ksplit_prepare = self._prepare_kdown_ksplit
++
++    def _prepare_kdown_ksplit(self) -> None:
++        """One-time contiguous K-half prep for the deterministic XPU split."""
++        if self._kdown_lo is not None:
++            return
++        down_linear = (
++            self.input_mix_weight_down_block_inject
++            if self.use_combine
++            else self.input_mix_weight_down
++        )
++        weight = down_linear.weight
++        if weight is None or weight.ndim != 2 or weight.shape[1] % 2 != 0:
++            logger.debug(
++                "HC down GEMM %s: unexpected weight geometry %s; K-split left disarmed",
++                type(down_linear).__name__,
++                None if weight is None else tuple(weight.shape),
++            )
++            return
++        self._kdown_k = weight.shape[1] // 2
++        self._kdown_lo = weight.data[:, : self._kdown_k].contiguous()
++        self._kdown_hi = weight.data[:, self._kdown_k :].contiguous()
++        logger.debug(
++            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d)",
++            weight.shape[1],
++            self._kdown_k,
++            weight.shape[0],
++        )
++
++    def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
++        """Down projection; width-gated deterministic K-split on XPU.
++
++        Row widths <= 64 (all decode graphs) keep the stock single GEMM,
++        which is bitwise-clean there. Wider rows (prefill chunks) take the
++        two-GEMM split over the contiguous K-halves. The branch conditions
++        are shape/attribute reads only, so stream capture bakes the correct
++        arm per graph and replays deterministically.
++        """
++        if (
++            self._kdown_lo is not None
++            and _is_xpu()
++            and xn.shape[0] > _HC_KSPLIT_MAX_STOCK_WIDTH
++        ):
++            width = xn.shape[0]
++            if width not in _HC_KSPLIT_WIDTHS_LOGGED:
++                _HC_KSPLIT_WIDTHS_LOGGED.add(width)
++                logger.info(
++                    "HC down GEMM: deterministic K-split engaged at row width "
++                    "%d (stock single GEMM kept for widths <= %d)",
++                    width,
++                    _HC_KSPLIT_MAX_STOCK_WIDTH,
++                )
++            return F.linear(xn[..., : self._kdown_k], self._kdown_lo) + F.linear(
++                xn[..., self._kdown_k :], self._kdown_hi
++            )
++        if self.use_combine:
++            return self.input_mix_weight_down_block_inject(xn)
++        return self.input_mix_weight_down(xn)
++
++    def mix(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        xn = grouped_gemma_rmsnorm(
++            hidden_states,
++            self.hc_norm.weight,
++            self.config.rms_norm_eps,
++            self.hc_count,
++        )
++
++        if self.use_combine:
++            # produce injection logits for combine
++            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
++            down_and_injection = self._down_gemm(xn)
++            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
++        else:
++            lora = self._down_gemm(xn)
++            injection = None
++
++        lora = hc_silu(lora, self.hc_count)
++        gate = self.input_mix_weight_up(lora)  # [M, D]
++        block_input = hc_gate_mix(xn, gate, self.hc_count)
++
++        return hidden_states, block_input, injection
++
++    def combine_and_mix(
++        self,
++        hidden_states: torch.Tensor,
++        prev_block_output: torch.Tensor,
++        prev_injection: torch.Tensor | None,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        """Consume a pending combine, then prepare the next block input.
++
++        ``hidden_states`` is the multi-stream state from before the pending
++        block's mix. Its combine with ``block_output`` is fused with this
++        module's input RMSNorm. A missing injection applies the block output
++        to every stream with unit weight.
++        """
++        hidden_states, xn = hc_combine_norm(
++            hidden_states,
++            prev_block_output,
++            prev_injection,
++            self.hc_norm.weight,
++            self.config.rms_norm_eps,
++            self.hc_count,
++        )
++
++        if self.use_combine:
++            # produce injection logits for combine
++            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
++            down_and_injection = self._down_gemm(xn)
++            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
++        else:
++            lora = self._down_gemm(xn)
++            injection = None
++
++        lora = hc_silu(lora, self.hc_count)
++        gate = self.input_mix_weight_up(lora)  # [M, D]
++        block_input = hc_gate_mix(xn, gate, self.hc_count)
++
++        return hidden_states, block_input, injection
++
++    def combine(
++        self,
++        hidden_states: torch.Tensor,
++        block_output: torch.Tensor,
++        injection: torch.Tensor | None,
++    ) -> torch.Tensor:
++        return hc_combine(hidden_states, block_output, injection, self.hc_count)
++
++    @property
++    def hyper_hidden_size(self) -> int:
++        return self.hc_count * self.hidden_size
++
++
++__all__ = [
++    "GatedResidual",
++    "GroupedGemmaRMSNorm",
++    "HyperConnectionConfig",
++]
+diff --git a/vllm/models/qwen4_exp/nvidia/dflash2_features.py b/vllm/models/qwen4_exp/nvidia/dflash2_features.py
+new file mode 100644
+index 0000000000..c4da58c272
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/dflash2_features.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DFlash2 features from completed Qwen4Exp hyper-connection layers."""
++
++import torch
++
++from vllm.model_executor.models.interfaces import EagleModelMixin
++
++TARGET_LAYER_IDS = (5, 15, 25, 35, 45)
++# vLLM converts DFlash's completed zero-based layer IDs to these boundaries.
++AUX_LAYER_BOUNDARIES = tuple(i + 1 for i in TARGET_LAYER_IDS)
++
++
++class DFlash2FeatureCapture(EagleModelMixin):
++    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        if layers and tuple(layers) != AUX_LAYER_BOUNDARIES:
++            raise ValueError(
++                "Flash-Next DFlash2 requires completed layers 5/15/25/35/45 "
++                "as vLLM boundaries 6/16/26/36/46"
++            )
++        if layers and (
++            self.config.hc_count != 4
++            or self.config.hidden_size != 2560
++            or self.start_layer != 0
++            or self.end_layer != 48
++            or self.use_hc_sequence_parallel
++        ):
++            raise ValueError("DFlash2 capture requires unsharded HC4/H2560, PP1")
++        super()._set_aux_hidden_state_layers(layers)
++
++    def capture_completed_layer(
++        self,
++        aux_hidden_states: list[torch.Tensor],
++        layer_idx: int,
++        layer: torch.nn.Module,
++        hidden_states: torch.Tensor,
++        block_output: torch.Tensor | None,
++        injection: torch.Tensor | None,
++    ) -> None:
++        if layer_idx + 1 not in self.aux_hidden_state_layers:
++            return
++        # A decoder returns a delayed MLP injection. Materialize it for the
++        # feature without consuming or modifying the tuple passed downstream.
++        completed = hidden_states
++        if block_output is not None:
++            completed = layer.mlp_hyper_connection.combine(
++                hidden_states, block_output, injection
++            )
++        # HC is the outer axis; TP4 owns replicated full-width token rows.
++        # mean allocates independent storage, so later workspace reuse cannot
++        # overwrite these snapshots. Preserve packed token order verbatim.
++        feature = completed.unflatten(-1, (4, 2560)).mean(dim=-2)
++        aux_hidden_states.append(feature)
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 2fb056bde4..998b5cb4b3 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -38,6 +38,7 @@ from vllm.model_executor.models.interfaces import (
+     IsHybrid,
+     MixtureOfExperts,
+     MultiModalEmbeddings,
++    SupportsEagle3,
+     SupportsHCSP,
+     SupportsLoRA,
+     SupportsMRoPE,
+@@ -77,12 +78,17 @@ from vllm.models.common.ops.sequence_parallel import (
+ )
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
++from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+-from .hyperconnection import GatedResidual, HyperConnectionConfig
++if current_platform.is_xpu():
++    from .b70_hyperconnection import GatedResidual, HyperConnectionConfig
++else:
++    from .hyperconnection import GatedResidual, HyperConnectionConfig
++from .dflash2_features import AUX_LAYER_BOUNDARIES, DFlash2FeatureCapture
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+ from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
+ from .ple_layer import Qwen4ExpPLELayer
+@@ -411,7 +417,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
+             moe.experts.update_expert_map()
+ 
+ 
+-class Qwen4ExpModel(nn.Module):
++class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
+     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+@@ -547,6 +553,7 @@ class Qwen4ExpModel(nn.Module):
+                 raise ValueError("pipeline stage requires intermediate tensors")
+             hidden_states = intermediate_tensors["hidden_states"]
+ 
++        aux_hidden_states: list[torch.Tensor] = []
+         full_num_tokens = positions.shape[-1]
+         block_output = None
+         injection = None
+@@ -603,6 +610,14 @@ class Qwen4ExpModel(nn.Module):
+                 block_output = None
+                 injection = None
+                 hidden_states = hidden_states + deepstack_embed
++            self.capture_completed_layer(
++                aux_hidden_states,
++                layer_idx,
++                layer,
++                hidden_states,
++                block_output,
++                injection,
++            )
+ 
+         if not get_pp_group().is_last_rank:
+             # PP transports one tensor, not the delayed HC tuple. Materialize
+@@ -644,6 +659,8 @@ class Qwen4ExpModel(nn.Module):
+             # this tensor is needed by the final mixer regardless).
+             num_tokens = multi_hidden.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
++        if self.aux_hidden_state_layers:
++            return sample_hidden_states, aux_hidden_states
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -653,6 +670,11 @@ class Qwen4ExpModel(nn.Module):
+                 weight,
+             )
+             for name, weight in weights
++            if not (
++                current_platform.is_xpu()
++                and getattr(self.config, "indexer_n_heads", None) is None
++                and ".self_attn.indexer." in name
++            )
+         )
+         weights = maybe_fuse_shared_experts(
+             weights,
+@@ -692,6 +714,7 @@ class Qwen4ExpModel(nn.Module):
+ 
+ class Qwen4ExpForCausalLM(
+     nn.Module,
++    SupportsEagle3,
+     HasInnerState,
+     SupportsHCSP,
+     SupportsLoRA,
+@@ -745,7 +768,7 @@ class Qwen4ExpForCausalLM(
+         )
+         self.set_moe_parameters(self.model.layers)
+         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
+-        if self.model_config.dtype == torch.bfloat16:
++        if self.model_config.dtype == torch.bfloat16 and current_platform.is_cuda():
+             # Precompile the fused HC down+SiLU kernels for every CUDA-graph
+             # capture size in the fused dispatch range, so no CuTe-DSL JIT
+             # happens during graph capture.
+@@ -756,6 +779,9 @@ class Qwen4ExpForCausalLM(
+                 self.config.hidden_size * self.config.hc_count,
+             )
+ 
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
++        return AUX_LAYER_BOUNDARIES
++
+     @staticmethod
+     def get_model_state_cls():
+         from .model_state import Qwen4ExpModelState
+@@ -961,6 +987,9 @@ class Qwen4ExpForConditionalGeneration(
+         ],
+     }
+ 
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
++        return AUX_LAYER_BOUNDARIES
++
+     @staticmethod
+     def get_model_state_cls():
+         from .model_state import Qwen4ExpModelState
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 246168509b..078f15dc54 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -1,3 +1,4 @@
++# Modified by Wulf for B70 Flash-Next Disk; upstream terms are retained.
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Model-runner state for Qwen4Exp PLE inputs."""
+@@ -26,6 +27,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
+     ) -> None:
+         super().__init__(vllm_config, model, encoder_cache, device)
+         config = self.model_config.hf_text_config
++        from .ngram_embedding import (
++            Qwen4ExpNGramEmbedding,
++            Qwen4ExpPLEDiskBF16Embedding,
++        )
++
++        self._disk_ple_modules = tuple(
++            module
++            for module in model.modules()
++            if isinstance(module, Qwen4ExpNGramEmbedding)
++            and isinstance(module.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
++        )
++        if self._disk_ple_modules and len(self._disk_ple_modules) != 1:
++            raise RuntimeError("Disk BF16 PLE requires exactly one target PLE module")
+         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+         if not self.uses_ngram_embedding:
+             self.ngram_context_len = 0
+@@ -110,6 +124,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             query_start_loc=query_start_loc,
+             ngram_context=self._prepare_ngram_context(input_batch, req_states),
+         )
++        for module in self._disk_ple_modules:
++            num_tokens_padded = input_batch.num_tokens_after_padding
++            module.ngram_embedding._check_capacity(num_tokens_padded)
++            if input_batch.input_ids.shape[0] != num_tokens_padded:
++                raise ValueError("Disk BF16 PLE input length differs from dispatch")
++            if num_tokens_padded == 0:
++                continue
++            # Existing GPU IDs use the authoritative committed context above.
++            # This producer runs before FULL replay as well as ordinary forward.
++            ids = module.compute_ngram_ids(
++                input_batch.input_ids,
++                query_start_loc,
++                model_inputs["ngram_context"],
++            )
++            module.ngram_embedding.prepare(
++                ids,
++                input_batch.num_tokens,
++                num_tokens_padded,
++            )
+         return model_inputs
+ 
+     def prepare_dummy_inputs(
+@@ -141,6 +174,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             query_start_loc=query_start_loc,
+             ngram_context=ngram_context,
+         )
++        for module in self._disk_ple_modules:
++            module.ngram_embedding.prepare(None, 0, num_tokens)
+         return model_inputs
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 794eea87a6..aa518c1c54 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
+ 
++import os
+ from collections.abc import Iterable
+ 
+ import torch
+@@ -27,6 +28,7 @@ from ..common.ngram_embedding import (
+     Qwen4ExpPLEUnquantizedEmbeddingMethod,
+ )
+ from ..common.ops.ple import ple_ngram_ids
++from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
+ 
+ logger = init_logger(__name__)
+ 
+@@ -216,6 +218,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             if engram_config is not None and engram_config.cpu_offload
+             else Qwen4ExpPLEDeviceEmbedding
+         )
++        if os.environ.get("B70_PLE_DISK_BF16") == "1":
++            embedding_cls = Qwen4ExpPLEDiskBF16Embedding
+         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
+         self.use_reduce_scatter = (
+             self.use_sequence_parallel
+@@ -400,6 +404,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+     ) -> None:
+         """Start the pinned lookup while the preceding decoder layer runs."""
+         embedding = self.ngram_embedding
++        if isinstance(embedding, Qwen4ExpPLEDiskBF16Embedding):
++            return  # ModelState staged the authoritative inputs before replay.
+         if not embedding.supports_prefetch:
+             return
+         ngram_ids = self.compute_ngram_ids(
+@@ -417,11 +423,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             "ngram_heads_offsets": self.ngram_heads_offsets,
+             "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+         }
++        disk = isinstance(self.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
++        if disk and self.ngram_embedding._mmap_owner is not None:
++            raise RuntimeError("Disk BF16 PLE rejects reload")
+         loaded: set[str] = set()
+         regular_weights: list[tuple[str, torch.Tensor]] = []
+         shard_prefix = "ngram_embedding.shard_"
+ 
+         for name, loaded_weight in weights:
++            if disk and name.startswith("ngram_embedding."):
++                raise RuntimeError("Disk PLE rows must not enter the model loader")
+             leaf_name = name.rsplit(".", 1)[-1]
+             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                 continue
+@@ -473,4 +484,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+ 
+         if regular_weights:
+             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
++        if disk:
++            self.ngram_embedding.load_mmap(os.environ["PLE_TABLE_PATH"])
++            loaded.add("ngram_embedding.weight")
+         return loaded

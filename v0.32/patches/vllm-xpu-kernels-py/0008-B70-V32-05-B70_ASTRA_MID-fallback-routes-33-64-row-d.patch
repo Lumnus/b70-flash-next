@@ -1,0 +1,46 @@
+From 25aef22c0c37860ada346a6fe5506497d789157e Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 04:16:54 +0000
+Subject: [PATCH 8/9] B70-V32-05: B70_ASTRA_MID=fallback routes 33-64-row
+ decode batches through the generic 20-route grouped GEMM
+
+---
+ vllm_xpu_kernels/astra_ownership.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
+index ca21df9..0752c60 100644
+--- a/vllm_xpu_kernels/astra_ownership.py
++++ b/vllm_xpu_kernels/astra_ownership.py
+@@ -18,6 +18,8 @@ torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so'))
+ torch.ops.load_library(str(Path(__file__).with_name('libserving_prefill.so')))
+ torch.ops.load_library(str(Path(__file__).with_name('liblong_prefill_v3.so')))
+ _prepared_layers = 0
++import os as _os
++_B70_MID = _os.getenv("B70_ASTRA_MID", "prefill8")
+ 
+ 
+ def exchange(tensor, kind, cpu_group):
+@@ -112,13 +114,17 @@ def apply(module, output, hidden, weights, ids, expert_map, activation_scales):
+             hidden, local.w13, local.gemm1_wei_scales,
+             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+         return
+-    if 0 < hidden.shape[0] <= 256:
++    if 32 < hidden.shape[0] <= 64 and _B70_MID == "fallback":
++        # B70-V32-05: 5-8 decode requests x (1+K=7) rows through the generic
++        # 20-route path (cutlass grouped GEMM) instead of the prefill kernel.
++        pass
++    elif 0 < hidden.shape[0] <= 256:
+         # Short prefills have few rows per expert; avoid 32-row tile padding.
+         torch.ops.serving_prefill8.forward(
+             hidden, local.w13, local.gemm1_wei_scales,
+             local.w2, local.gemm2_wei_scales, ids, weights, module.ep_rank, output)
+         return
+-    if 0 < hidden.shape[0] <= 1024:
++    if 0 < hidden.shape[0] <= 1024 and not (32 < hidden.shape[0] <= 64 and _B70_MID == "fallback"):
+         # One input row per routed expert is shared by that expert's one or
+         # two owned groups. Gate/up coexecution writes only the activation.
+         # Keep C1 and C2-C4's specialized paths above; no extra collective.
+-- 
+2.43.0
+

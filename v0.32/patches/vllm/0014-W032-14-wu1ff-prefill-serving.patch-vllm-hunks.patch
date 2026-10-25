@@ -1,0 +1,176 @@
+From 08a7b34f685d41d7d0d310bbb8a5cb12e7e2b119 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 14/49] W032-14: wu1ff prefill-serving.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/prefill-serving.patch (sha256 efd7de9122ca30bd…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/models/qwen4_exp/nvidia/b70_c1_graph.py  |  5 ++
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py   |  9 ++-
+ .../models/qwen4_exp/nvidia/b70_prefill_hc.py | 71 +++++++++++++++++++
+ .../gpu/spec_decode/dflash/speculator.py      | 17 +++++
+ 4 files changed, 99 insertions(+), 3 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_c1_graph.py b/vllm/models/qwen4_exp/nvidia/b70_c1_graph.py
+index d732e2856b..c23dff72bb 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_c1_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_c1_graph.py
+@@ -22,6 +22,11 @@ def hc_graph_scope(width):
+ 
+ def replay_hc(module, name, forward, args):
+     """Return a fixed-address HC result, or use eager outside the C1 scope."""
++    from .b70_prefill_hc import prefill_hc
++
++    prefilled = prefill_hc(module, name, forward, args)
++    if prefilled is not None:
++        return prefilled
+     if not getattr(_scope, "active", False) or torch.xpu.is_current_stream_capturing():
+         return forward(*args)
+     entries = getattr(module, "_c1_hc_graphs", None)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index 427e6bb96c..139b5e736c 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -8,12 +8,12 @@ import torch
+ from vllm.triton_utils import tl, triton
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["M"])
+ def _ordered_hc_gemm(
+     x,
+     weight,
+     output,
+-    M: tl.constexpr,
++    M,
+     N: tl.constexpr,
+     K: tl.constexpr,
+     XS0: tl.constexpr,
+@@ -61,7 +61,9 @@ def ordered_hc_gemm(x, weight, valid_columns):
+     ):
+         return parallel_hc_gemm(x, weight, valid_columns)
+     output = torch.empty((rows, columns), device=x.device, dtype=x.dtype)
+-    _ordered_hc_gemm[(triton.cdiv(rows, 16), triton.cdiv(columns, 32))](
++    # Preserve fixed K ordering; wide prefill tiles share more weight loads.
++    bm, bn = (32, 64) if rows >= 256 and inner == 10240 else (16, 32)
++    _ordered_hc_gemm[(triton.cdiv(rows, bm), triton.cdiv(columns, bn))](
+         x,
+         weight,
+         output,
+@@ -71,6 +73,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
+         *x.stride(),
+         *weight.stride(),
+         valid_columns,
++        BM=bm, BN=bn,
+         num_warps=4,
+         num_stages=2,
+     )
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py b/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
+new file mode 100644
+index 0000000000..a7eb642674
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_prefill_hc.py
+@@ -0,0 +1,71 @@
++"""Experimental bounded shared storage for stateless prefill graph regions."""
++import torch
++import torch.distributed as dist
++from vllm.distributed import get_tp_group
++
++class Regions:
++    def __init__(self):
++        self.pool=torch.xpu.graph_pool_handle();self.inputs={};self.outputs={};self.entries={};self.checks=[]
++    def call(self,module,name,fn,args):
++        m=args[0].shape[0]
++        if m <= 32 or m > 256 or torch.xpu.is_current_stream_capturing():
++            return fn(*args)
++        bucket = 256
++        key=(id(module),name,bucket,tuple(x is None for x in args))
++        stat=[]
++        for i,x in enumerate(args):
++            if x is None:stat.append(None);continue
++            signature=(name,i,tuple(x.shape[1:]),x.dtype,x.device)
++            if signature not in self.inputs:self.inputs[signature]=torch.empty((256,*x.shape[1:]),dtype=x.dtype,device=x.device)
++            y=self.inputs[signature][:bucket];y[:m].copy_(x)
++            if m<bucket:y[m:].zero_()
++            stat.append(y)
++        entry=self.entries.get(key)
++        if entry is None:
++            expected=fn(*stat);single=isinstance(expected,torch.Tensor)
++            values=(expected,) if single else expected
++            expected=tuple(x.clone() if x is not None else None for x in values)
++            outputs=[]
++            for i,x in enumerate(values):
++                if x is None:outputs.append(None);continue
++                signature=(name,i,tuple(x.shape[1:]),x.dtype,x.device)
++                if signature not in self.outputs:self.outputs[signature]=torch.empty((256,*x.shape[1:]),dtype=x.dtype,device=x.device)
++                outputs.append(self.outputs[signature][:bucket])
++            del values
++            graph=torch.xpu.XPUGraph()
++            with torch.xpu.graph(graph,pool=self.pool):
++                value=fn(*stat);values=(value,) if single else value
++                for dst,src in zip(outputs,values):
++                    if dst is not None:dst.copy_(src)
++            del value,values
++            graph.replay();torch.xpu.synchronize()
++            passed=all(torch.equal(a,b) if a is not None else b is None for a,b in zip(expected,outputs))
++            verdict=torch.tensor(int(passed),dtype=torch.int32);dist.all_reduce(verdict,op=dist.ReduceOp.MIN,group=get_tp_group().cpu_group)
++            self.checks.append(dict(name=name,bucket=bucket,passed=bool(verdict.item())))
++            assert verdict.item(),self.checks[-1]
++            entry=self.entries[key]=(graph,outputs,single)
++        else:entry[0].replay()
++        result=tuple(x[:m] if x is not None else None for x in entry[1])
++        return result[0] if entry[2] else result
++
++
++_regions = None
++
++def prefill_hc(module, name, fn, args):
++    global _regions
++    rows = args[0].shape[0]
++    if rows <= 32 or torch.xpu.is_current_stream_capturing():
++        return None
++    if _regions is None:
++        _regions = Regions()
++    if rows > 256:
++        # Profile-time initialization accounts bounded persistent storage before
++        # KV sizing. These operations are stateless and preserve the inputs.
++        warmed = getattr(module, "_prefill_hc_warmed", set())
++        if name not in warmed:
++            for width in (256,):
++                _regions.call(module, name, fn, tuple(torch.zeros_like(x[:width]) if x is not None else None for x in args))
++            warmed.add(name)
++            module._prefill_hc_warmed = warmed
++        return None
++    return _regions.call(module, name, fn, args)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 5a13441ee8..8962f75fd9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -451,6 +451,23 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 self.sample_from_anchor,
+             )
+ 
++        # An unfinished prompt chunk cannot produce accepted draft tokens.
++        # Preserve every context K/V write, but avoid queries whose positions
++        # will be overwritten by the next target-prefill chunk. The scheduler
++        # explicitly ignores draft IDs while request.is_prefill_chunk is true.
++        if (
++            not dummy_run and self.dp_size == 1
++            and self._speculator_name == "DFlash2"
++            and input_batch.has_prefill
++            and input_batch.is_prefilling_np.all()
++            and (input_batch.num_computed_prefill_tokens_np
++                 + input_batch.num_scheduled_tokens < input_batch.prefill_len_np).all()
++        ):
++            self._precompute_context_kv(0, num_target_tokens)
++            self.draft_tokens[:num_reqs].fill_(-1)
++            return self.draft_tokens[:num_reqs]
++
++
+         batch_sync, num_batch_tokens = (
+             self._build_uniform_batch_dp_sync(
+                 dp_sync_state, num_reqs, self.num_query_per_req

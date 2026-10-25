@@ -1,0 +1,27 @@
+From 752a45ffc0565d1d8e49d40f548813366f1f25c5 Mon Sep 17 00:00:00 2001
+From: wu1ff <wu1ff@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:28:25 +0000
+Subject: [PATCH 12/49] W032-11: wu1ff astra500-ownership.patch (vllm/ hunks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-ownership.patch (sha256 36887d6cb787f125…), applied unchanged with git apply -p1 --include='vllm/*'. MIT (b70/third_party/wu1ff).
+---
+ vllm/model_executor/layers/fused_moe/experts/xpu_moe.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index 35fb916078..894cf0c8cc 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -175,7 +175,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+                 gemm1_clamp_limit=self.gemm1_clamp_limit,
+             )
+         assert self.fused_moe_impl is not None
+-        if self.moe_config.ep_size > 1:
++        if (self.moe_config.ep_size > 1
++                and getattr(self.fused_moe_impl, "_astra_groups", None) is None):
+             # Avoid topk_ids = -1, remap them to an
+             # expert not owned by this rank so they are skipped.
+             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
