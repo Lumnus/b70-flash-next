@@ -1,27 +1,33 @@
 # 0.32.0-b70.1 — Qwen3.8-Flash-Next on vLLM 0.32, 4× Intel Arc Pro B70
 
-The configuration we serve since 2026-10-24: vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
+The current line, served since 2026-10-24: vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
 from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM fixes cherry-picked. Speculative
 decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 8 sequences,
-4096-token prefill chunks, a 128 GiB host-RAM KV tier and the INT8 PLE table on NVMe.
+4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. This
+release is the **dense** attention variant (the checkpoint's QSA indexer is dropped); the sparse variant has its own
+slot below ([Sparse attention](#sparse-attention-qsa-in-preparation)).
 
 | | |
 |---|---|
 | code | fork tag [`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1) = branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0) @ `103f2f2eb9`, 49 commits on vLLM v0.32.0 (`5df63a7203`), exported to [`patches/vllm/`](patches/vllm/) |
 | weights | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (the only build measured on 0.32) + drafter `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` |
 | GPUs | 4× Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
+| attention | the target model on vLLM's XPU default backend (FlashAttention); the drafter on `TRITON_ATTN` (`serve.args`) |
+| KV | 397,309 GPU KV tokens at memory fraction 0.89 (388,872 with `serve-no-plugin.env`) + 128 GiB CPU tier (32 GiB pinned per rank, private pool, no `/dev/shm` requirement) |
+| software | [Software](#software) below; pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 |
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
 | engine files | [`engines/serve.args`](engines/serve.args), [`engines/serve.env`](engines/serve.env); fallback [`engines/serve-no-plugin.env`](engines/serve-no-plugin.env) |
-| status | serving since 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
+| status | the line we serve since 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
 
-The 0.30.0-b70.2 recipe at the top of this repository stays as it was and is the long-term fallback line.
+The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable fallback line.
 
 ## Numbers
 
 Three configurations measured with the same harness on the same host, one after another, on an idle engine (each
 timed cell waits for 20 s with no running or waiting requests). Single runs unless noted; read differences under
-~5 % as noise. These are **not** comparable with the tables in the main README, which use a different harness
-(the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching configuration).
+~5 % as noise. These are **not** comparable with the per-build tables in the main README's Models section, which use a different
+harness (the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching
+configuration). The headline table on the main README cover is taken from this one.
 
 | | 0.30.0-b70.2 (as released: MTP k=3, 16 slots) | 0.30 perf line (DFlash2 K=7, 8 slots) | **0.32.0-b70.1** |
 |---|---|---|---|
@@ -129,10 +135,10 @@ wu1ff's `vllm_xpu_kernels/` hunks (0001–0007, astra500 wrappers and the fused-
 | compute-runtime (Level Zero) | 26.35.39758.10 |
 | oneAPI compiler (builds only) | 2026.1.1 (`icpx`) |
 | Python | 3.12 |
-| torch / triton | 2.14.0+xpu / triton-xpu 3.8.0 |
+| torch / triton | 2.14.0+xpu / 3.8.0+xpu |
 | Intel runtime wheels | intel-sycl-rt, dpcpp-cpp-rt, intel-opencl-rt 2026.1.1; onemkl-sycl 2026.1.0 |
 | oneCCL | 2022.1.2 (pip `oneccl`) core and loader, legacy plugin rebuilt with oneCCL#229 |
-| vllm-xpu-kernels | `release/0.1.15.4` + #658, #660 and an earlier pinned-only form of #662, oneDNN on |
+| vllm-xpu-kernels | `release/0.1.15.4` + #658, #660 and an earlier pinned-only form of #662, oneDNN on; Python side + [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/) |
 | other pins | transformers 5.17.0, auto-round-lib 0.16.0 |
 | vLLM | v0.32.0 + this series |
 
@@ -229,10 +235,26 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
 Chat template: the examples use the checkpoint's own template. We serve a lightly modified one (thinking switches off
 on `enable_thinking=false` or a "none/off" effort); it is not included.
 
+## Sparse attention (QSA): in preparation
+
+Placeholder. The release above is the dense variant: the serve config drops the QSA indexer keys and the loaders skip
+the `self_attn.indexer` tensors, so the full-attention layers attend over the whole context. A sparse variant keeps the indexer and
+runs QSA on the vLLM Triton kernels. Nothing here is released or measured yet; this section, and the files below, will
+be filled when it is:
+
+| path | what it will hold |
+|---|---|
+| `v0.32/patches/vllm-qsa/` | the sparse add-on series, on top of `v0.32/patches/vllm/` |
+| `v0.32/engines/qsa-serve.args`, `v0.32/engines/qsa-serve.env` | the sparse engine files, paired like `serve.args` / `serve.env` |
+| `v0.32/engines/serve-config-qsa.json` | the serve config that keeps the indexer keys |
+| `docs/measurements/v0.32-qsa.md` | sparse against dense on this line, same harness |
+
+Until then, use the dense release above.
+
 ## Known issues (0.32)
 
-1. **No multi-day run yet.** The served configuration has run since 2026-10-24 without an incident we know of; there is
-   no endurance number for 0.32.
+1. **No multi-day run yet.** The 0.32 line has served since 2026-10-24, with planned stops for development windows;
+   there is no endurance number for it yet.
 2. **One hang in development.** Before the copy-through-lock fix, one boot with FULL graphs hung in `sample_tokens`
    (unit stopped, cards rebound). It did not recur in later boots or in the drill; the cause is not known.
 3. **KV is ~2 % below the 0.30 perf line.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not

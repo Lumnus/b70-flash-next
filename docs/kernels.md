@@ -1,10 +1,11 @@
 # Our vllm-xpu-kernels builds
 
-Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Two lines:
+Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Three builds:
 
 | build | for | source | state |
 |---|---|---|---|
-| **`0.1.14.1+b70.3`** | torch 2.13, oneAPI 2026.0 (the stable line) | tag [`v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3) on branch `b70/v0.1.14` = upstream tag `0.1.14.1` (`6d92b1bf`) + 7 commits | **what we serve** (since 2026-10-03); wheel attached to the [0.30.0-b70.2 release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) |
+| **`release/0.1.15.4` + our PRs** | torch 2.14, oneAPI 2026.1.1 (the current 0.32 line) | upstream `release/0.1.15.4` (`ddf336d`) + vllm-xpu-kernels #660, #658, #662 from their pull refs, oneDNN on, plus wu1ff's Python hunks | **the current line's kernels**; build recipe in [v0.32/README.md](../v0.32/README.md#build-and-run) step 3 (no wheel attached) |
+| **`0.1.14.1+b70.3`** | torch 2.13, oneAPI 2026.0 (the 0.30 stable fallback line) | tag [`v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3) on branch `b70/v0.1.14` = upstream tag `0.1.14.1` (`6d92b1bf`) + 7 commits | the 0.30 line's kernels (served 2026-10-03 to 2026-10-23); wheel attached to the [0.30.0-b70.2 release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) |
 | `0.1.15.4+b70.1` | torch 2.14, oneAPI 2026.1 (the edge line) | [`b70/v0.1.15`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.15) @ `69b823f9` = upstream `release/0.1.15.4` + the 64-bit fix | ran on the edge line; not recommended (known issues item 5) |
 
 ## 0.1.14.1+b70.3: the series

@@ -4,7 +4,7 @@ Where every piece of the image comes from, and the hashes that prove it. Grades:
 **[W]** third-party claim, not reproduced · **UNVERIFIED**. The source of the vLLM patches is the fork branch
 `b70/v0.30.0` of github.com/Lumnus/vllm (one commit per patch on v0.30.0 `ced6857afa`); `patches/` is exported from
 it by `scripts/export-series.sh` and checked by `scripts/check-series.sh`. From 0.30.0-b70.2 the branch is
-`b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7).
+`b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7). The current 0.32 line (`v0.32/`) is pinned in §8.
 
 ## 1. Bases
 
@@ -157,7 +157,7 @@ The other 8 wu1ff files and the 4 binaries/pack files keep their §2 hashes. The
 | not shown | correctness on a GPU past block id 5,042 by a targeted test |
 
 **vllm-xpu-kernels `0.1.14.1+b70.1`** (stable line, torch 2.13): upstream tag `0.1.14.1` = `6d92b1bfbf32767ecda8e819613eb151e70030ad`
-+ the same commit, oneAPI 2026.0. In progress; not published.
++ the same commit, oneAPI 2026.0. Never published; superseded by `0.1.14.1+b70.3` (§7).
 
 **AWQ serving recipe** (engines/awq-s16-kv128-chunked.env, docs/weights.md) [M]:
 
@@ -275,7 +275,7 @@ experts (same keys, dtypes, shapes and sizes) and links everything else from the
 gave max |diff| 0 against compressed-tensors' own unpack on layers 0, 1, 12, 24, 31, 47 (32 experts × 3 each) and a
 rel-L2 of 0.110–0.119 between Intel's and Minachist's experts. Not redistributed here.
 
-**Runtime we serve on** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
+**Runtime of the 0.30.0-b70.2 recipe** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
 kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro
 B70. Our host image is internal and not published.
 
@@ -290,7 +290,7 @@ B70. Our host image is internal and not published.
 | oneCCL plugin | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
 | weights | Intel/Qwen3.8-Flash-Next-W4A16-AutoRound `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`; drafter incoai/Qwen3.8-Flash-Next-DFlash2 `a22a1744e85c17364dcc54a6a420af7135d4c7f6` (model.safetensors sha256 `d6723f2a…4d3186f`) |
 | serve config | `engines/serve-config-intel-autoround.json`, sha256 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7` (byte-identical to the served file) |
-| runtime | compute-runtime 26.35.39758.10; torch 2.14.0+xpu; triton-xpu 3.8.0; intel-sycl-rt 2026.1.1; oneccl 2022.1.2; transformers 5.17.0; auto-round-lib 0.16.0; icpx 2026.1.1 for builds |
+| runtime | compute-runtime 26.35.39758.10; torch 2.14.0+xpu; triton 3.8.0+xpu; intel-sycl-rt 2026.1.1; oneccl 2022.1.2; transformers 5.17.0; auto-round-lib 0.16.0; icpx 2026.1.1 for builds |
 
 Publication: the 15 commits after `979482e2e` were moved from the test host's tree with `git format-patch`/`git am`
 onto the published 0.32 branch; the resulting tree equals the served tree except for files already neutralized on

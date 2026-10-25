@@ -2,6 +2,24 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## Repository changes — 2026-10-25: documentation reconciled to the current line
+
+Documentation only; no series change, no new tag.
+
+- **The cover describes the current line.** README's first table is now 0.32.0-b70.1 (vLLM v0.32.0, torch 2.14.0+xpu,
+  triton 3.8.0+xpu, oneAPI 2026.1.1, oneCCL 2022.1.2 with the rebuilt legacy plugin, vllm-xpu-kernels
+  `release/0.1.15.4` + our three PRs; DFlash2 K=7, async scheduling, 8 sequences, 397K GPU KV tokens, the private
+  pinned CPU tier). Before, it still listed the 0.30 stack (vLLM v0.30.0, torch 2.13, MTP k=3, 16 sequences, ~311K)
+  as if current. The 0.30.0-b70.2 line has a row of its own and a section labelled as the stable fallback; its
+  endurance, validation, models and KV-tier numbers are labelled as 0.30 measurements.
+- **"What we serve" corrected** wherever it still pointed at the 0.30 recipe or its kernels (`docs/kernels.md`,
+  `docs/weights.md`, `docs/measurements/`, `engines/README.md`, engine file comments, PROVENANCE §6/§7).
+- **Dense and sparse attention.** The 0.32 release is the dense variant; `v0.32/README.md` has a placeholder section
+  for the sparse (QSA) variant and the paths it will use.
+- `v0.32/README.md`: attention backends (target on the XPU default FlashAttention, drafter on `TRITON_ATTN`), KV and
+  software rows; triton named as 3.8.0+xpu. `docs/known-issues.md` and `docs/switches.md` say which line they cover.
+  `docs/switches.md`: the serving recipes set the presence penalty to 0, not 0.7.
+
 ## Repository changes — 2026-10-25: Intel AutoRound recommended, Minachist experts supported
 
 Documentation and one tool; no series change, no new tag.

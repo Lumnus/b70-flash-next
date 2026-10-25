@@ -1,11 +1,14 @@
-# Example engines
+# Example engines (0.30 line)
+
+These are the 0.30 line's engines. The current line's engine files are in [v0.32/engines/](../v0.32/engines/)
+([v0.32/README.md](../v0.32/README.md)); the two serve configs here are shared with it.
 
 Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
 KV size to your host.
 
 | engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
 |---|---|---|---|---|---|---|
-| **`s16-kv128-mtp3`** + `MODEL=intel-autoround` | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve and recommend** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3; patch 0028 acts here |
+| **`s16-kv128-mtp3`** + `MODEL=intel-autoround` | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **the recommended 0.30.0-b70.2 configuration** (stable fallback line; served 2026-10-07 to 2026-10-23): MTP k=3, kernels 0.1.14.1+b70.3; patch 0028 acts here |
 | `s16-kv128-mtp3` + `MODEL=awq` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | the validated alternative: same code and flags |
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |

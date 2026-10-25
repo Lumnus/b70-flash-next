@@ -1,6 +1,7 @@
 # Measurements
 
-**0.30.0-b70.2 (Intel AutoRound + MTP, what we serve now): [b70.2.md](b70.2.md).**
+**Current line 0.32.0-b70.1: [v0.32/README.md](../../v0.32/README.md#numbers).**
+**0.30.0-b70.2 (the stable fallback; Intel AutoRound + MTP): [b70.2.md](b70.2.md).**
 
 The files below are the 0.30.0-b70.1 measurements. All numbers: Qwen3.8-Flash-Next, `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d`, on one host with
 4× Intel Arc Pro B70 (32 GB each), TP4 + expert parallel, vLLM v0.30.0 XPU with this series, compute-runtime

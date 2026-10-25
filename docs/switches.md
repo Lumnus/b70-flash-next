@@ -1,4 +1,8 @@
-# Runtime switches (`B70_*`)
+# Runtime switches (`B70_*`) of the 0.30 series
+
+This page covers the 0.30 series in `patches/`. The 0.32 line carries most of these switches as ports, plus its own;
+its engine files ([v0.32/engines/serve.env](../v0.32/engines/serve.env)) explain each one inline, and
+[v0.32/README.md](../v0.32/README.md#the-series) lists the series.
 
 Every feature the b70 series adds is behind an environment variable and **off by default**. With none of them set,
 the image behaves as vLLM v0.30.0 plus wu1ff's patch set (0001–0005), apart from the ungated parts listed at
@@ -47,7 +51,7 @@ every existing table unloadable. It is not a switch.
 | variable | default | patch | effect |
 |---|---|---|---|
 | `B70_THINKING_BUDGET` | unset (off) | 0009 | per-effort cap on reasoning tokens, keyed on the effort the **client** asked for: `minimal=512,low=512,medium=2048,high=4096,xhigh=8192,max=12288,ultra=12288,default=8192`. `default` applies when no effort was sent. Nothing applies when thinking is off (`enable_thinking=false` or an effort of `none`/`off`/`false`/`0`/`disabled`), and a request's own `thinking_token_budget` wins. |
-| `B70_DEFAULT_PRESENCE_PENALTY` | unset | 0009 | server default for `presence_penalty` (we use `0.7`); a request's own value wins. |
+| `B70_DEFAULT_PRESENCE_PENALTY` | unset | 0009 | server default for `presence_penalty`; a request's own value wins. The serving recipes set `0` (`common.env` sets `0.7` for the devan examples). |
 | `B70_DEFAULT_REPETITION_DETECTION` | unset | 0010 | server default for vLLM's built-in n-gram repetition stop, `max=<n>,min=<n>,count=<n>` (we use `max=1,min=1,count=128`: stop when one token repeats 128 times). Catches the token-1023 "duct" NaN loop. A request's own `repetition_detection` wins. Chat endpoint only. |
 | `B70_REASONING_EFFORT_ALIAS` | unset (off) | 0012 | `1`: map an OpenRouter-style `{"reasoning": {"effort": X}}` onto `reasoning_effort` when the request did not set that field. |
 

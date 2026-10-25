@@ -1,59 +1,75 @@
 # b70-flash-next
 
-vLLM for **Qwen3.8-Flash-Next on 4× Intel Arc Pro B70**: vLLM v0.30.0 for XPU, wu1ff's B70 patch set rebuilt from
-source patches, a series of patches for host memory, long-context reuse, MTP speculative decoding and agent clients,
-and a vllm-xpu-kernels build with the fixes this model needs.
+vLLM for **Qwen3.8-Flash-Next on 4× Intel Arc Pro B70**. The current line, **0.32.0-b70.1**, is vLLM v0.32.0 with
+wu1ff's 1.0.5 B70 chain, our patches on top, DFlash2 speculative decoding and a vllm-xpu-kernels build carrying our
+upstream fixes; everything for it is in [`v0.32/`](v0.32/README.md). The previous line, **0.30.0-b70.2** (vLLM
+v0.30.0), stays as the stable fallback; it is the rest of this repository root (`patches/`, `engines/`, `image/`).
+
+The 0.32 line has two attention variants: **dense** (the release below: the checkpoint's QSA indexer is dropped and
+the full-attention layers attend over the whole context) and **sparse** (QSA with the indexer kept; in preparation, see
+[v0.32/README.md](v0.32/README.md#sparse-attention-qsa-in-preparation)).
+
+## Current line: 0.32.0-b70.1 (dense attention)
 
 | | |
 |---|---|
-| model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound build recommended** (AWQ is validated too; Minachist's recalibrated experts are a supported variant; [Models](#models)) |
+| release | [`v0.32.0-b70.1`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.1), 2026-10-25; the line we serve since 2026-10-24 |
+| code | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers: fork tag [`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1) (`103f2f2eb9`), exported to [`v0.32/patches/vllm/`](v0.32/patches/vllm/) (49 patches) |
+| model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound recommended** (the only build measured on 0.32); AWQ is validated on the 0.30 line; Minachist's recalibrated experts are a supported variant ([Models](#models)) |
 | GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
-| KV cache | GPU pool ~311K tokens + **128 GB in host RAM** (CPU tier) |
-| PLE n-gram table | **INT8, served from NVMe** (8 GB pinned row cache instead of 48.9 GB in RAM) |
-| decoding | MTP speculative decoding, 3 draft tokens; 16 sequences; 262K context; GPU memory fraction 0.88; `--no-async-scheduling`; cudagraph capture sizes at every multiple of 4 up to 64 (plus 256/512/1024) |
+| decoding | DFlash2 speculative decoding, 7 draft tokens (incoai's drafter; the drafter on `TRITON_ATTN`, the target on vLLM's XPU default, FlashAttention); async scheduling; 8 sequences; 4096-token prefill chunks; 262K context; GPU memory fraction 0.89 |
+| KV cache | GPU pool 397K tokens + **128 GiB in host RAM** (CPU tier, a private pinned pool per rank; no `/dev/shm` requirement) |
+| PLE n-gram table | **INT8, served from NVMe** (8 GiB pinned row cache instead of 48.9 GiB in RAM) |
+| software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 with the legacy plugin rebuilt from oneCCL #229, vllm-xpu-kernels `release/0.1.15.4` + our three PRs ([v0.32/README.md](v0.32/README.md#software)) |
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| software | torch 2.13.0+xpu, compute-runtime 26.35.39758.10, vllm-xpu-kernels 0.1.14.1+b70.3 |
+| status | gates, quality, speed and an agent-session replay measured; no multi-day run yet ([known issues](v0.32/README.md#known-issues-032)) |
+| **stable fallback** | [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2): vLLM v0.30.0, torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3, MTP k=3, 16 sequences, ~311K GPU KV tokens + the same 128 GiB CPU tier; multi-day validated on Intel and AWQ ([the 0.30 line](#the-030-line-stable-fallback)) |
 
-## Latest: 0.32.0-b70.1 on vLLM 0.32 (2026-10-25)
-
-What we serve since 2026-10-24: vLLM v0.32.0 with wu1ff's 1.0.5 chain and our layers, **DFlash2 speculative decoding
-with 7 draft tokens**, async scheduling, 8 sequences, 4096-token prefill chunks, the 128 GiB host-RAM KV tier and the
-INT8 PLE table on NVMe, Intel AutoRound weights. Everything is in [`v0.32/`](v0.32/README.md): the series (fork tag
-[`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1)), engine files with every knob explained, the
-kernels and oneCCL build recipe, and the measurements. Same harness, same host, one after another:
+Measured against the 0.30 fallback, same harness, same host, one after another:
 
 | | 0.30.0-b70.2 (MTP k=3, 16 slots) | **0.32.0-b70.1** (DFlash2 K=7, 8 slots) |
 |---|---|---|
 | decode, 1 stream | 107.5 tok/s | **169.3 tok/s** |
-| decode, 4 concurrent | 295 tok/s total | **306 tok/s** |
-| decode, 8 streams | 370 tok/s total | **605 tok/s** |
+| decode, 4 concurrent | 295 tok/s total | **306.2 tok/s** |
+| decode, 8 streams | 370 tok/s total | **605.5 tok/s** |
 | prefill 8K / 32K / 131K | 4,052 / 3,833 / 2,953 tok/s | **6,305 / 6,114 / 4,641 tok/s** |
 | GPU KV cache | ~311K tokens | **397K tokens** |
 | agent-session replay (243 requests) | 401 s | **268 s** |
 | MMLU / TruthfulQA | — | not significantly different (paired, at every step) |
 
-Single runs on an idle engine; this harness is not the one behind the tables below. Method, the intermediate 0.30
-perf line, and the caveats (no multi-day run on 0.32 yet; only Intel weights measured on it):
-[v0.32/README.md](v0.32/README.md#numbers). The 0.30.0-b70.2 recipe below is unchanged and stays the fallback line.
+Single runs on an idle engine; this harness is not the one behind the 0.30 per-build tables further down. Method, the
+intermediate 0.30 perf line, and the caveats: [v0.32/README.md](v0.32/README.md#numbers). How to build and run it:
+[v0.32/README.md](v0.32/README.md#build-and-run).
 
-**Release [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2): the stable set.**
-Both weight builds are validated on its code ([known issues](docs/known-issues.md) item 12): Intel AutoRound (recommended; 8 days 6 hours in one engine, 0 errors) and AWQ
-(3 days 16 hours, 0 errors). One code branch, the model is a serving parameter. It runs
-from source trees; the vllm-xpu-kernels wheel is attached to the release, and no container image is built for b70.2
-([CHANGELOG](CHANGELOG.md)).
+## The 0.30 line (stable fallback)
 
-## Validation status
+**Release [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), 2026-10-07.** Both
+weight builds are validated on its code ([known issues](docs/known-issues.md) item 12): Intel AutoRound (8 days 6 hours
+in one engine, 0 errors) and AWQ (3 days 16 hours, 0 errors). One code branch, the model is a serving parameter. It
+runs from source trees; the vllm-xpu-kernels wheel is attached to the release, and no container image is built for
+b70.2 ([CHANGELOG](CHANGELOG.md)). Everything from here to [Quick start](#quick-start-030-source-tree) is about this
+line unless a row says otherwise.
 
 | | |
 |---|---|
-| **Intel AutoRound** (recommended) | **fully validated**: gates, quality, speed, and about **15 days of serving** (2026-10-07 to 2026-10-23), the longest single engine **8 days 6 hours** with 0 errors and 0 aborts ([Endurance](#endurance)). One crash in that time: a GPU device-lost, described there |
-| **AWQ** | **fully validated** on an earlier branch of the same code: gates, quality, speed, and one engine running **3 days 16 hours** without an error ([Endurance](#endurance)) |
+| code | stock vLLM v0.30.0 + the series in [`patches/`](patches/) (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`) |
+| decoding | MTP speculative decoding, 3 draft tokens; 16 sequences; 262K context; GPU memory fraction 0.88; `--no-async-scheduling`; cudagraph capture sizes at every multiple of 4 up to 64 (plus 256/512/1024) |
+| KV cache | GPU pool ~311K tokens + 128 GB in host RAM (CPU tier) |
+| PLE n-gram table | INT8, served from NVMe (as on 0.32) |
+| software | torch 2.13.0+xpu, compute-runtime 26.35.39758.10, vllm-xpu-kernels 0.1.14.1+b70.3 |
+
+### Validation status (0.30 line)
+
+| | |
+|---|---|
+| **Intel AutoRound** (recommended) | **fully validated**: gates, quality, speed, and about **15 days of serving** (2026-10-07 to 2026-10-23), the longest single engine **8 days 6 hours** with 0 errors and 0 aborts ([Endurance](#endurance-030-line)). One crash in that time: a GPU device-lost, described there |
+| **AWQ** | **fully validated** on an earlier branch of the same code: gates, quality, speed, and one engine running **3 days 16 hours** without an error ([Endurance](#endurance-030-line)) |
 | the release branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable) | not booted on a GPU as such. It is the union of the two lines we tested, with one copy of each fix. Intel's endurance ran on the release code except for the directory of the debug flag files; AWQ's on an earlier branch. Every difference is listed in [known issues](docs/known-issues.md) item 12 |
 
-In day-to-day use (an operator observation under real mixed agent load, not a benchmark), aggregate generation has
-peaked at about 500 tok/s and holds at 300+ tok/s sustained; it depends on the jobs.
+In day-to-day use on this line (an operator observation under real mixed agent load, not a benchmark), aggregate
+generation peaked at about 500 tok/s and held at 300+ tok/s sustained; it depends on the jobs.
 
-## Endurance
+## Endurance (0.30 line)
 
 ### Intel AutoRound
 
@@ -111,14 +127,16 @@ workloads.
 
 Two calibrated 4-bit checkpoints run on this stack and both are validated; a third, round-to-nearest one is the
 reference, and a fourth variant (Minachist's recalibrated experts in Intel's checkpoint) is supported. **We recommend
-Intel AutoRound, and it is what we serve.** The two calibrated builds are close; the reasons for the order:
+Intel AutoRound, and it is what we serve** on both lines. Only Intel has been measured on the 0.32 line; the comparison
+and the per-build tables below were measured on the 0.30 line (MTP k=3, kernels b70.2/b70.3), with a different harness
+from the 0.32 table at the top. The two calibrated builds are close; the reasons for the order:
 
 1. **Speed is a tie, Intel slightly ahead at one stream.** Measured side by side, Intel decodes 2.8 % faster at one
    short stream (90.4 vs 87.9 tok/s) and 5 % faster at one 16K stream (89.8 vs 85.0), and the two are level at 4 to 10
    streams (within the ~10 % noise). The benchmarks we ran (MMLU, TruthfulQA, agentic coding, long context) do not
    separate them significantly; they sit 0.082 KL apart (top-1 agreement 90.2 %) and give the same answer on 97 % of
    items.
-2. **Both have clean multi-day runs** ([Endurance](#endurance)): Intel 8 days 6 hours in one engine and about 15 days of
+2. **Both have clean multi-day runs** ([Endurance](#endurance-030-line)): Intel 8 days 6 hours in one engine and about 15 days of
    serving with one crash (a GPU device-lost under a long memory-store re-ingest); AWQ 3 days 16 hours.
 3. **Host RAM is the same.** An earlier reading of ~23 GiB left free with Intel against ~39 GiB with AWQ was not the
    model: at ready Intel leaves 39.8 GiB, the same as AWQ, and over its 8-day run MemAvailable never went below 53 GiB.
@@ -134,7 +152,7 @@ All of them serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE
 Throughput below: single runs on an idle engine, thinking off, 400 (short) or 256 (16K) generated tokens per request;
 "prefill" = prompt tokens over time to first token; differences under ~10 % are noise.
 
-### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (recommended; what we serve)
+### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (recommended; what we serve on both lines)
 
 AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MTP and the rest BF16.
 
@@ -151,7 +169,7 @@ AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MT
 | knowledge | MMLU 280/300, TruthfulQA 178/200 (medium, MTP); AWQ with MTP 275 / 176 (p 0.18 / 0.50) |
 | per card | 20.29 GiB model weights; 311,299 GPU KV tokens at memory fraction 0.88 |
 | host RAM | 39.8 GiB MemAvailable at ready on our 256 GiB host, the same as AWQ; never below 53 GiB over the 8-day run |
-| endurance | **8 days 6 h in one engine**, 40,912 requests, 0 errors, 0 aborts; about 15 days of serving with one crash, a GPU device-lost ([Endurance](#endurance)). On the earlier b70.2 kernels its longest run was 21.5 h, ended by two guard stops that 0029b fixed |
+| endurance | **8 days 6 h in one engine**, 40,912 requests, 0 errors, 0 aborts; about 15 days of serving with one crash, a GPU device-lost ([Endurance](#endurance-030-line)). On the earlier b70.2 kernels its longest run was 21.5 h, ended by two guard stops that 0029b fixed |
 | setup | needs patch 0028 and `tools/intel_snapshot.py` ([engines/README.md](engines/README.md)) |
 | download | 78.8 GB (the 102.4 GB BF16 PLE shard in the checkpoint is not used) |
 
@@ -172,7 +190,7 @@ AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
 | knowledge | MMLU 275/300, TruthfulQA 176/200 (medium, MTP); 276 / 176 without MTP |
 | token-level distance to Intel (both MTP) | KL 0.082, top-1 90.2 %; same answer on 97 % of items |
 | per card | 309,467 GPU KV tokens at memory fraction 0.88; 30.5–31.1 GiB VRAM in use; model weights per card: not measured |
-| endurance | 3 days 16 h in one run, ~52,500 requests, 0 errors, 0 aborts ([Endurance](#endurance)) |
+| endurance | 3 days 16 h in one run, ~52,500 requests, 0 errors, 0 aborts ([Endurance](#endurance-030-line)) |
 | host RAM | ~39 GiB MemAvailable left in steady state on our 256 GiB host (the same as Intel) |
 | download | 180.8 GB |
 
@@ -234,7 +252,8 @@ numbers come from an earlier branch of the same code; how it differs from the re
 ## The host-RAM KV tier
 
 Agent sessions resend long, growing prompts. The CPU tier keeps their KV cache in 128 GB of pinned host RAM and loads
-it back instead of recomputing it.
+it back instead of recomputing it. Both lines run it at 128 GiB. The numbers in this table were measured on the 0.30
+line; the 0.32 line's replay, KV and host-RAM numbers are in [v0.32/README.md](v0.32/README.md#numbers).
 
 | | |
 |---|---|
@@ -251,15 +270,17 @@ rest, so a session that comes back after others have filled the GPU pool still g
 full re-prefill. The engine's working range is ~6 concurrent sessions; beyond that it holds, and everything slows.
 Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 
-## Two lines
+## Lines
 
 | line | what | state |
 |---|---|---|
-| **stable `0.30.0-b70.N`** | stock vLLM v0.30.0 + this series (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | **recommended**: the validated line (multi-day runs on Intel and AWQ) |
-| **`0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`), torch 2.14, vllm-xpu-kernels 0.1.15.4 + our three kernel PRs | **what we serve since 2026-10-24** ([v0.32/](v0.32/README.md)); no multi-day run yet |
+| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`), torch 2.14, vllm-xpu-kernels `release/0.1.15.4` + our three kernel PRs ([v0.32/](v0.32/README.md)) | **what we serve since 2026-10-24**; gates, quality and speed measured, no multi-day run yet. Dense attention released; sparse (QSA) in preparation |
+| **stable fallback `0.30.0-b70.N`** | stock vLLM v0.30.0 + the series in `patches/` (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 | the multi-day validated line (Intel and AWQ); the fallback |
 | edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
 
-## Quick start (source tree, how we run it)
+## Quick start (0.30, source tree)
+
+For the current line, follow [v0.32/README.md](v0.32/README.md#build-and-run). For the 0.30 fallback:
 
 ```bash
 git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next
@@ -303,16 +324,18 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 | `patches/series.txt` | which fork commit goes to which file |
 | `scripts/` | `export-series.sh`, `check-series.sh` (patches/ == fork branch), `make-tree.sh` (a verified source tree) |
 | `image/` | `Dockerfile`, `verify-overlay.sh`, wu1ff's pack files, `derive-serve-config.py` |
-| `engines/` | environments and `vllm serve` flags, incl. the recommended configuration (`s16-kv128-mtp3` + `models/intel-autoround.env`; [engines/README.md](engines/README.md)) |
+| `engines/` | 0.30 line: environments and `vllm serve` flags, incl. its recommended configuration (`s16-kv128-mtp3` + `models/intel-autoround.env`; [engines/README.md](engines/README.md)); the serve configs are shared with 0.32 |
 | `docs/` | [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
 | `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `minachist_repack.py` (Minachist experts into the Intel snapshot), `repro_band.py` (reproduce the offload miss) |
 | [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.32.0` (tag `v0.32.0-b70.1`, the 0.32 line), `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
-| [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, what we serve), `b70/v0.1.15` (edge) |
+| [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, the 0.30 line's kernels), `b70/v0.1.15` (edge). The 0.32 line builds upstream `release/0.1.15.4` + our PRs instead ([v0.32/README.md](v0.32/README.md#build-and-run), step 3) |
 | [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
 
 `PROVENANCE.md` records where every piece comes from, with hashes. `CHANGELOG.md` lists releases.
 
-## What is in the series
+## What is in the 0.30 series
+
+The 0.32 series is listed in [v0.32/README.md](v0.32/README.md#the-series).
 
 | patch | what | switch |
 |---|---|---|
@@ -336,20 +359,23 @@ still needs the kernel wheel installed and wu1ff's `libgdn_index64.so` removed; 
 | 0029, 0029b | prompt logprobs in 128-row chunks (no VRAM spill into host RAM) | on; `B70_PROMPT_LOGPROBS_CHUNK` |
 | 0031 | CPU→GPU KV loads straight from the pinned pool (for kernels without B70-K1) | `B70_OFFLOAD_H2D_DIRECT=1` |
 
-Every switch: [docs/switches.md](docs/switches.md).
+Every switch of the 0.30 series: [docs/switches.md](docs/switches.md); the 0.32 engine files explain theirs inline.
 
 ## Work in progress (not in the series)
 
-1. **The proper MTP fixes**: padding rows that write no state (so capture sizes no longer have to avoid padding) and
+1. **Sparse attention (QSA) on 0.32**: being brought up; its release slot is described in
+   [v0.32/README.md](v0.32/README.md#sparse-attention-qsa-in-preparation).
+2. **The proper MTP fixes** (0.30 line): padding rows that write no state (so capture sizes no longer have to avoid padding) and
    the spec + async-scheduling race (so `--no-async-scheduling` can go). Until then the serving flags work around both
    ([known issues](docs/known-issues.md) item 6).
-2. **A few upstream API fixes on the stable line** (request validation, streaming tool-call finish reasons, logprobs
+3. **A few upstream API fixes on the 0.30 line** (request validation, streaming tool-call finish reasons, logprobs
    of parser-suppressed chunks): cherry-picked and CPU-tested, not published yet.
 
 ## The code lives in the fork
 
-Changes are made on the fork branch, then exported here with `scripts/export-series.sh`; `scripts/check-series.sh`
-fails on any drift.
+Changes are made on the fork branch, then exported here: for 0.30 with `scripts/export-series.sh`, checked by
+`scripts/check-series.sh`; for 0.32 with `git format-patch v0.32.0..v0.32.0-b70.1`, checked by
+`v0.32/scripts/check-series.sh`. Both checks fail on any drift.
 
 ## Upstream
 
@@ -377,7 +403,7 @@ This work stands on other people's:
 2. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
    weights we serve and recommend, made with [AutoRound](https://github.com/intel/auto-round);
    [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels), whose upstream fixes #600, #563, #564, #578 and
-   #586 are in our kernel build (by Guancheng Fu, Chaojun Zhang, Qiming Zhang and Tony Lin);
+   #586 are in our 0.30 kernel build (by Guancheng Fu, Chaojun Zhang, Qiming Zhang and Tony Lin);
    [llm-scaler](https://github.com/intel/llm-scaler) and the XPU work in
    [vLLM #55068](https://github.com/vllm-project/vllm/pull/55068).
 3. **wtdcode** — the [`Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16)

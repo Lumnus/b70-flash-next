@@ -32,7 +32,8 @@
 --kv-offloading-size 128
 --kv-offloading-backend native
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
-# 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it.
+# 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
+# TRITON_ATTN; the target model takes vLLM's XPU default backend (FlashAttention), so no --attention-backend flag.
 --speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 # clients see cached prompt tokens in usage
 --enable-prompt-tokens-details
