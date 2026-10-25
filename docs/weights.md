@@ -1,9 +1,11 @@
 # Weights: Intel AutoRound, AWQ or devan W4A16
 
-Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. We serve and recommend the AWQ build (since
-2026-09-30; with MTP and kernels b70.3 since 2026-10-04); Intel's AutoRound build served in between (2026-10-02 to 04) and
-is the documented alternative; devan's W4A16 (from 2026-09-28) is the reference. The README ranks them and says why; the
-numbers are in [measurements/b70.2.md](measurements/b70.2.md).
+Three 4-bit checkpoints of Qwen3.8-Flash-Next run on this series. We serve and recommend Intel's AutoRound build
+(2026-10-02 to 04, and since 2026-10-07; about 15 days of serving to 2026-10-23, the longest engine 8 days 6 hours). The
+AWQ build (served 2026-09-30 to 2026-10-07; 3 days 16 hours in one engine with MTP and kernels b70.3) is validated too
+and is the alternative; devan's W4A16 (from 2026-09-28) is the reference. Minachist's recalibrated experts, repacked
+into Intel's checkpoint (`tools/minachist_repack.py`), are a supported variant (README, Models). The README ranks them
+and says why; the numbers are in [measurements/b70.2.md](measurements/b70.2.md).
 
 ## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)
 

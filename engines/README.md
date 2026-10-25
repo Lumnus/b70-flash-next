@@ -5,8 +5,8 @@ KV size to your host.
 
 | engine | weights | slots | PLE table | CPU KV tier | offload fix | note |
 |---|---|---|---|---|---|---|
-| **`s16-kv128-mtp3`** + `MODEL=awq` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve and recommend** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3 |
-| `s16-kv128-mtp3` + `MODEL=intel-autoround` | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | the alternative: same code and flags (patch 0028 acts here); verification on the release branch in progress |
+| **`s16-kv128-mtp3`** + `MODEL=intel-autoround` | Intel AutoRound @ `4c67bf68` | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | **what we serve and recommend** (0.30.0-b70.2): MTP k=3, kernels 0.1.14.1+b70.3; patch 0028 acts here |
+| `s16-kv128-mtp3` + `MODEL=awq` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | the validated alternative: same code and flags |
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
 | `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
@@ -26,14 +26,14 @@ MODELS=/srv/models CACHE=/srv/cache MODEL=awq engines/run-example.sh s16-kv128-m
 ## The serving recipe (`s16-kv128-mtp3`, 0.30.0-b70.2; the model is a parameter)
 
 We run it from a source tree, not the image (README, Quick start). One code tree and one set of flags; the weights are
-chosen with `MODEL=awq` (recommended: snapshot from `tools/awq_snapshot.py`, `serve-config-awq.json`) or
-`MODEL=intel-autoround` (`tools/intel_snapshot.py`, `serve-config-intel-autoround.json`). The configuration: MTP k=3,
-16 slots, util 0.88, 262K context, 128 GiB CPU tier, INT8 PLE from NVMe, kernels b70.3. On AWQ it ran 3 days 16 h in one
-engine without an error (README, Endurance). AWQ weights and snapshot: step 1 of "The b70.1 serving recipe" below. Intel
+chosen with `MODEL=intel-autoround` (recommended: `tools/intel_snapshot.py`, `serve-config-intel-autoround.json`) or
+`MODEL=awq` (snapshot from `tools/awq_snapshot.py`, `serve-config-awq.json`). The configuration: MTP k=3, 16 slots,
+util 0.88, 262K context, 128 GiB CPU tier, INT8 PLE from NVMe, kernels b70.3. On Intel it ran 8 days 6 h in one engine
+without an error, on AWQ 3 days 16 h (README, Endurance). AWQ weights and snapshot: step 1 of "The b70.1 serving recipe" below. Intel
 differs only in the weights step (Intel specifics, point 1); points 2 to 5 hold for both.
 
 0. **Code.** Fork branch `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), exported to `patches/`. What was validated where:
-   README, "Validation status" (AWQ ran its endurance on an earlier branch of the same code; the differences are listed
+   README, "Validation status" (Intel ran its endurance on the release code except the flag-file directory, AWQ on an earlier branch; the differences are listed
    in known issues item 12).
 
 Intel specifics (point 1 only; points 2 to 5 are common):

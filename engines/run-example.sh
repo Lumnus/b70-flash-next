@@ -2,8 +2,8 @@
 # run-example.sh <engine> [image] — start one example engine with docker.
 #
 #   engines/run-example.sh awq-s16-kv128-chunked b70-flash-next:0.30.0-b70.1
-#   MODEL=awq engines/run-example.sh s16-kv128-mtp3 <image>          # the b70.2 configuration; the model is a parameter
-#   MODEL=intel-autoround engines/run-example.sh s16-kv128-mtp3 <image>
+#   MODEL=intel-autoround engines/run-example.sh s16-kv128-mtp3 <image>  # the b70.2 configuration (recommended weights)
+#   MODEL=awq engines/run-example.sh s16-kv128-mtp3 <image>              # the model is a parameter
 #
 # MODEL=<name> reads engines/models/<name>.env (MODEL_DIR and SERVE_CONFIG of one checkpoint) after <engine>.env, so
 # the same engine runs either set of weights.

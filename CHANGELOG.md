@@ -2,6 +2,24 @@
 
 Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series changes.
 
+## Repository changes — 2026-10-25: Intel AutoRound recommended, Minachist experts supported
+
+Documentation and one tool; no series change, no new tag.
+
+- **Intel AutoRound is the recommended weights**, AWQ the validated alternative. Intel's endurance on the 0.30.0-b70.2
+  recipe (MTP k=3, 16 slots, 128 GiB CPU KV tier, kernels b70.3): about 15 days of serving from 2026-10-07 to 2026-10-23,
+  the longest engine 8 days 6 h (40,912 requests, 0 errors, 0 aborts). One crash: on 2026-10-13 a card returned
+  `UR_RESULT_ERROR_DEVICE_LOST` during a long memory-store re-ingest; host RAM was not the cause (31 GiB free); cause
+  unknown; restarted the same day, not recurred. README (Validation status, Endurance, Models), `docs/weights.md`,
+  `docs/known-issues.md` item 12, `docs/measurements/b70.2.md`, `engines/` comments and `PROVENANCE.md` updated; every
+  "Intel verification in progress" note removed.
+- **Correction:** the ~23 GiB host-RAM figure for Intel (against ~39 GiB for AWQ) was not the model; Intel leaves
+  39.8 GiB at ready, the same as AWQ.
+- **Minachist experts, a supported variant:** `Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound` branch `new-main` @
+  `411505aa` (qwen-community-1.0), routed experts repacked into Intel's checkpoint by the new `tools/minachist_repack.py`.
+  Measured on the 0.30 perf line against Intel: knowledge, long context and agent smoke within noise, coding 120 vs
+  125 of 150 (n.s.), one-stream decode ~7 % slower. We keep Intel by preference.
+
 ## 0.32.0-b70.1 — 2026-10-25: vLLM 0.32, DFlash2 K=7
 
 What we serve since 2026-10-24, published as a second line next to 0.30.0-b70.2 (unchanged). Everything is in `v0.32/`.
@@ -32,7 +50,8 @@ What we serve since 2026-10-24, published as a second line next to 0.30.0-b70.2 
 
 ## 0.30.0-b70.2 — 2026-10-07: the stable set
 
-AWQ serving fully validated; Intel verification in progress. The configuration we serve since 2026-10-04: the AWQ W4A16
+At release AWQ serving was fully validated and Intel's multi-day run had just started (it has since finished; see
+the 2026-10-25 repository changes above). The configuration we served from 2026-10-04: the AWQ W4A16
 checkpoint (wtdcode) with MTP (3 draft tokens) and a 128 GiB CPU KV tier, on our vllm-xpu-kernels 0.1.14.1+b70.3. It ran
 3 days 16 h in one engine with 0 errors and 0 aborts (README, Endurance). Intel's AutoRound checkpoint on the same code
 and flags is the alternative; a multi-day stability run of it started on 2026-10-07.

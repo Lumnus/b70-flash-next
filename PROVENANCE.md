@@ -259,13 +259,21 @@ is overwritten by 0032 in `vllm/_xpu_ops.py`; 0023 likewise):
 - `b70.3/0006-fix-initialize-atomic_buffer-to-0-to-avoid-race-cond.patch` · `b3e781913912df006e8cde922d63f3dfaca5826abc756462e36c61eb168af008`
 - `b70.3/0007-B70-K1-swap_blocks_batch-H2D-copies-directly-from-pi.patch` · `d0ce420b09a99f2610a8edcfa2866e606c73c5a03365446b2c5ff90aa83863c7`
 
-**Intel weights (the alternative)** [M]: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`
+**Intel weights (recommended; what we serve)** [M]: `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`
 (29 files, 181.24 GB; still the head revision on 2026-10-03), license qwen-community-1.0 per the card. Every file
 sha256-verified against the Hugging Face tree at download. Snapshot: `tools/intel_snapshot.py` (224,280 → 224,113
 tensors; equal in count to the snapshot we serve). Serve config `engines/serve-config-intel-autoround.json`, sha256
 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7`, reproduced by `tools/intel_snapshot.py
 serve-config` byte for byte. INT8 PLE table: as in §6 (built from devan's BF16 table); the identity of Intel's BF16
 PLE rows (shard 16) with devan's table is UNVERIFIED.
+
+**Minachist experts (supported variant)** [M]: `Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound`, branch `new-main`
+@ `411505aaa5588e3dac0693c41e442ba79e897975` (2026-10-23; `main` is a different, earlier calibration), license
+qwen-community-1.0 per the card; downloaded without its BF16 n-gram table (~73 GB), every file sha256-verified. Only
+the routed experts are used: `tools/minachist_repack.py` writes them into copies of the 14 Intel shards that hold
+experts (same keys, dtypes, shapes and sizes) and links everything else from the Intel snapshot. Its `verify` mode
+gave max |diff| 0 against compressed-tensors' own unpack on layers 0, 1, 12, 24, 31, 47 (32 experts × 3 each) and a
+rel-L2 of 0.110–0.119 between Intel's and Minachist's experts. Not redistributed here.
 
 **Runtime we serve on** [M]: torch 2.13.0+xpu, vLLM v0.30.0 XPU environment (the base image's `/opt/venv`) + the
 kernels above, no `libgdn_index64.so`, wu1ff's peer-residency shim (P7), compute-runtime 26.35.39758.10, 4× Arc Pro

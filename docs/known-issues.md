@@ -122,13 +122,13 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 0032 logs it once per requested mode. Harmless. Note: with **stock** 0.1.14.1 kernels and no `libgdn_index64.so`, the stock GDN op is
 32-bit and an engine dies with `DEVICE_LOST` once a block id passes 5,042; keep wu1ff's library or use our kernels.
 
-## 12. The release branch: AWQ validated on an earlier branch of the same code, Intel verification in progress
+## 12. The release branch: Intel validated on the release code except the flag-file directory, AWQ on an earlier branch
 
 From 0.30.0-b70.2 there is one release branch, `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), and the model is a serving
 parameter (`engines/s16-kv128-mtp3.env` + `engines/models/awq.env` or `engines/models/intel-autoround.env`). The branch
 carries the union of the two lines we tested on, with one copy of each fix. It has **not yet been booted on a GPU**.
 
-**AWQ** (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, the build we serve and recommend) was validated on an earlier branch of
+**AWQ** (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, the validated alternative) was validated on an earlier branch of
 the same code: MTP k=3, 16 slots, 128 GiB CPU tier, vllm-xpu-kernels 0.1.14.1+b70.3 (B70-K1). Measured there: the engine
 boots on the first pass (first token 363 s after start); the K1 load line appears on all four workers; the sweep over
 1–10 streams has 0 bad outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok with the engine
@@ -157,8 +157,10 @@ We expect none of these to change AWQ's behaviour, but the release branch has no
 
 **Intel AutoRound** (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`) served on an earlier branch with the same series
 (up to 0031, without the path change above) on kernels b70.2 and b70.3, for hours at a time (README, Models). A
-multi-day stability run of Intel started on 2026-10-07, on that branch plus 0032, i.e. the release code except for the
-flag-file directory: **Intel verification is in progress**.
+multi-day stability run of Intel followed from 2026-10-07, on that branch plus 0032, i.e. the release code except for
+the flag-file directory: about 15 days of serving, the longest engine 8 days 6 hours with 0 errors, and one crash (a
+GPU device-lost on 2026-10-13 under a long memory-store re-ingest, cause unknown; README, Endurance). **Intel is
+validated** and is the build we serve and recommend.
 
 Also not measured: AWQ at 48K prompts on b70.3; token-level identity of the direct copy against staging on AWQ; the
 snapshot `tools/awq_snapshot.py` writes was compared with ours by index only (same 222,579 tensors), not by a boot.
