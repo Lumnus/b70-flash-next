@@ -427,9 +427,12 @@ This work stands on other people's:
    our b70.2: the FP8 `lm_head`, the resident decode MoE op, the step trace and the `bench_det` harness came from there;
    the 0.32 FP8 head (B70-V32-0053) is a port of its 0053, and the 1- and 4-stream numbers in the 0.32 table use
    `bench_det`.
-8. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
-9. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
-   vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
+8. **DominikBucko** — [qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090), the
+   two-card CUDA port. No code is taken from it; its published measurements and design notes (async scheduling and the
+   Mamba state-block fix, prefill chunk sizes, the AVX2 cold-expert path) shaped which levers we measured.
+9. **The Qwen team** — Qwen3.8-Flash-Next itself (license: qwen-community-1.0, see each checkpoint's card).
+10. **[vLLM](https://github.com/vllm-project/vllm)**, on which everything here is built. Patch 0014e is a backport of
+    vllm-project/vllm#51787; patch 0022 ports vllm-project/vllm#55506.
 
 ## License
 
