@@ -1,7 +1,7 @@
 From 273c0671221ec84f66845b45acc54cc5ba36f49f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 20:20:12 +0000
-Subject: [PATCH 37/49] Pin a shared-prefix junction when a sparse group cuts
+Subject: [PATCH 37/50] Pin a shared-prefix junction when a sparse group cuts
  the offload hit
 
 On a hybrid model (full attention + Mamba or sliding window) under sparse

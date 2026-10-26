@@ -1,7 +1,7 @@
-From cd0bb0c45dfdc7b4c697a957508ec2f463feb9b6 Mon Sep 17 00:00:00 2001
+From 4895e61f06d6c5386bac44012e5e0c528bd98a60 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 19:53:38 +0000
-Subject: [PATCH 06/32] B70-QSA-06: QSA reference and prepare tests run on XPU
+Subject: [PATCH 06/36] B70-QSA-06: QSA reference and prepare tests run on XPU
 
 - Device from the platform (xpu or cuda) instead of hard-coded cuda; the
   kernel tests are enabled on XPU.

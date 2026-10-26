@@ -1,7 +1,7 @@
 From bcb8870d210c05a71ff1193ed3c31aa1ed12f63f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 23:38:03 +0000
-Subject: [PATCH 39/49] B70-V32-01: env-gated eager dispatch for C1-shaped
+Subject: [PATCH 39/50] B70-V32-01: env-gated eager dispatch for C1-shaped
  DFlash2 K=7 batches (B70_C1_EAGER_ROUTE=1)
 
 With FULL graphs on, wu1ff c1_verify (guarded target graphs, canonical

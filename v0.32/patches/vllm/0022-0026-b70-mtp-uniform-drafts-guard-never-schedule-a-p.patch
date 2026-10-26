@@ -1,7 +1,7 @@
 From df11975be973e69ee382a94b222ac3497fb0e7af Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Thu, 1 Oct 2026 20:25:16 +0000
-Subject: [PATCH 22/49] 0026-b70-mtp-uniform-drafts-guard: never schedule a
+Subject: [PATCH 22/50] 0026-b70-mtp-uniform-drafts-guard: never schedule a
  partial draft list on XPU
 
 The XPU GDN kernel (vllm-xpu-kernels 0.1.14 gdn_attn_interface.cpp:119, and

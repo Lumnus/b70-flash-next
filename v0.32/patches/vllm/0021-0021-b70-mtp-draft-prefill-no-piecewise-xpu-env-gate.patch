@@ -1,7 +1,7 @@
 From 38795510eba14c719b195765c4ba41231f0eb692 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Thu, 1 Oct 2026 17:11:02 +0000
-Subject: [PATCH 21/49] 0021-b70-mtp-draft-prefill-no-piecewise-xpu: env-gated
+Subject: [PATCH 21/50] 0021-b70-mtp-draft-prefill-no-piecewise-xpu: env-gated
  FULL-only draft prefill graphs on XPU
 
 On XPU the MTP draft prefill's breakable PIECEWISE capture fails at its

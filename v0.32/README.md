@@ -1,15 +1,16 @@
-# 0.32.0-b70.1 — Qwen3.8-Flash-Next on vLLM 0.32, 4× Intel Arc Pro B70
+# 0.32.0-b70.4 — Qwen3.8-Flash-Next on vLLM 0.32, 4× Intel Arc Pro B70
 
 The current line (configuration validated on 2026-10-24): vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
 from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM fixes cherry-picked. Speculative
-decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 8 sequences,
+decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 12 sequences (8 up to b70.3),
 4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. This
-release is the **dense** attention variant (the checkpoint's QSA indexer is dropped); the sparse variant
-is described below ([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2, near dense speed from 0.32.0-b70.3: working, experimental).
+page describes both attention variants, **both working**: **dense** (the checkpoint's QSA indexer is dropped) and **sparse**
+([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2, near dense speed from 0.32.0-b70.3, split KV groups
+from 0.32.0-b70.4: working, experimental).
 
 | | |
 |---|---|
-| code | fork tag [`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1) = branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0) @ `103f2f2eb9`, 49 commits on vLLM v0.32.0 (`5df63a7203`), exported to [`patches/vllm/`](patches/vllm/) |
+| code | dense: fork tag [`v0.32.0-b70.4-dense`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4-dense) (branch `b70/v0.32.0-dense-b70.4`), 50 commits on vLLM v0.32.0 (`5df63a7203`), exported to [`patches/vllm/`](patches/vllm/); commits 1–49 are the b70.1 series (tag `v0.32.0-b70.1`, `103f2f2eb9`), 50 is the #54163 backport. Sparse: fork tag [`v0.32.0-b70.4`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4) (branch `b70/v0.32.0-qsa-b70.4`), 36 more commits, exported to [`patches/vllm-qsa/`](patches/vllm-qsa/) |
 | weights | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (the only build measured on 0.32) + drafter `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` |
 | GPUs | 4× Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
 | attention | the target model on vLLM's XPU default backend (FlashAttention); the drafter on `TRITON_ATTN` (`serve.args`) |
@@ -123,11 +124,11 @@ Upstream fixes folded in (all six are our posted PRs; none merged as of 2026-10-
 
 ## The series
 
-[`patches/vllm/`](patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.1` of the fork; `scripts/check-series.sh`
+[`patches/vllm/`](patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.4-dense` of the fork; `scripts/check-series.sh`
 fails if it differs from a fresh export.
 `tools/check-trunk-tree.sh` is the tree-level counterpart for maintainers: it applies both series (dense and sparse) to
-vanilla v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere except the last
-N commits (the hot/cold set); see the header of the script.
+vanilla v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere except the hot/cold
+commits (`--hotcold-count N`, with `--hotcold-tip` when later commits sit on top of them); see the header of the script.
 
 | patches | what | author |
 |---|---|---|
@@ -136,6 +137,7 @@ N commits (the hot/cold set); see the header of the script.
 | 0017–0034 | our 0.30 layers ported: INT8 PLE from NVMe on wu1ff's host-prepared PLE (B70-L32-0013), thinking budget per effort, repetition stop, effort alias, dense-QSA indexer skip (main + MTP), MTP draft prefill graphs, uniform drafts guard, step trace, offload trace / junction / GDN backstep / empty-advance guard, prompt logprobs chunks, and their CPU tests | Lumnus |
 | 0035–0037 | revert of our 0029b port, then vllm-project/vllm#63564 and #63566 | Lumnus |
 | 0038–0049 | 0.32-specific: B70-V32-PR2, -01, -0053, -02/-02b (diagnostic), -03/-03b, -04, -07, -0054 (off), -08, -RC1 | Lumnus |
+| 0050 | b70.4: backport of vllm-project/vllm#54163 (merged upstream 2026-10-23): `needs_eagle_block_drop()` excludes DFlash/DSpark, so the trailing prefix-cache block is no longer dropped for them and `disable_eagle_block_drop` is not needed. Applied by hand where the 0.32 line lacks `is_xpress`; its tests ported | Lumnus |
 
 Off by default and not used in the served configuration: B70-V32-01 (`B70_C1_EAGER_ROUTE`), -02/-02b
 (`B70_PHASE_TIMING`), -04 (`B70_HC_PARALLEL_MAX_ROWS`, superseded by -07), -0054 (`B70_MOE_DECODE_OP_RESIDENT`; the
@@ -180,7 +182,7 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
 
 2. **Python environment.**
    ```bash
-   git clone -b v0.32.0-b70.1 https://github.com/Lumnus/vllm.git vllm-b70-0.32
+   git clone -b v0.32.0-b70.4-dense https://github.com/Lumnus/vllm.git vllm-b70-0.32
    uv venv --python 3.12 /opt/b70/venv
    uv pip install --python /opt/b70/venv/bin/python --index-strategy unsafe-best-match \
        --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/xpu/ \
@@ -255,15 +257,16 @@ on `enable_thinking=false` or a "none/off" effort); it is not included.
 
 ## Sparse attention (QSA)
 
-**Status: working, experimental, close to dense speed.** Release 0.32.0-b70.2 added a second attention variant on top of
-the dense one; 0.32.0-b70.3 brought it near dense speed. The checkpoint's QSA indexer is kept and the full-attention layers
+**Status: working, experimental; on par with or ahead of dense on agent sessions and long context, a few percent behind on short
+context.** Release 0.32.0-b70.2 added a second attention variant on top of the dense one; 0.32.0-b70.3 brought it near
+dense speed; 0.32.0-b70.4 fixed its KV packing. The checkpoint's QSA indexer is kept and the full-attention layers
 attend over the indexer's selection (a 2,048-token budget) with Triton kernels, instead of over the whole context. It boots
 on 4× B70, answers correctly, passes the gates and the long-context needles, and its output matches dense up to the
 selection budget. Against dense on the same harness it is 0.90× on one-stream decode and prefill, 1.00× at 4 concurrent
 streams, 0.94× at 8, and faster than dense at 131K prefill, with 14 % less GPU KV (342K against 397K tokens). The dense
-series ([`patches/vllm/`](patches/vllm/), the release above) is unchanged in its patches and stays the default.
+series ([`patches/vllm/`](patches/vllm/), the release above) stays the default.
 
-| | dense | sparse QSA (b70.3) | sparse / dense | sparse in b70.2 (superseded) |
+| micro-benchmark, b70.3 build, dense at 8 slots | dense | sparse QSA (b70.3) | sparse / dense | sparse in b70.2 (superseded) |
 |---|---|---|---|---|
 | decode, 1 stream (tok/s) | 169.3 | 153.1 | 0.90 | 125.0 (0.74) |
 | decode, 4 concurrent (total tok/s) | 306.2 | 306.1 | 1.00 | 161.2 (0.53) |
@@ -278,15 +281,38 @@ beyond that KL 0.0224 against dense on a 12K-token document, where dense's own r
 kernel-level comparison with Intel's SYCL kernel (labelled as kernel level), the gates, the stress stage, the levers that
 were tried and not shipped, and what is not measured are in [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md).
 
+**b70.4, end to end.** Same trunk code for both variants (the published series are tree-identical to it, checked by
+[`tools/check-trunk-tree.sh`](../tools/check-trunk-tree.sh)). Agent-style session replay (recorded multi-turn, 243 requests):
+sparse about 205 s (204.7 s, median decode 69.3 tok/s, 0 preemptions, draft acceptance length 5.06) against about 232 s
+for dense (median decode 45–52 tok/s; earlier back-to-back boots at 230–235 s). Short context, same window: one-stream
+decode 0.92× dense, 4 streams level, 8 streams 0.93×, prefill up to 32K 0.89×; long prefill: 131K 1.06×, 260K 1.31×
+(4,480 against 3,420 tok/s). Long-context task set (384 items, exact match): equal up to 8K, 128K 80/78 % sparse against
+72/72 % dense; real-document next-token loss at 32–128K 1.399 against 1.417 nats/token. GPU KV 344,706 tokens at 12
+slots against 397,309 for dense (both with the patched plugin). The multi-stream rows of the b70.3 table were not
+repeated on the b70.4 build; the dense engine was not re-measured at 12 slots. Method, floors and caveats (retrieval-type
+tasks and three documents; no generation or reasoning tasks): [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md) §0.
+
+**What b70.4 changed.** The sparse engine packed all 12 full-attention layers and their compressed-key caches into one KV
+group, so every block was 10.9 MB and every small per-request state group (GDN, PLE conv, QSA ring, DFlash SWA) paid whole
+fat blocks (about 425 MiB per running request against about 287 MiB on dense: 32 % less free KV at 6 running requests). Patches 0033 and 0036 split
+that bucket into 66 groups of 905,216 B blocks (`B70_KV_SPLIT_GROUPS=0` restores the old packing; `B70_KV_PACK_REPEATS=<n>`
+sets the repeat explicitly and wins). Outputs are unchanged (teacher-forced KL against unsplit sparse at its own noise
+floor), the agent replay's GPU prefix hit rate goes from about 0.37 to about 0.46, and KV usage on it from 73 % to 62 %.
+Patch 0034 adds `B70_QSA_OPTIMER` (a per-op timer around the QSA ops, off by default; it replaces the XPU profiler,
+which hangs the engine on the first decode graph replay) and 0035 a cache-path lifecycle driver. The engine files run
+12 sequences with a capture list of every multiple of 8 up to 96; 12 against 8 slots on the sparse engine is within
+boot-to-boot noise.
+
 **What b70.3 fixed.** The b70.2 sparse build ran out of GPU memory on 131K prefills under load (about 800 MiB, inside the
 deterministic top-k's tie repair) and was 0.46–0.53× dense at 4–8 streams. The tie repair is now device-only (no host
 synchronisation, no full-width sort), as a fused Triton select, and the faster scorer launch configurations from the sweeps
 are the defaults. The build passed a stress stage of repeated 131K prefills plus 8-stream decode.
 
-**What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 32 patches, applied on top of
-[`patches/vllm/`](patches/vllm/) (that is, on fork tag `v0.32.0-b70.1`, `103f2f2eb9`); the fork branch is
-[`b70/v0.32.0-qsa-release`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-release). `scripts/check-series.sh --qsa`
-fails if the directory differs from a fresh export of it. Every patch is authored `Lumnus`; 0001 is the upstream
+**What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 36 patches, applied on top of
+[`patches/vllm/`](patches/vllm/) (that is, on fork tag `v0.32.0-b70.4-dense`); the fork tag is `v0.32.0-b70.4`, branch
+[`b70/v0.32.0-qsa-b70.4`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-b70.4). The b70.2/b70.3 branch `b70/v0.32.0-qsa-release` is the same 32 commits on the b70.1 base. `scripts/check-series.sh --qsa`
+fails if the directory differs from a fresh export of it. The first 32 patches are unchanged in content from b70.3; their
+headers (`From <sha>`, `[PATCH n/36]`) are regenerated because patch 0050 now sits below them. Every patch is authored `Lumnus`; 0001 is the upstream
 vllm-project/vllm#60602 cherry-pick.
 
 | patches | what |
@@ -297,6 +323,7 @@ vllm-project/vllm#60602 cherry-pick.
 | 0017–0019, 0022 | qualification: off-by-default hooks for the QSA side caches, `B70_QSA_TOPK=native_det` (the native top-k with the torch selector's output), 148 side-cache state-contract tests and an engine lifecycle driver |
 | 0026 | a one-time log line naming the sparse attention implementation in use |
 | 0027–0032 | 0.32.0-b70.3: `native_det`'s tie repair without a host sync or a full-width sort (0027; `B70_QSA_TOPK=radix` as an alternative), top-k once per verify step and skip-when-fits (0028, both off by default), the scorer launch defaults from the sweeps (0029; `B70_QSA_SCORE_DEFAULTS=legacy` restores the old ones), CPU tests for them (0030), the fused Triton select and the radix schedule by width (0031; `B70_QSA_TOPK_SELECT_IMPL=triton`), profiler buckets for `attn2` and the select (0032) |
+| 0033–0036 | 0.32.0-b70.4: the split packed full-attention KV bucket (0033, env-gated), `B70_QSA_OPTIMER` per-op timer (0034, off by default) and its report script, `qsa_engine_lifecycle2` and its tests (0035), split groups on by default (0036) |
 
 Off by default: `attn2` (`B70_QSA_ATTN_IMPL`, default `splitk`, the first kernel), `native_det` (`B70_QSA_TOPK`, default
 `auto`), the Triton select (`B70_QSA_TOPK_SELECT_IMPL`, default `torch`), top-k once per verify step
@@ -307,7 +334,7 @@ and dump hooks. The engine file turns on `attn2`, `native_det` and the Triton se
 **Run it.** Build as in [Build and run](#build-and-run), with the add-on applied after the dense series:
 
 ```bash
-git clone -b b70/v0.32.0-qsa-release https://github.com/Lumnus/vllm.git vllm-b70-0.32   # instead of the v0.32.0-b70.1 tag in step 2
+git clone -b v0.32.0-b70.4 https://github.com/Lumnus/vllm.git vllm-b70-0.32   # instead of the v0.32.0-b70.4-dense tag in step 2
 # or, in a clone of the dense tag:  git am v0.32/patches/vllm-qsa/*.patch
 ```
 
@@ -320,21 +347,20 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
 
 **Known issues (sparse).**
 
-1. **Slower than dense** by about 10 % on one stream, at prefill up to 32K and at 8 streams (above); at 4 streams and at
-   131K prefill it matches or beats it. No in-engine profile exists (the torch profiler hangs the engine on XPU), so where
+1. **Slower than dense on short context** by 3–11 % on one stream, at prefill up to 32K and at 8 streams (above); at 4 streams
+   it matches, and at 131K+ prefill and on agent-style session replays it beats it. No in-engine profile exists (the torch profiler hangs the engine on XPU), so where
    the remaining time goes is inferred.
-2. **KV capacity −14 %** against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
+2. **KV capacity about −13 %** (344,706 against 397,309 tokens) against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
    `kernel_block_size=16` is not fully optimised).
 3. **Both variants are run-to-run nondeterministic from about token 512**, so bit-level comparison gates fail on either;
    fidelity was measured with KL against a same-engine floor instead.
 4. **Prefill at 262K**: the first Triton kernel, run on Intel's main-branch Triton, beats `attn2` there (15.6 against
    17.6 ms per layer, kernel level); the release uses Triton 3.8.0.
-5. **No multi-day run**, no task-level quality comparison with dense, one host, Intel AutoRound only
+5. **No multi-day run**, no generation or reasoning quality comparison with dense (retrieval-type tasks and next-token loss are measured), one host, Intel AutoRound only
    ([measurements, what this does not show](../docs/measurements/v0.32-qsa.md#5-what-this-does-not-show)).
 6. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); do not serve it.
    `native_det` is the qualified native mode.
-7. **Not run on the sparse engine:** DFlash's trailing-block drop turned off (`disable_eagle_block_drop`, set in the dense
-   `serve.args`), and the stock oneCCL plugin.
+7. **Not run on the sparse engine:** the stock oneCCL plugin (`serve.env`). DFlash's trailing-block drop is off in both variants since b70.4 through patch 0050 (the sparse engine ran without the flag in the b70.4 validation).
 
 ## Known issues (0.32)
 
@@ -351,5 +377,10 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    item 1), liveness must generate, and pinned memory escapes container limits.
 7. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the burst gate and
    a token compare (garbage and divergence check, not an equivalence test) before serving.
-8. **The kernels build is not attached.** Build it as in step 3 (~26 min on our build host with flash-attention and
+8. **Kernels stay at `release/0.1.15.4` + our local patch (the GDN 64-bit conv-state offset).** vllm-xpu-kernels 0.1.16.2
+   from PyPI does not carry upstream #658: on one card, `tests/gdn_attn/test_causal_conv1d.py -k large_state_offset` fails 3
+   of 3 (float16 prefill, decode, spec: the guard line is overwritten). The same wheel does contain the paged-decode row
+   `16,256,64,false,false,false` that the 0.1.15.4 build lacks (only a 2-card layout needs it). Re-test when a wheel or tag
+   after #658 appears.
+9. **The kernels build is not attached.** Build it as in step 3 (~26 min on our build host with flash-attention and
    MQA off; much longer with them on).

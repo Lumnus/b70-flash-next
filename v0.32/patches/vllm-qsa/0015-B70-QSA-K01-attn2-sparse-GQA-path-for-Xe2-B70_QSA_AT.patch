@@ -1,7 +1,7 @@
-From 84f1ad073c566c65260bd8b7405ec49758698cce Mon Sep 17 00:00:00 2001
+From f2b787f3c15001811f0e918f8c559a52e8d1a772 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 22:41:58 +0000
-Subject: [PATCH 15/32] B70-QSA-K01: attn2 sparse GQA path for Xe2
+Subject: [PATCH 15/36] B70-QSA-K01: attn2 sparse GQA path for Xe2
  (B70_QSA_ATTN_IMPL=attn2), no register spills
 
 The splitk kernel holds a [BLOCK_M, HEAD_DIM] fp32 accumulator plus gathered

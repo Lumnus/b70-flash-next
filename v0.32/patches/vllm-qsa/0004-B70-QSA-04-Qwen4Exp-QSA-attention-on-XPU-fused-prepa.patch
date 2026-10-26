@@ -1,7 +1,7 @@
-From 5ee621efbca66256ea53d05c35b43d6144523973 Mon Sep 17 00:00:00 2001
+From 918b52894ddb9698b2c085b6fcd826a916a5edf8 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 19:53:38 +0000
-Subject: [PATCH 04/32] B70-QSA-04: Qwen4Exp QSA attention on XPU: fused
+Subject: [PATCH 04/36] B70-QSA-04: Qwen4Exp QSA attention on XPU: fused
  prepare, portable unfused path
 
 - use_fused_qk_norm_rope_gate accepts XPU, as Qwen3NextAttention already does

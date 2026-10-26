@@ -1,7 +1,7 @@
 From bc041ac319d9c6abf121a87dc7623b70b744ebd5 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 04:53:16 +0000
-Subject: [PATCH 46/49] B70-V32-07: DFlash2 fixed-order HC down projection only
+Subject: [PATCH 46/50] B70-V32-07: DFlash2 fixed-order HC down projection only
  up to B70_HC_ORDERED_MAX_ROWS rows
 
 Wider batches take the stock BF16 GEMM. Measured on one B70 (K=10240, N=336): ordered Triton

@@ -1,7 +1,7 @@
 From fff892eff63dc4d91f57dd86e632146ee11d489d Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 01:58:01 +0000
-Subject: [PATCH 41/49] B70-V32-02: per-step GPU/host phase timing in the V2
+Subject: [PATCH 41/50] B70-V32-02: per-step GPU/host phase timing in the V2
  runner (diagnostic, B70_PHASE_TIMING=1)
 
 Timing events (resolved by query, never synchronized) at exec/fwd/sample/post/draft/kvpost/end;

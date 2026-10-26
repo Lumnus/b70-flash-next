@@ -5,17 +5,17 @@
 #   v0.32/scripts/check-series.sh --qsa [--git-dir DIR] [--qsa-ref REF]
 #
 #   --git-dir  a vLLM clone (default: ./vllm-src-032, cloned on demand from https://github.com/Lumnus/vllm.git)
-#   --ref      default v0.32.0-b70.1 (tag; branch b70/v0.32.0 carries the same commits)
+#   --ref      default v0.32.0-b70.4-dense (tag: the dense series, 50 commits; v0.32.0-b70.1 is the same series without the last one)
 #
 # The export is `git format-patch` of v0.32.0..REF, one file per commit, abbrev 10, no signature.
 #
-#   --qsa      check the sparse add-on instead: v0.32/patches/vllm-qsa/ against the export of v0.32.0-b70.1..QSA-REF
-#   --qsa-ref  default b70/v0.32.0-qsa-release (branch of the same fork; the release tag, once cut, names the same commit)
+#   --qsa      check the sparse add-on instead: v0.32/patches/vllm-qsa/ against the export of REF..QSA-REF
+#   --qsa-ref  default v0.32.0-b70.4 (tag of the same fork: dense series plus the 36 sparse commits)
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
 REPO_URL=https://github.com/Lumnus/vllm.git
-gd="$PWD/vllm-src-032"; ref=v0.32.0-b70.1; qsa=0; qref=b70/v0.32.0-qsa-release
+gd="$PWD/vllm-src-032"; ref=v0.32.0-b70.4-dense; qsa=0; qref=v0.32.0-b70.4
 while [ $# -gt 0 ]; do
   case "$1" in
     --git-dir) gd=$2; shift 2 ;;
@@ -32,7 +32,7 @@ fi
 git -C "$gd" rev-parse -q --verify "$ref^{commit}" >/dev/null || git -C "$gd" fetch -q --tags origin
 if [ "$qsa" = 1 ]; then
   git -C "$gd" fetch -q origin "$qref" 2>/dev/null || git -C "$gd" fetch -q origin "refs/tags/$qref:refs/tags/$qref"
-  qcommit=$(git -C "$gd" rev-parse FETCH_HEAD 2>/dev/null || git -C "$gd" rev-parse "refs/tags/$qref^{commit}")
+  qcommit=$(git -C "$gd" rev-parse "FETCH_HEAD^{commit}" 2>/dev/null || git -C "$gd" rev-parse "refs/tags/$qref^{commit}")
   git -C "$gd" merge-base --is-ancestor "$ref^{commit}" "$qcommit" || { echo "$qref does not descend from $ref" >&2; exit 1; }
   tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
   git -C "$gd" -c core.abbrev=10 format-patch -q --no-signature -o "$tmp" "$ref..$qcommit"

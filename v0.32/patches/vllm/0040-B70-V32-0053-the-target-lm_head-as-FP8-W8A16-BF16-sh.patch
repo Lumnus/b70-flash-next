@@ -1,7 +1,7 @@
 From e0fd2ce8d109b3064e0d9a58c44c5b7e04af343a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 23:53:51 +0000
-Subject: [PATCH 40/49] B70-V32-0053: the target lm_head as FP8 W8A16, BF16
+Subject: [PATCH 40/50] B70-V32-0053: the target lm_head as FP8 W8A16, BF16
  shard released (B70_HEAD_FP8=1), port of B70-0053/0048 head
 
 New nvidia/b70_fp8_head.py (B70Fp8Head + b70_fp8_head_of from 0048/0053) instead of the

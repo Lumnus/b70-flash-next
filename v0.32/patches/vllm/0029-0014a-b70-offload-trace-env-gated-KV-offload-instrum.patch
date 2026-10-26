@@ -1,7 +1,7 @@
 From bf490d613352ca9f6a567b54ec03927472d10b65 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:36:45 +0000
-Subject: [PATCH 29/49] 0014a-b70-offload-trace: env-gated KV-offload
+Subject: [PATCH 29/50] 0014a-b70-offload-trace: env-gated KV-offload
  instrumentation (B70_OFFLOAD_TRACE=1)
 
 Default off; with the flag unset the connector behaves as upstream.

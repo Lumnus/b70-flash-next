@@ -1,7 +1,7 @@
 From a5a2e894f27e0eeb9bb09561ebcc9640473bd369 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 04:50:25 +0000
-Subject: [PATCH 47/49] B70-V32-0054: the 0048 resident decode MoE op on the EP
+Subject: [PATCH 47/50] B70-V32-0054: the 0048 resident decode MoE op on the EP
  layout (B70_MOE_DECODE_OP_RESIDENT=1), port of B70-0054
 
 Loader in fused_moe/b70_decode_op.py (no hot/cold machinery: all experts resident). Refuses under wu1ff

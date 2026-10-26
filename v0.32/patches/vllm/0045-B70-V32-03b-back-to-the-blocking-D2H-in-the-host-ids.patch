@@ -1,7 +1,7 @@
 From 95589bd04e5e232ac8ab206de406cf20b690af8f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 03:46:42 +0000
-Subject: [PATCH 45/49] B70-V32-03b: back to the blocking D2H in the host-ids
+Subject: [PATCH 45/50] B70-V32-03b: back to the blocking D2H in the host-ids
  producer (event polling bought nothing; unbounded spin)
 
 ---

@@ -1,7 +1,7 @@
 From 499a074d24770a2af9e4076573515f5619c5854b Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 13:05:29 +0000
-Subject: [PATCH 19/49] 0019-b70-qwen4exp-dense-qsa-skip-indexer: drop
+Subject: [PATCH 19/50] 0019-b70-qwen4exp-dense-qsa-skip-indexer: drop
  *.self_attn.indexer.* weights on dense-QSA configs
 
 Dense-QSA configs (no indexer_n_heads) build no indexer module, but some

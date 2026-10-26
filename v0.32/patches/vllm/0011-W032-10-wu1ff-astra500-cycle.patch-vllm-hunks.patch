@@ -1,7 +1,7 @@
 From 4c3ffc8c3f17d030347a72ce34aa48f8c521aa65 Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 11/49] W032-10: wu1ff astra500-cycle.patch (vllm/ hunks)
+Subject: [PATCH 11/50] W032-10: wu1ff astra500-cycle.patch (vllm/ hunks)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

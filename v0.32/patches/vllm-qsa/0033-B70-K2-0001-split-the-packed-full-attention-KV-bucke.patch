@@ -1,0 +1,188 @@
+From 8a21a4b3053b5decc2827861262fd55ad596e445 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 09:42:34 +0000
+Subject: [PATCH 33/36] B70-K2-0001: split the packed full-attention KV bucket
+ (QSA), env-gated
+
+On the sparse (QSA) engine the trunk packs all 12 full-attention layers and
+their 12 compressed-key caches into one KV group, so every block is 10.9 MB and
+each small per-request state group (GDN x(2+K), PLE short conv, QSA ring,
+DFlash SWA) pays whole fat blocks: ~425 MiB per running request vs ~287 MiB on
+dense, -32 % free KV at 6 running.
+
+B70_KV_SPLIT_GROUPS=1 lowers the repeat floor of the balanced mixed-page
+bucket to 1 (66 groups, 905,216 B blocks); B70_KV_PACK_REPEATS=<n> sets n
+explicitly and wins. Both unset = upstream packing (default off). Split groups
+pair full_i with its own side caches by layer index, not dict order.
+
+CPU: tests/v1/core/test_b70_kv_pack_repeats.py (6 env cases x 5 shuffled
+orders: partition, per-layer pairing, group count, bytes per block).
+test_kv_cache_utils.py failure set unchanged vs HEAD (49 pre-existing).
+---
+ tests/v1/core/test_b70_kv_pack_repeats.py | 91 +++++++++++++++++++++++
+ vllm/v1/core/kv_cache_utils.py            | 33 +++++++-
+ 2 files changed, 122 insertions(+), 2 deletions(-)
+ create mode 100644 tests/v1/core/test_b70_kv_pack_repeats.py
+
+diff --git a/tests/v1/core/test_b70_kv_pack_repeats.py b/tests/v1/core/test_b70_kv_pack_repeats.py
+new file mode 100644
+index 0000000000..8707ff7229
+--- /dev/null
++++ b/tests/v1/core/test_b70_kv_pack_repeats.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: Apache-2.0
++# B70-K2-0001: split the packed full-attention bucket (QSA) behind
++# B70_KV_SPLIT_GROUPS / B70_KV_PACK_REPEATS. CPU only: real-shaped Flash-Next
++# QSA specs, shuffled insertion orders; checks partition, per-layer pairing of
++# compressed-key caches with their own attention layer, and block sizes.
++import random
++import re
++import types
++
++import pytest
++import torch
++
++import vllm.v1.core.kv_cache_utils as U
++from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator as C
++from vllm.v1.kv_cache_interface import (CircularBufferSpec, FullAttentionSpec,
++                                        MambaSpec, MLAAttentionSpec,
++                                        SlidingWindowSpec)
++from vllm.v1.kv_cache_layout import KVCacheLayout
++
++BF = torch.bfloat16
++BS = 832
++K = 7
++
++
++def _items():
++    gdn = C.gated_delta_net_state_shape(4, 16, 48, 128, 128, 4, K)
++    ple = C.short_conv_state_shape(1, 10240, 10, K)
++    items = []
++    for L in range(48):
++        p = f"language_model.model.layers.{L}"
++        if L % 4 == 3:
++            items.append((f"{p}.self_attn.attn", FullAttentionSpec(block_size=BS, num_kv_heads=1, head_size=256, head_size_v=256, dtype=BF)))
++            items.append((f"{p}.self_attn.indexer.compressed_key_cache", MLAAttentionSpec(block_size=BS, num_kv_heads=1, head_size=128, dtype=BF, tokens_per_state=4)))
++            items.append((f"{p}.self_attn.indexer.raw_key_cache", CircularBufferSpec(block_size=16, num_kv_heads=1, head_size=128, head_size_v=0, dtype=BF)))
++        else:
++            items.append((f"{p}.linear_attn", MambaSpec(shapes=tuple(gdn), dtypes=(BF, torch.float32), block_size=BS, page_size_padded=851968, mamba_cache_mode="align", num_speculative_blocks=K)))
++    items.append(("language_model.model.layers.2.ple.short_conv", MambaSpec(shapes=tuple(ple), dtypes=(BF,), block_size=BS, page_size_padded=851968, mamba_cache_mode="align", num_speculative_blocks=K, tp_replicated=True)))
++    for i in range(5):
++        items.append((f"drafter.model.layers.{i}.self_attn.attn", SlidingWindowSpec(block_size=BS, num_kv_heads=2, head_size=128, dtype=BF, sliding_window=2048)))
++    return items
++
++
++def _cfg():
++    cc = types.SimpleNamespace(get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC, mamba_cache_mode="align")
++    return types.SimpleNamespace(cache_config=cc, model_config=types.SimpleNamespace(max_model_len=262144),
++                                 max_in_flight_tokens=8192,
++                                 parallel_config=types.SimpleNamespace(decode_context_parallel_size=1),
++                                 num_speculative_tokens=K)
++
++
++def _idx(n):
++    return re.search(r"layers\.(\d+)\.", n).group(1)
++
++
++@pytest.fixture(autouse=True)
++def _stub(monkeypatch):
++    monkeypatch.setattr(U, "_annotate_eagle_groups", lambda *a, **k: None)
++    monkeypatch.setattr(U, "_warn_if_unannotated_eagle_mamba", lambda *a, **k: None)
++    monkeypatch.setattr(U, "_uses_trailing_mtp_layers", lambda *a, **k: False)
++    monkeypatch.delenv("B70_KV_PACK_REPEATS", raising=False)
++    monkeypatch.delenv("B70_KV_SPLIT_GROUPS", raising=False)
++
++
++# env -> (groups, bytes per block); unset = upstream packing
++CASES = [
++    ({}, 7, 10_862_592),
++    ({"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592),
++    ({"B70_KV_SPLIT_GROUPS": "1"}, 66, 905_216),
++    ({"B70_KV_PACK_REPEATS": "1"}, 66, 905_216),
++    ({"B70_KV_PACK_REPEATS": "3"}, 23, 2_715_648),
++    ({"B70_KV_SPLIT_GROUPS": "1", "B70_KV_PACK_REPEATS": "3"}, 23, 2_715_648),
++]
++
++
++@pytest.mark.parametrize("seed", range(5))
++@pytest.mark.parametrize("env,groups,bpb", CASES)
++def test_pack_repeats(monkeypatch, seed, env, groups, bpb):
++    for k, v in env.items():
++        monkeypatch.setenv(k, v)
++    it = _items()
++    random.seed(seed)
++    random.shuffle(it)
++    sp = dict(it)
++    g = U._get_packed_kv_cache_groups(_cfg(), sp)
++    for x in g:
++        cmp_ = [_idx(n) for n in x.layer_names if n.endswith("compressed_key_cache")]
++        att = [_idx(n) for n in x.layer_names if n.endswith("self_attn.attn") and not n.startswith("drafter")]
++        assert sorted(cmp_) == sorted(att), x.layer_names
++    assert sorted(n for x in g for n in x.layer_names) == sorted(sp)
++    assert len(g) == groups
++    assert U._get_kv_cache_bytes_per_block(g, KVCacheLayout.BLNHC) == bpb
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 03c6c5ff62..9d9e1bd067 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -6,6 +6,7 @@ import copy
+ import hashlib
+ import math
+ import os
++import re
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator, Sequence
+ from dataclasses import dataclass, field, replace
+@@ -1857,6 +1858,30 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
+     return best_d
+ 
+ 
++def _b70_layer_index(name: str) -> tuple[int, str]:
++    m = re.search(r"layers\.(\d+)\.", name)
++    return (int(m.group(1)) if m else 1 << 30, name)
++
++
++def _b70_pack_repeats_floor(floor: int) -> int:
++    """B70-K2: lower the repeat floor that keeps a balanced mixed-page bucket
++    (QSA: 12 full-attention + 12 compressed-key layers) in one group. With one
++    group every per-request state group (GDN, PLE, QSA ring, draft SWA) pays a
++    whole ~10.9 MB block; splitting the bucket shrinks the block (~0.9 MB at
++    n=1). B70_KV_SPLIT_GROUPS=1 means n=1; B70_KV_PACK_REPEATS=<n> sets n
++    explicitly and wins. Both unset (default) = upstream behaviour."""
++    raw = os.environ.get("B70_KV_PACK_REPEATS")
++    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "0") not in ("", "0"):
++        raw = "1"
++    if not raw:
++        return floor
++    value = max(1, min(int(raw), floor))
++    logger.info_once(
++        "B70-K2: packed KV repeat floor %d -> %d (B70_KV_PACK_REPEATS)", floor, value
++    )
++    return value
++
++
+ def _get_packed_kv_cache_groups(
+     vllm_config: VllmConfig,
+     kv_cache_spec: dict[str, KVCacheSpec],
+@@ -1918,7 +1943,7 @@ def _get_packed_kv_cache_groups(
+                 for spec, _, balanced in bucketed
+                 if balanced
+             ],
+-            lower_bound=min_repeats_per_group,
++            lower_bound=_b70_pack_repeats_floor(min_repeats_per_group),
+         )
+         if min_repeats_per_group
+         else None
+@@ -1972,7 +1997,11 @@ def _get_packed_kv_cache_groups(
+             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
+             continue
+ 
+-        pattern_repeats = list(zip(*page_size_layers.values()))
++        # B70-K2: pair the layers of one repeat by layer index, not by dict
++        # order, so a split group always holds full_i with its own side caches.
++        pattern_repeats = list(
++            zip(*(sorted(v, key=_b70_layer_index) for v in page_size_layers.values()))
++        )
+         for i in range(num_groups):
+             group_layer_names = [
+                 name for repeat in pattern_repeats[i::num_groups] for name in repeat

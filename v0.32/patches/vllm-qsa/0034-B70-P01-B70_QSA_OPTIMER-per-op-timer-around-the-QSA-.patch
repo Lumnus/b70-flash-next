@@ -1,0 +1,865 @@
+From 8e852701d856a683cba274893bac9f356232f755 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 09:42:34 +0000
+Subject: [PATCH 34/36] B70-P01: B70_QSA_OPTIMER per-op timer around the QSA
+ ops (default off)
+
+Host perf_counter_ns + pooled XPU events around run_qsa, indexer, prepare,
+store, compress, select_decode/prefill, expand, attn, sparse_attn; events and
+sync modes; capture-safe, error-isolated, auto-disables after 5 errors.
+Output B70_QSA_OPTIMER_DIR/rank<r>.jsonl; reader
+benchmarks/kernels/qsa_optimer_report.py. Replaces the XPU (PTI) profiler,
+which hangs the engine on the first decode graph replay.
+
+CPU: tests/models/qwen4_exp/test_qsa_optimer.py (10 passed).
+---
+ benchmarks/kernels/qsa_optimer_report.py    | 128 +++++++
+ tests/models/qwen4_exp/test_qsa_optimer.py  | 326 ++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/qsa.py         |   3 +
+ vllm/models/qwen4_exp/nvidia/qsa_optimer.py | 355 ++++++++++++++++++++
+ 4 files changed, 812 insertions(+)
+ create mode 100644 benchmarks/kernels/qsa_optimer_report.py
+ create mode 100644 tests/models/qwen4_exp/test_qsa_optimer.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/qsa_optimer.py
+
+diff --git a/benchmarks/kernels/qsa_optimer_report.py b/benchmarks/kernels/qsa_optimer_report.py
+new file mode 100644
+index 0000000000..6711cac918
+--- /dev/null
++++ b/benchmarks/kernels/qsa_optimer_report.py
+@@ -0,0 +1,128 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA-P: read the B70_QSA_OPTIMER output (rank<r>.jsonl) and print the host/kernel split per rows-per-step.
++
++usage: qsa_optimer_report.py <dir | file.jsonl ...> [--rank 0|all] [--json]
++
++Per T (rows per step = streams x (1 + draft tokens), e.g. 8 for 1 stream, 32 for 4, 64 for 8 at K=7):
++  step      mean wall time between two engine steps of the anchor layer (the whole step, not only QSA)
++  per step  = window sum / steps in the window, summed over all QSA layers of one rank
++  host      Python wall of the span, exclusive of nested spans (launch cost)
++  dev       XPU event time of the span, exclusive of nested spans (kernel + idle gaps)   [events mode]
++  kern      launch + drain wall of a leaf with the queue drained before and after          [sync mode]
++  lead      device work queued before the span, drained by the leading sync                [sync mode]
++  h/d       host / dev. Near 1.0: the device waited on the host (launch bound). Well below 1: kernel bound.
++"""
++import argparse
++import collections
++import glob
++import json
++import os
++import sys
++
++
++def load(paths, rank):
++    files = []
++    for p in paths:
++        files += sorted(glob.glob(os.path.join(p, "rank*.jsonl"))) if os.path.isdir(p) else [p]
++    out = []
++    for f in files:
++        for line in open(f):
++            line = line.strip()
++            if line:
++                r = json.loads(line)
++                if rank == "all" or str(r.get("rank")) == str(rank):
++                    out.append(r)
++    return out
++
++
++def merge(recs):
++    """T -> {steps, period_sum, period_n, spans: name -> sums, modes}; ranks merge by summing (means are per-rank
++    averages once divided by the rank count)."""
++    ranks = {r["rank"] for r in recs} or {0}
++    agg = {}
++    over = steps = 0.0
++    for r in recs:
++        over += r.get("timer_overhead_ms", 0.0)
++        steps += r.get("window_steps", 0)
++        for T, b in r["by_T"].items():
++            a = agg.setdefault(int(T), dict(steps=0, period=[], over=0.0, spans=collections.defaultdict(
++                lambda: collections.defaultdict(float)), mode=set()))
++            a["steps"] += b["steps"]
++            a["mode"].add(r["mode"])
++            if b.get("period_ms_mean") is not None:
++                a["period"].append((b["period_ms_mean"], b["steps"]))
++            for n, s in b["spans"].items():
++                for k, v in s.items():
++                    a["spans"][n][k] += v
++    return agg, len(ranks), (over / steps if steps else None)
++
++
++def table(agg):
++    rows = []
++    for T in sorted(agg):
++        a = agg[T]
++        steps = a["steps"] or 1
++        pw = sum(w for _, w in a["period"]) or 1
++        period = sum(p * w for p, w in a["period"]) / pw if a["period"] else None
++        res = dict(T=T, steps=a["steps"], step_ms=period, mode=sorted(a["mode"]), spans={})
++        for n, s in a["spans"].items():
++            d = dict(calls_per_step=s["n"] / steps, host_ms=s["host_excl_ms"] / steps,
++                     host_incl_ms=s["host_ms"] / steps)
++            if s.get("dev_ms"):
++                d["dev_ms"] = s["dev_excl_ms"] / steps
++                d["dev_incl_ms"] = s["dev_ms"] / steps
++                d["host_over_dev"] = (s["host_excl_ms"] / s["dev_excl_ms"]) if s["dev_excl_ms"] > 0 else None
++            if s.get("wall_ms"):
++                d["kern_ms"] = s["wall_ms"] / steps
++                d["lead_ms"] = s["lead_ms"] / steps
++            res["spans"][n] = d
++        rows.append(res)
++    return rows
++
++
++def fmt(v, w=8, p=3):
++    return f"{'-':>{w}}" if v is None else f"{v:>{w}.{p}f}"
++
++
++def render(rows, nranks, over=None):
++    out = []
++    for r in rows:
++        out.append(f"\nT={r['T']} rows/step   steps={r['steps']}   mode={','.join(r['mode'])}   "
++                   f"step wall {fmt(r['step_ms'], 0, 2).strip()} ms (per rank mean of {nranks} rank(s) summed windows)")
++        out.append(f"  {'span':<16}{'calls/step':>11}{'host ms':>9}{'dev ms':>9}{'h/d':>7}{'kern ms':>9}{'lead ms':>9}")
++        order = sorted(r["spans"].items(), key=lambda kv: -(kv[1].get("dev_ms") or kv[1].get("kern_ms") or kv[1]["host_ms"]))
++        for n, d in order:
++            out.append(f"  {n:<16}{d['calls_per_step']:>11.1f}{fmt(d['host_ms'])}{fmt(d.get('dev_ms'))}"
++                       f"{fmt(d.get('host_over_dev'), 7, 2)}{fmt(d.get('kern_ms'))}{fmt(d.get('lead_ms'))}")
++        top = r["spans"].get("run_qsa")
++        if top and r["step_ms"]:
++            inc = top.get("dev_incl_ms")
++            out.append(f"  QSA body per step (inclusive): host {top['host_incl_ms']:.2f} ms"
++                       + (f", dev {inc:.2f} ms" if inc is not None else "")
++                       + f"  | step wall {r['step_ms']:.2f} ms"
++                       + (f"  | dev share {100 * inc / r['step_ms']:.0f}%" if inc is not None else ""))
++    if over is not None:
++        out.append(f"\ntimer overhead: {over:.2f} ms per step per rank (all spans, both sides of every call); the host "
++                   "columns above already exclude it from the parent spans, the step wall includes it.")
++    return "\n".join(out)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser()
++    ap.add_argument("paths", nargs="+")
++    ap.add_argument("--rank", default="0")
++    ap.add_argument("--json", action="store_true")
++    a = ap.parse_args(argv)
++    recs = load(a.paths, a.rank)
++    if not recs:
++        print("no records", file=sys.stderr)
++        return 1
++    agg, nranks, over = merge(recs)
++    rows = table(agg)
++    print(json.dumps(rows, indent=1) if a.json else render(rows, nranks, over))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/models/qwen4_exp/test_qsa_optimer.py b/tests/models/qwen4_exp/test_qsa_optimer.py
+new file mode 100644
+index 0000000000..4ce91b07a0
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_optimer.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU tests for qsa_optimer.py and qsa_optimer_report.py (no XPU, no vllm): a fake device with a work queue."""
++import json
++import os
++import sys
++import types
++
++import pytest
++
++import importlib.util  # noqa: E402
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def _load(name, *candidates):
++    """Load a sibling file, or the same file from the repo layout (tests/models/qwen4_exp -> vllm/..., benchmarks/...)."""
++    for c in candidates:
++        path = os.path.join(_HERE, c)
++        if os.path.exists(path):
++            spec = importlib.util.spec_from_file_location(name, path)
++            m = importlib.util.module_from_spec(spec)
++            sys.modules[name] = m
++            spec.loader.exec_module(m)
++            return m
++    raise FileNotFoundError(name)
++
++
++qo = _load("qsa_optimer", "qsa_optimer.py", "../../../vllm/models/qwen4_exp/nvidia/qsa_optimer.py")
++rep = _load("qsa_optimer_report", "qsa_optimer_report.py", "../../../benchmarks/kernels/qsa_optimer_report.py")
++
++
++class FakeDev:
++    """Host clock + one in-order device queue. host(ns) advances the host; launch(ns) enqueues device work."""
++
++    def __init__(self):
++        self.now = 0
++        self.free = 0
++        self.capture = False
++
++    def clock(self):
++        return self.now
++
++    def host(self, ns):
++        self.now += ns
++
++    def launch(self, ns, host_ns=0):
++        self.host(host_ns)
++        self.free = max(self.free, self.now) + ns
++
++    # backend API
++    def event(self):
++        return max(self.free, self.now)
++
++    def elapsed_ms(self, a, b):
++        return (b - a) / 1e6
++
++    def sync(self):
++        self.now = max(self.now, self.free)
++
++    def capturing(self):
++        return self.capture
++
++
++def mk(dev, tmp_path, **kw):
++    kinds = {"indexer": "container", "attn": "container", "select": "leaf", "attn_k": "leaf"}
++    t = qo.OpTimer(dev, rank=0, out_dir=str(tmp_path), every=kw.pop("every", 4), warmup=kw.pop("warmup", 2),
++                   clock=dev.clock, kinds=kinds, **kw)
++    return t
++
++
++def run_step(t, dev, T, body, layers=("L0", "L1", "L2")):
++    for L in layers:
++        timed = t.on_anchor(L, T)
++        if timed:
++            t.call(qo.ANCHOR, lambda: body(t, dev), (), {})
++        else:
++            body(t, dev)
++
++
++def spans_of(tmp_path):
++    return [json.loads(x) for x in open(tmp_path / "rank0.jsonl")]
++
++
++def test_launch_bound_vs_kernel_bound(tmp_path):
++    # span "select": 10 launches of 100us host, 50us device each -> the device waits for the host: dev ~= host
++    dev = FakeDev()
++    t = mk(dev, tmp_path)
++
++    def body(t, d):
++        t.call("select", lambda: [d.launch(50_000, host_ns=100_000) for _ in range(10)], (), {})
++
++    for _ in range(2 + 4 + 1):  # +1: a window is written when the next one starts
++        run_step(t, dev, 8, body)
++    s = spans_of(tmp_path)[0]["by_T"]["8"]
++    sel = s["spans"]["select"]
++    assert s["steps"] == 4 and sel["n"] == 12
++    assert sel["host_ms"] / sel["n"] == pytest.approx(1.0)           # 10 x 100us
++    assert sel["dev_ms"] / sel["n"] == pytest.approx(1.0, abs=0.06)   # waited on the host
++    # kernel bound: 10 us of host, 500 us of device per launch -> dev >> host
++    dev = FakeDev()
++    t = mk(dev, tmp_path / "k")
++
++    def body2(t, d):
++        t.call("select", lambda: [d.launch(500_000, host_ns=10_000) for _ in range(10)], (), {})
++        d.sync()  # the next op needs the result: keeps the queue from running away between spans
++
++    for _ in range(7):
++        run_step(t, dev, 8, body2)
++    sel = json.loads(open(tmp_path / "k" / "rank0.jsonl").readline())["by_T"]["8"]["spans"]["select"]
++    assert sel["host_ms"] / sel["n"] == pytest.approx(0.1)
++    assert sel["dev_ms"] / sel["n"] == pytest.approx(5.0, abs=0.1)
++
++
++def test_nesting_exclusive(tmp_path):
++    dev = FakeDev()
++    t = mk(dev, tmp_path)
++
++    def body(t, d):
++        def indexer():
++            d.host(200_000)  # python in the container
++            t.call("select", lambda: d.launch(300_000, host_ns=50_000), (), {})
++            d.host(100_000)
++
++        t.call("indexer", indexer, (), {})
++
++    for _ in range(7):
++        run_step(t, dev, 8, body, layers=("L0",))
++    sp = spans_of(tmp_path)[0]["by_T"]["8"]["spans"]
++    n = sp["indexer"]["n"]
++    assert sp["indexer"]["host_ms"] / n == pytest.approx(0.35)       # inclusive: 200+50+100
++    assert sp["indexer"]["host_excl_ms"] / n == pytest.approx(0.30)  # without select's 50
++    assert sp["select"]["host_excl_ms"] / n == pytest.approx(0.05)
++    assert sp["indexer"]["dev_excl_ms"] == pytest.approx(sp["indexer"]["dev_ms"] - sp["select"]["dev_ms"])
++    # run_qsa (the anchor) contains the indexer
++    assert sp["run_qsa"]["host_excl_ms"] == pytest.approx(0.0, abs=1e-9)
++
++
++def test_warmup_windows_T_buckets_and_period(tmp_path):
++    dev = FakeDev()
++    t = mk(dev, tmp_path, every=3, warmup=2)
++
++    def body(t, d):
++        d.host(10_000)
++
++    for i in range(2 + 6 + 3):
++        T = 8 if i < 6 else 32
++        run_step(t, dev, T, body, layers=("L0", "L1"))
++        dev.host(1_000_000)  # the rest of the step
++    recs = spans_of(tmp_path)
++    assert len(recs) >= 2
++    first = recs[0]
++    assert first["step"] == 5 and first["by_T"]["8"]["steps"] == 3
++    # warmup steps are not counted: 2 warmup + windows of 3
++    assert first["by_T"]["8"]["period_ms_mean"] == pytest.approx(1.02, abs=0.01)  # 2 layers x 10us + 1 ms
++    assert any("32" in r["by_T"] for r in recs)
++    # layers other than the anchor layer do not count as steps
++    assert sum(r["by_T"][T]["steps"] for r in recs for T in r["by_T"]) <= 9
++
++
++def test_capture_bypass_and_no_leak(tmp_path):
++    dev = FakeDev()
++    t = mk(dev, tmp_path)
++    t.step = 10
++    dev.capture = True
++    assert t.call("select", lambda: 42, (), {}) == 42 and not t.pending
++    dev.capture = False
++
++    class Bad(FakeDev):
++        def event(self):
++            raise RuntimeError("no events")
++
++    b = Bad()
++    t2 = mk(b, tmp_path / "b")
++    t2.step = 10
++    for _ in range(7):  # the engine call always succeeds; the timer disables itself
++        assert t2.call("select", lambda: 7, (), {}) == 7
++    assert t2.dead
++    # an exception from the op itself propagates and leaves the stack clean
++    t3 = mk(FakeDev(), tmp_path / "c")
++    t3.step = 10
++    with pytest.raises(ValueError):
++        t3.call("select", lambda: (_ for _ in ()).throw(ValueError("x")), (), {})
++    assert t3._stack() == []
++
++
++def test_sync_mode_leaf(tmp_path):
++    dev = FakeDev()
++    t = mk(dev, tmp_path, mode="sync")
++
++    def body(t, d):
++        d.launch(400_000)  # untracked work queued before the leaf: shows up as lead
++
++        def sel():
++            d.launch(300_000, host_ns=20_000)
++
++        t.call("select", sel, (), {})
++
++    for _ in range(7):
++        run_step(t, dev, 8, body, layers=("L0",))
++    sp = spans_of(tmp_path)[0]["by_T"]["8"]["spans"]["select"]
++    n = sp["n"]
++    assert sp["lead_ms"] / n == pytest.approx(0.4)
++    assert sp["wall_ms"] / n == pytest.approx(0.32)   # launch 20us + drain; kernel 300us
++    assert sp["host_ms"] / n == pytest.approx(0.02)
++    assert "dev_ms" in sp and sp["dev_ms"] == 0.0     # events not used in sync mode
++
++
++def test_wrap_run_qsa_and_install(tmp_path, monkeypatch):
++    monkeypatch.setenv("B70_QSA_OPTIMER", "1")
++    monkeypatch.setenv("B70_QSA_OPTIMER_DIR", str(tmp_path))
++    monkeypatch.setenv("B70_QSA_OPTIMER_EVERY", "2")
++    monkeypatch.setenv("B70_QSA_OPTIMER_WARMUP", "1")
++    dev = FakeDev()
++    monkeypatch.setattr(qo, "XpuBackend", lambda: dev)
++    # a fake module with a function and a class method to wrap through B70_QSA_OPTIMER_SPANS
++    m = types.ModuleType("fakeops")
++
++    def sel(x):
++        dev.launch(100_000, host_ns=10_000)
++        return x + 1
++
++    class K:
++        def go(self, x):
++            return sys.modules["fakeops"].sel(x) + 1
++
++    m.sel, m.K = sel, K
++    sys.modules["fakeops"] = m
++    monkeypatch.setenv("B70_QSA_OPTIMER_SPANS", ",".join(f"{n}=-" for n in qo.DEFAULT_SPECS)
++                       + ",f_sel=fakeops:sel,f_go=fakeops:K.go")
++    monkeypatch.setattr(qo, "_installed", False)
++    monkeypatch.setattr(qo, "_timer", None)
++    import torch
++
++    class Owner:
++        layer_name = "model.layers.3.attn"
++
++        @qo.wrap_run_qsa
++        def _run_qsa(self, pqk, *rest):
++            return sys.modules["fakeops"].K().go(1)
++
++    o = Owner()
++    pqk = torch.zeros(8, 4)
++    for _ in range(7):
++        assert o._run_qsa(pqk) == 3
++    assert qo._timer is not None and qo._timer.anchor_layer == "model.layers.3.attn"
++    recs = spans_of(tmp_path)
++    assert recs and set(recs[0]["by_T"]["8"]["spans"]) == {"run_qsa", "f_go", "f_sel"}
++    assert recs[0]["by_T"]["8"]["spans"]["f_sel"]["n"] >= 1
++    # functions that were wrapped keep their name and are wrapped once
++    assert sys.modules["fakeops"].sel.__name__ == "sel" and sys.modules["fakeops"].sel.__b70_optimer__
++    qo._install_spans(print)
++    assert not hasattr(sys.modules["fakeops"].sel.__wrapped__, "__b70_optimer__")
++
++
++def test_off_is_identity(monkeypatch):
++    monkeypatch.delenv("B70_QSA_OPTIMER", raising=False)
++
++    def f(self, x):
++        return x
++
++    assert qo.wrap_run_qsa(f) is f
++
++
++def test_report(tmp_path, capsys):
++    dev = FakeDev()
++    t = mk(dev, tmp_path, every=4, warmup=1)
++
++    def body(t, d):
++        t.call("select", lambda: d.launch(200_000, host_ns=20_000), (), {})
++
++    for i in range(1 + 8 + 1):
++        run_step(t, dev, 8 if i < 5 else 64, body, layers=("L0", "L1", "L2"))
++        dev.host(500_000)
++    assert rep.main([str(tmp_path)]) == 0
++    out = capsys.readouterr().out
++    assert "T=8 " in out and "T=64" in out and "select" in out and "run_qsa" in out
++    assert rep.main([str(tmp_path), "--json"]) == 0
++    rows = json.loads(capsys.readouterr().out)
++    r8 = next(r for r in rows if r["T"] == 8)
++    assert r8["spans"]["select"]["calls_per_step"] == pytest.approx(3.0)
++    assert r8["spans"]["select"]["host_ms"] == pytest.approx(0.06)   # 3 calls x 20us per step
++    assert r8["spans"]["select"]["dev_ms"] >= 0.5                    # 3 x 200us
++
++
++def test_overhead_recorded_and_excluded_from_parent(tmp_path):
++    class SlowDev(FakeDev):
++        def event(self):
++            self.host(5_000)  # an event costs the host 5 us
++            return super().event()
++
++    dev = SlowDev()
++    t = mk(dev, tmp_path)
++
++    def body(t, d):
++        def indexer():
++            t.call("select", lambda: d.launch(100_000, host_ns=50_000), (), {})
++
++        t.call("indexer", indexer, (), {})
++
++    for _ in range(7):
++        run_step(t, dev, 8, body, layers=("L0",))
++    rec = spans_of(tmp_path)[0]
++    sp = rec["by_T"]["8"]["spans"]
++    n = sp["indexer"]["n"]
++    assert rec["timer_overhead_ms"] > 0
++    # indexer's own host time is zero: the child's 50 us and the child's event cost are both excluded
++    assert sp["indexer"]["host_excl_ms"] / n == pytest.approx(0.0, abs=0.02)
++    assert sp["select"]["host_excl_ms"] / n == pytest.approx(0.05)
++
++
++def test_event_pool_is_recycled(tmp_path):
++    class PoolBackend(FakeDev):
++        released = 0
++
++        def release(self, ev):
++            PoolBackend.released += len(ev)
++
++    dev = PoolBackend()
++    t = mk(dev, tmp_path)
++
++    def body(t, d):
++        t.call("select", lambda: d.launch(10_000), (), {})
++
++    for _ in range(7):
++        run_step(t, dev, 8, body, layers=("L0",))
++    assert PoolBackend.released > 0
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index bb20af2351..40f1125faa 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -352,6 +352,9 @@ def _qsa_eager_break(fn):
+     the measurement arm that captures it into the decode segments instead.
+     Decided at class definition (import time), like the decorator itself.
+     """
++    from .qsa_optimer import wrap_run_qsa
++
++    fn = wrap_run_qsa(fn)  # B70-QSA-P: no-op unless B70_QSA_OPTIMER=1
+     if os.environ.get("B70_QSA_EAGER_BREAK", "1") == "0":
+         logger.info_once("B70-QSA: _run_qsa is captured into graph segments")
+         return fn
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa_optimer.py b/vllm/models/qwen4_exp/nvidia/qsa_optimer.py
+new file mode 100644
+index 0000000000..02aa1deb85
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/qsa_optimer.py
+@@ -0,0 +1,355 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA-P: per-op timer around the QSA ops. Off unless B70_QSA_OPTIMER=1.
++
++Why not the torch profiler: on XPU it starts fine and then hangs the first decode step (graph replay under PTI,
++see artifacts/P-profiler-lifecycle.md). This module uses no tracing layer: host perf counters around each op
++call, plus XPU event pairs around the same span.
++
++Each wrapped call records, per (rows-per-step T, span name):
++  host   wall time of the Python call (launch cost; also any sync inside it)
++  dev    device time between the two events recorded around the call (kernel time + any idle gap in the span)
++and the same two numbers exclusive of nested spans. Reading: dev ~= host means the device waited on the host
++(launch bound); dev >> host means the host ran ahead and the span is kernel bound.
++B70_QSA_OPTIMER_MODE=sync drains the queue before and after every LEAF span: exact kernel time per leaf at the
++price of overlap (use it for the split, not for step time). 'lead' is the device work queued before the span.
++
++  B70_QSA_OPTIMER=1            on
++  B70_QSA_OPTIMER_MODE         events (default) | sync
++  B70_QSA_OPTIMER_EVERY        engine steps per window (default 50)
++  B70_QSA_OPTIMER_WARMUP       steps ignored at the start (default 20)
++  B70_QSA_OPTIMER_DIR          output dir (default /tmp/b70-qsa-optimer); one rank<r>.jsonl per worker
++  B70_QSA_OPTIMER_SPANS        comma list of name or name=module:Class.attr to add or override (name=- removes)
++
++A step is one call of the first QSA layer seen by the process (the target model; one call per layer per step).
++Measurement only: nothing the model reads is changed, and an error inside the timer never reaches the engine.
++"""
++from __future__ import annotations
++
++import functools
++import json
++import os
++import threading
++import time
++
++_PKG = "vllm.models.qwen4_exp.nvidia"
++# name -> (target, kind). kind: "container" holds other spans; "leaf" is a kernel group (synced in sync mode).
++DEFAULT_SPECS: dict[str, tuple[str, str]] = {
++    "indexer": (f"{_PKG}.indexer_qsa:QSAIndexer.forward", "container"),
++    "prepare": (f"{_PKG}.indexer_qsa:qsa_prepare", "leaf"),
++    "store": (f"{_PKG}.ops.qsa:qsa_store_cache_rows", "leaf"),
++    "compress": (f"{_PKG}.ops.qsa:qsa_compress_groups_with_ratio", "leaf"),
++    "select_decode": (f"{_PKG}.ops.qsa_indexer:qsa_select_paged_decode", "leaf"),
++    "select_prefill": (f"{_PKG}.ops.qsa_indexer:qsa_select_paged_prefill", "leaf"),
++    "expand": (f"{_PKG}.ops.qsa_indexer:expand_qsa_block_indices", "leaf"),
++    "attn": (f"{_PKG}.qsa:Qwen4ExpQSAFlashAttentionImpl.forward_qsa", "container"),
++    "sparse_attn": (f"{_PKG}.ops.qsa:qsa_sparse_paged_attention", "leaf"),
++}
++ANCHOR = "run_qsa"  # wrapped by the engine patch (qsa.py _qsa_eager_break), not by install()
++
++
++class XpuBackend:
++    def __init__(self):
++        import torch
++
++        self.torch = torch
++        self.free = []  # events are recycled after a window is read: creating one costs more than recording one
++
++    def event(self):
++        e = self.free.pop() if self.free else self.torch.xpu.Event(enable_timing=True)
++        e.record()
++        return e
++
++    def release(self, events):
++        self.free.extend(events)
++
++    def elapsed_ms(self, a, b) -> float:
++        return float(a.elapsed_time(b))
++
++    def sync(self) -> None:
++        self.torch.xpu.synchronize()
++
++    def capturing(self) -> bool:
++        f = getattr(self.torch.xpu, "is_current_stream_capturing", None)
++        try:
++            return bool(f()) if f else False
++        except Exception:
++            return False
++
++
++class _Rec:
++    __slots__ = ("name", "T", "parent", "host", "e0", "e1", "lead", "wall", "kids_host", "kids_wall", "kind", "over")
++
++
++class OpTimer:
++    def __init__(self, backend, rank=0, out_dir="/tmp/b70-qsa-optimer", every=50, warmup=20, mode="events",
++                 clock=time.perf_counter_ns, kinds=None, log=None):
++        self.b, self.rank, self.every, self.warmup, self.mode = backend, rank, every, warmup, mode
++        self.clock = clock
++        self.kinds = kinds or {n: k for n, (_, k) in DEFAULT_SPECS.items()}
++        self.log = log or (lambda s: None)
++        self.dir = out_dir
++        self.local = threading.local()
++        self.anchor_layer = None
++        self.step = 0           # engine steps seen
++        self.win_steps = {}     # T -> steps in this window
++        self.win_period = {}    # T -> [period_ns...]
++        self.win_count = 0
++        self.over_ns = 0        # time spent inside the timer itself in this window
++        self.last_anchor_t = None
++        self.last_anchor_T = None
++        self.pending: list[_Rec] = []
++        self.stats: dict[int, dict[str, dict[str, float]]] = {}
++        self.errors = 0
++        self.dead = False
++        self.windows = 0
++
++    # ---- state -------------------------------------------------------------------------------------------
++    def _stack(self):
++        s = getattr(self.local, "stack", None)
++        if s is None:
++            s = self.local.stack = []
++        return s
++
++    def active(self) -> bool:
++        return not self.dead and self.step > self.warmup
++
++    # ---- anchor ------------------------------------------------------------------------------------------
++    def on_anchor(self, layer_name, T):
++        """Called at the start of every run_qsa. Returns True if the call should be timed."""
++        if self.anchor_layer is None:
++            self.anchor_layer = layer_name
++        if layer_name == self.anchor_layer:
++            now = self.clock()
++            if self.last_anchor_t is not None and self.step > self.warmup:
++                self.win_period.setdefault(self.last_anchor_T, []).append(now - self.last_anchor_t)
++            if self.win_count >= self.every:  # the window holds whole steps: every layer of every step is in
++                self.flush()
++            self.last_anchor_t, self.last_anchor_T = now, T
++            self.step += 1
++            if self.step > self.warmup:
++                self.win_steps[T] = self.win_steps.get(T, 0) + 1
++                self.win_count += 1
++        self.local.T = T
++        return self.active()
++
++    # ---- span --------------------------------------------------------------------------------------------
++    def call(self, name, fn, args, kwargs):
++        if self.dead or self.b.capturing():
++            return fn(*args, **kwargs)
++        kind = "container" if name == ANCHOR else self.kinds.get(name, "leaf")
++        try:
++            t_in = self.clock()
++            r = _Rec()
++            r.name, r.kind, r.T = name, kind, getattr(self.local, "T", 0)
++            r.kids_host = r.kids_wall = r.over = 0
++            st = self._stack()
++            r.parent = st[-1] if st else None
++            sync = self.mode == "sync" and kind == "leaf"
++            if sync:
++                a = self.clock()
++                self.b.sync()
++                r.lead = self.clock() - a
++                t_in = self.clock()
++            else:
++                r.lead = 0
++            r.e0 = None if sync else self.b.event()
++            st.append(r)
++            h0 = self.clock()
++            r.over = h0 - t_in            # instrumentation cost before the op
++        except Exception:
++            self._fail()
++            return fn(*args, **kwargs)
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            try:
++                h1 = self.clock()
++                st.pop()
++                r.host = h1 - h0
++                if sync:
++                    r.e1 = None
++                    r.over += self.clock() - h1
++                    self.b.sync()
++                    r.wall = self.clock() - h0          # launch + drain
++                else:
++                    r.e1 = self.b.event()
++                    r.over += self.clock() - h1
++                    r.wall = r.host
++                if r.parent is not None:
++                    r.parent.kids_host += r.host + r.over
++                    r.parent.kids_wall += r.wall + r.lead + r.over
++                self.over_ns += r.over
++                if self.active():
++                    self.pending.append(r)
++            except Exception:
++                self._fail()
++
++    def _fail(self):
++        self.errors += 1
++        if self.errors >= 5:
++            self.dead = True
++            self.log("B70-QSA-OPTIMER: disabled after repeated errors")
++
++    # ---- window ------------------------------------------------------------------------------------------
++    def flush(self):
++        try:
++            if self.mode != "sync" and self.pending:
++                self.b.sync()
++            kid_dev: dict[int, float] = {}
++            rows = []
++            for r in self.pending:
++                dev = self.b.elapsed_ms(r.e0, r.e1) if r.e0 is not None else None
++                rows.append((r, dev))
++            # inclusive device time of children, summed onto the parent record (by identity)
++            for r, dev in rows:
++                if r.parent is not None and dev is not None:
++                    kid_dev[id(r.parent)] = kid_dev.get(id(r.parent), 0.0) + dev
++            for r, dev in rows:
++                s = self.stats.setdefault(r.T, {}).setdefault(r.name, dict(
++                    n=0, host_ms=0.0, host_excl_ms=0.0, dev_ms=0.0, dev_excl_ms=0.0, wall_ms=0.0, lead_ms=0.0))
++                s["n"] += 1
++                s["host_ms"] += r.host / 1e6
++                s["host_excl_ms"] += (r.host - r.kids_host) / 1e6
++                if dev is not None:
++                    s["dev_ms"] += dev
++                    s["dev_excl_ms"] += dev - kid_dev.get(id(r), 0.0)
++                else:
++                    s["wall_ms"] += r.wall / 1e6
++                    s["lead_ms"] += r.lead / 1e6
++            rel = getattr(self.b, "release", None)
++            if rel:
++                rel([e for r, _ in rows for e in (r.e0, r.e1) if e is not None])
++            self.pending = []
++            self._write()
++        except Exception as e:  # never reach the engine
++            self.log(f"B70-QSA-OPTIMER: flush failed: {e!r}")
++            self.pending = []
++            self._fail()
++
++    def _write(self):
++        rec = {"rank": self.rank, "window": self.windows, "t": time.time(), "mode": self.mode, "step": self.step,
++               "timer_overhead_ms": self.over_ns / 1e6, "window_steps": self.win_count, "by_T": {}}
++        for T in sorted(set(self.win_steps) | set(self.stats)):
++            per = self.win_period.get(T, [])
++            rec["by_T"][str(T)] = {
++                "steps": self.win_steps.get(T, 0),
++                "period_ms_mean": (sum(per) / len(per) / 1e6) if per else None,
++                "spans": self.stats.get(T, {}),
++            }
++        os.makedirs(self.dir, exist_ok=True)
++        with open(os.path.join(self.dir, f"rank{self.rank}.jsonl"), "a") as f:
++            f.write(json.dumps(rec) + "\n")
++        self.log(f"B70-QSA-OPTIMER rank {self.rank} window {self.windows} step {self.step}: wrote "
++                 f"{len(rec['by_T'])} T-buckets to {self.dir}")
++        self.windows += 1
++        self.stats, self.win_steps, self.win_period, self.win_count = {}, {}, {}, 0
++        self.over_ns = 0
++
++
++_timer: OpTimer | None = None
++_installed = False
++
++
++def enabled() -> bool:
++    return os.environ.get("B70_QSA_OPTIMER", "") not in ("", "0")
++
++
++def _resolve(target):
++    import importlib
++
++    mod, _, attr = target.partition(":")
++    m = importlib.import_module(mod)
++    parts = attr.split(".")
++    owner = m
++    for p in parts[:-1]:
++        owner = getattr(owner, p)
++    return owner, parts[-1]
++
++
++def _wrap(name, fn):
++    if getattr(fn, "__b70_optimer__", False):
++        return fn
++
++    @functools.wraps(fn)
++    def w(*a, **k):
++        t = _timer
++        if t is None or not t.active():
++            return fn(*a, **k)
++        return t.call(name, fn, a, k)
++
++    w.__b70_optimer__ = True
++    return w
++
++
++def _specs():
++    specs = dict(DEFAULT_SPECS)
++    for item in filter(None, os.environ.get("B70_QSA_OPTIMER_SPANS", "").split(",")):
++        name, _, tgt = item.partition("=")
++        if tgt == "-":
++            specs.pop(name, None)
++        elif tgt:
++            specs[name] = (tgt, "leaf")
++    return specs
++
++
++def _install_spans(log):
++    for name, (target, _) in _specs().items():
++        try:
++            owner, attr = _resolve(target)
++            setattr(owner, attr, _wrap(name, getattr(owner, attr)))
++        except Exception as e:
++            log(f"B70-QSA-OPTIMER: span {name} not installed ({target}): {e!r}")
++
++
++def _init():
++    global _timer, _installed
++    if _installed:
++        return
++    _installed = True
++    try:
++        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
++        from vllm.logger import init_logger
++
++        lg = init_logger(__name__).info
++        try:
++            rank = get_tensor_model_parallel_rank()
++        except Exception:
++            rank = int(os.environ.get("RANK", "0"))
++    except Exception:
++        lg, rank = print, int(os.environ.get("RANK", "0"))
++    mode = os.environ.get("B70_QSA_OPTIMER_MODE", "events")
++    specs = _specs()
++    _timer = OpTimer(
++        XpuBackend(), rank=rank, out_dir=os.environ.get("B70_QSA_OPTIMER_DIR", "/tmp/b70-qsa-optimer"),
++        every=int(os.environ.get("B70_QSA_OPTIMER_EVERY", "50")),
++        warmup=int(os.environ.get("B70_QSA_OPTIMER_WARMUP", "20")), mode=mode,
++        kinds={n: k for n, (_, k) in specs.items()}, log=lg)
++    _install_spans(lg)
++    lg(f"B70-QSA-OPTIMER on (rank {rank}, mode {mode}, every {_timer.every} steps, warmup {_timer.warmup}, "
++       f"spans {sorted(specs)})")
++
++
++def wrap_run_qsa(fn):
++    """Engine hook: wrap the inner _run_qsa body (inside @eager_break_during_capture, which records the inner
++    callable and replays it eagerly every step). Returns fn unchanged when the timer is off."""
++    if not enabled():
++        return fn
++
++    @functools.wraps(fn)
++    def w(self, projected_qk, *a, **k):
++        if not _installed:
++            _init()
++        t = _timer
++        if t is None or t.dead:
++            return fn(self, projected_qk, *a, **k)
++        try:
++            T = int(projected_qk.shape[0])
++            timed = t.on_anchor(getattr(self, "layer_name", "?"), T)
++        except Exception:
++            t._fail()
++            return fn(self, projected_qk, *a, **k)
++        if not timed:
++            return fn(self, projected_qk, *a, **k)
++        return t.call(ANCHOR, fn, (self, projected_qk) + a, k)
++
++    return w

@@ -1,7 +1,7 @@
 From 103f2f2eb94074e91e91f0c13652272f819bef70 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 07:28:09 +0000
-Subject: [PATCH 49/49] B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a
+Subject: [PATCH 49/50] B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a
  private USM-host KV offload pool per rank on XPU
 
 The shared /dev/shm region is only host-registered, which SYCL reports as

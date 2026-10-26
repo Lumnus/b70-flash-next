@@ -6,6 +6,30 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
+## 0.32.0-b70.4 — 2026-10-26: dense and sparse attention both working; split KV groups; upstream DFlash fix; 12 slots
+
+- **Dense series: 50 patches** (`v0.32/patches/vllm/`, fork tag `v0.32.0-b70.4-dense`). 0001–0049 are the b70.1 series, unchanged
+  in content (the `[PATCH n/49]` headers read `n/50`); **0050** backports vllm-project/vllm#54163 (merged upstream
+  2026-10-23): DFlash and DSpark no longer drop the trailing prefix-cache block, so `disable_eagle_block_drop` is no longer
+  needed. `v0.32/engines/serve.args` drops it (b70.1–b70.3 set it: agent-session replay 232 s against 266 s).
+- **Sparse (QSA) add-on: 36 patches** (`v0.32/patches/vllm-qsa/`, fork tag `v0.32.0-b70.4`; 0001–0032 unchanged in content from
+  b70.3, headers regenerated because 0050 now sits below them). 0033 and 0036: the packed full-attention KV bucket is split into
+  66 groups of 905,216 B blocks instead of 7 groups of 10,862,592 B, **on by default**; `B70_KV_SPLIT_GROUPS=0` restores the old
+  packing, `B70_KV_PACK_REPEATS=<n>` wins over both. GPU KV 344,706 tokens; the agent replay's GPU prefix hit rate about 0.37 →
+  0.46. 0034: `B70_QSA_OPTIMER` per-op timer (off by default) and its report script. 0035: cache-path lifecycle driver and
+  tests. The sparse engine file `qsa-serve.args` runs without `disable_eagle_block_drop` (validated on 2026-10-26).
+- **12 sequences** in both `serve.args` and `qsa-serve.args`, with capture sizes at every multiple of 8 up to 96 (then 256, 512,
+  1024). On the sparse engine 8 against 12 slots is within boot-to-boot noise; the dense engine at 12 slots was not re-measured.
+- **Both variants listed as working** (README, `v0.32/README.md`). Sparse against dense on the same trunk: agent-session replay
+  about 205 s against about 232 s; short context 0.90–0.97×; prefill 131K 1.06×, 260K 1.31×; 128K long-context tasks 80/78 %
+  against 72/72 %. Measurements: [docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md) §0.
+- **Tooling.** `tools/check-trunk-tree.sh` gains `--hotcold-tip` (the last hot/cold commit, when later commits sit on the
+  trunk), so those later commits must be in the series. `v0.32/scripts/check-series.sh` defaults to the b70.4 refs.
+  `serve-config-qsa.json` re-indented to the dense file's style (JSON-equal).
+- **Kernels unchanged:** vllm-xpu-kernels `release/0.1.15.4` plus the 64-bit GDN conv-state offset patch. 0.1.16.2 (PyPI) was
+  tried and not taken: it lacks #658 (`large_state_offset` fails 3 of 3 on a card). Re-test when a wheel after #658 appears.
+- Release notes: [RELEASE-NOTES-b70.4.md](RELEASE-NOTES-b70.4.md).
+
 ## 0.32.0-b70.3 — 2026-10-26: sparse attention (QSA) brought near dense speed; dense engine args
 
 The dense series (`v0.32/patches/vllm/`, 49 patches, fork tag `v0.32.0-b70.1`) is unchanged.

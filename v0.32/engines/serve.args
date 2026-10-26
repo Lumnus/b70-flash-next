@@ -1,4 +1,4 @@
-# serve.args — `vllm serve` flags for 0.32.0-b70.1, one flag and its value per line (same format as engines/*.args).
+# serve.args — `vllm serve` flags for 0.32.0-b70.4 (the dense series, 50 patches), one flag and its value per line (same format as engines/*.args).
 # Run: vllm serve <serve dir> $(these flags). The serve dir is the Intel AutoRound snapshot with
 # engines/serve-config-intel-autoround.json copied over its config.json (see v0.32/README.md, step 7).
 --served-model-name qwen38-flash-next
@@ -14,12 +14,14 @@
 --max-model-len 262144
 # prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
 --max-num-batched-tokens 4096
-# 8 concurrent sequences
---max-num-seqs 8
+# 12 concurrent sequences (b70.4; 8 before). Measured on the sparse engine: 8 against 12 slots is within boot-to-boot noise,
+# and a decode of 1..12 requests replays a FULL graph without padding (capture list below). The dense engine at 12
+# slots was not re-measured; the dense numbers on the README pages were taken at 8.
+--max-num-seqs 12
 --limit-mm-per-prompt {"image":2,"video":0}
-# FULL graphs for uniform decode, piecewise for the rest. Capture sizes are multiples of 1+K = 8 (K = 7 draft tokens),
-# so a uniform spec-decode step is never padded, plus three prefill sizes.
---compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,256,512,1024]}
+# FULL graphs for uniform decode, piecewise for the rest. Capture sizes are every multiple of 1+K = 8 (K = 7 draft tokens)
+# up to 12 x 8 = 96, so a uniform spec-decode step of 1..12 requests is never padded, plus three prefill sizes.
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,72,80,88,96,256,512,1024]}
 --cudagraph-metrics
 --enable-auto-tool-choice
 --tool-call-parser qwen3_xml
@@ -34,10 +36,9 @@
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
 # 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
 # TRITON_ATTN; the target model takes vLLM's XPU default backend (FlashAttention), so no --attention-backend flag.
-# disable_eagle_block_drop: keep the trailing KV block that vLLM drops for EAGLE-style drafters. On this tree the
-# DFlash2 draft group is not recognised as the draft's, so the drop hit every group; off, a recorded agent-session
-# replay ran 232 s against 266 s back to back (one run each), median decode +21 %, gates and token compare pass,
-# GPU KV -1.6K tokens. (2026-10-26)
---speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN","disable_eagle_block_drop":true}
+# No disable_eagle_block_drop: patch 0050 (vllm-project/vllm#54163, merged upstream 2026-10-23) makes DFlash/DSpark skip vLLM's
+# EAGLE trailing-block drop on their own. b70.1-b70.3 set that flag here (agent-session replay 232 s against 266 s with it);
+# on a tree without 0050 add "disable_eagle_block_drop":true to the config below.
+--speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 # clients see cached prompt tokens in usage
 --enable-prompt-tokens-details

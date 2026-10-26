@@ -1,7 +1,7 @@
 From 08a7b34f685d41d7d0d310bbb8a5cb12e7e2b119 Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 14/49] W032-14: wu1ff prefill-serving.patch (vllm/ hunks)
+Subject: [PATCH 14/50] W032-14: wu1ff prefill-serving.patch (vllm/ hunks)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

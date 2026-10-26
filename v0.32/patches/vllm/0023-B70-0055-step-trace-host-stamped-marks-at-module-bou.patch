@@ -1,7 +1,7 @@
 From 3b8ef6a14826e9b809c86caefd4adc080b735b00 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 07:02:55 +0000
-Subject: [PATCH 23/49] B70-0055: step trace (host-stamped marks at module
+Subject: [PATCH 23/50] B70-0055: step trace (host-stamped marks at module
  boundaries inside the decode XPU graphs), B70_STEP_TRACE
 
 Port of kernels/b70-step-trace/vllm-step-trace.patch from

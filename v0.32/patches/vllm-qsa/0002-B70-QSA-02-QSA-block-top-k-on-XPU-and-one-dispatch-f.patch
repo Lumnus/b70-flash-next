@@ -1,7 +1,7 @@
-From dab0736cdb59a1f394029e654d3eb394200a2b52 Mon Sep 17 00:00:00 2001
+From e02b6e109c4fd2c014a5a3bb0ffad19455b17157 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 19:53:38 +0000
-Subject: [PATCH 02/32] B70-QSA-02: QSA block top-k on XPU and one dispatch
+Subject: [PATCH 02/36] B70-QSA-02: QSA block top-k on XPU and one dispatch
  function per indexer kernel
 
 cooperative_topk/persistent_topk are CUDA-only csrc ops. Off CUDA, _topk now

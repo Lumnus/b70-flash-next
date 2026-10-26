@@ -1,7 +1,7 @@
 From 0dd9d4c8b3951d241d1e55a23e0089c585a9da80 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 03:44:31 +0000
-Subject: [PATCH 44/49] B70-V32-04: split-K parallel HC down GEMM up to
+Subject: [PATCH 44/50] B70-V32-04: split-K parallel HC down GEMM up to
  B70_HC_PARALLEL_MAX_ROWS rows (default 32 = wu1ff)
 
 Also (V32-03 follow-up) the host-ids producer polls an event on a pinned buffer instead of a blocking D2H.

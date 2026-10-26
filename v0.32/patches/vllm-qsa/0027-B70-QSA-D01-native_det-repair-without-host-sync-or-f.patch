@@ -1,7 +1,7 @@
-From fd2a03a96844674e50a54792ba05bc6a7c99a40d Mon Sep 17 00:00:00 2001
+From 2fe127e0744649db4a2c54acaf18a200e290bee8 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:12:12 +0000
-Subject: [PATCH 27/32] B70-QSA-D01: native_det repair without host sync or
+Subject: [PATCH 27/36] B70-QSA-D01: native_det repair without host sync or
  full-width sort; B70_QSA_TOPK=radix
 
 native_det used to fix the native top-k up with a host sync per layer

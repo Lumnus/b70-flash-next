@@ -1,7 +1,7 @@
 From 623526f0cab6bad40cb3dbebd6c8ffbc4e80cca6 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 05:19:50 +0000
-Subject: [PATCH 48/49] B70-V32-08: B70_PREFILL_HC_GRAPHS=0 turns off the
+Subject: [PATCH 48/50] B70-V32-08: B70_PREFILL_HC_GRAPHS=0 turns off the
  prefill HC graph regions
 
 ---

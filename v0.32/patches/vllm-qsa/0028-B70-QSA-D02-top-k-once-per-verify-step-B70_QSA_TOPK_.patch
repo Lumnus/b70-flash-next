@@ -1,7 +1,7 @@
-From 1e5b30c77a20d087f00aef8219bc788f72d41084 Mon Sep 17 00:00:00 2001
+From 77d287ccf559d4a846007292a412994207110a6b Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:12:33 +0000
-Subject: [PATCH 28/32] B70-QSA-D02: top-k once per verify step
+Subject: [PATCH 28/36] B70-QSA-D02: top-k once per verify step
  (B70_QSA_TOPK_PER_STEP) and skip-when-fits (B70_QSA_TOPK_SKIP_FIT)
 
 Both off by default.

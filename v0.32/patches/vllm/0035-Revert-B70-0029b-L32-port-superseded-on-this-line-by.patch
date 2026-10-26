@@ -1,7 +1,7 @@
 From 10d4774b7fb19d0e7f8363f80b9bc9ef8cda3caa Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 23:38:03 +0000
-Subject: [PATCH 35/49] Revert B70-0029b (L32 port): superseded on this line by
+Subject: [PATCH 35/50] Revert B70-0029b (L32 port): superseded on this line by
  the upstream fix (vllm-project/vllm#63564, next commit)
 
 ---

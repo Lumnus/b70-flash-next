@@ -1,7 +1,7 @@
 From 979482e2ee34388aa7324e647501e1babd3a69c7 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 11:59:55 +0000
-Subject: [PATCH 34/49] B70-L32-0013 fix: pinned PLE stage/slab allocated on
+Subject: [PATCH 34/50] B70-L32-0013 fix: pinned PLE stage/slab allocated on
  CPU explicitly (model init runs under torch.device(xpu))
 
 ---

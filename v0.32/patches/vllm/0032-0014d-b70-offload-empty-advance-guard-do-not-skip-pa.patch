@@ -1,7 +1,7 @@
 From 977cda85dc25261db90e7fd82f937b93e86a9bbb Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:40:43 +0000
-Subject: [PATCH 32/49] 0014d-b70-offload-empty-advance-guard: do not skip past
+Subject: [PATCH 32/50] 0014d-b70-offload-empty-advance-guard: do not skip past
  write-pending keys (B70_OFFLOAD_EMPTY_ADVANCE_GUARD=1)
 
 Default off. vllm#56795: _build_store_jobs advances every group's

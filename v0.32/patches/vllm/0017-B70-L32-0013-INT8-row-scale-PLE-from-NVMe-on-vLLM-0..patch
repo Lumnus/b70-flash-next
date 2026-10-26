@@ -1,7 +1,7 @@
 From f823bc59d06d915760a402a6b21102b7a61d1c53 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 08:53:38 +0000
-Subject: [PATCH 17/49] B70-L32-0013: INT8 row-scale PLE from NVMe on vLLM 0.32
+Subject: [PATCH 17/50] B70-L32-0013: INT8 row-scale PLE from NVMe on vLLM 0.32
  (port of B70-0008/0013 onto wu1ff host-prepared PLE)
 
 New Qwen4ExpPLEInt8NVMeEmbedding (nvidia/b70_ple_nvme.py) on the 0.32 PLE split, following wu1ff 1.0.5 b70_disk.py (MIT): ModelState prepares each dispatch before forward/FULL replay; rows of this rank resolved through the 0013 row cache (ple_nvme.py from b70/v0.30.0 0013b, + PleNvmeServer.resolve_ids for device-hashed ids), packed INT8 rows staged pinned, one H2D; consumer reduces int8 bytes over ETP and dequantises once. Any slot count / dispatch size (wu1ff disk PLE is 4-slot, <=1024, DFlash only). Disk + NVMe share a host_prepared marker in ngram_embedding.py / model_state.py. Same env names as v0.30 (B70_PLE_INT8_NVME*, B70_PLE_INT8_PATH, PLE_TABLE_PATH cross-check). Not ported: 0013b lookahead (serving runs it off), SYNC_ONLY, host hash.

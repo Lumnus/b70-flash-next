@@ -1,7 +1,7 @@
-From 7c5f827dc7c18a6d04b724a5c2e91e17bd19ada7 Mon Sep 17 00:00:00 2001
+From 079cd6dd1b5935978f3da12b3765c64d6d70b9c4 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 22:41:58 +0000
-Subject: [PATCH 16/32] B70-QSA-K02: bench attn2 side by side; AOT
+Subject: [PATCH 16/36] B70-QSA-K02: bench attn2 side by side; AOT
  register/spill compile; CPU interpreter check
 
 bench_qwen4_qsa_xpu.py: --attn-impls splitk,attn2 adds attn@<impl> ops, each

@@ -300,3 +300,12 @@ assistant co-author and sign-off trailers, name the upstream PR in the two cherr
 library path. Code diffs are unchanged. The two kernels-Python patches of ours (`0008`, `0009`) carry `Lumnus` as
 `From:`. Not GPU-booted from a clean clone in this form: the served engine runs the same commits from the test host's
 tree.
+
+### 0.32.0-b70.4 addendum
+
+| piece | pin |
+|---|---|
+| fork, dense | github.com/Lumnus/vllm tag `v0.32.0-b70.4-dense` = `v0.32.0-b70.1` + 1 commit: 0050, vllm-project/vllm#54163 (upstream merge `0bfeb8d0e3`, 2026-10-23), applied by hand where the 0.32 line lacks `is_xpress` (50 commits) |
+| fork, sparse | tag `v0.32.0-b70.4` = the dense tag + 36 commits (`patches/vllm-qsa/`); 0001–0032 are the b70.3 commits replayed on the new base (same content), 0033–0036 are new |
+| authorship | all new commits `Lumnus`; trailers and internal paths scrubbed as for b70.2/b70.3; `tools/check-trunk-tree.sh` shows the series equal the maintainers' trunk after the scrub rules, apart from the hot/cold commits |
+| kernels | unchanged: `release/0.1.15.4` + the local 64-bit GDN conv-state offset patch. vllm-xpu-kernels 0.1.16.2 (PyPI) was tried and not taken: it does not contain #658 |

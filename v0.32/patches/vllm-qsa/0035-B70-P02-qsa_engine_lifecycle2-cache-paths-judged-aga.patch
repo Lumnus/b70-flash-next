@@ -1,0 +1,688 @@
+From c51fad779feeb853377cbe1f0943d7904f368500 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 09:42:34 +0000
+Subject: [PATCH 35/36] =?UTF-8?q?B70-P02:=20qsa=5Fengine=5Flifecycle2=20?=
+ =?UTF-8?q?=E2=80=94=20cache=20paths=20judged=20against=20a=20cold-vs-cold?=
+ =?UTF-8?q?=20floor?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tools/b70_qsa/qsa_engine_lifecycle2.py: per prompt N cold runs set the noise
+floor; gpu_hit/cpu_reload/junction/cancel_then_hit/interleave_hit are compared
+by the same statistics (exact zone on reused compressed rows, q50/q90 noise
+zone, last-row selection Jaccard, token divergence). No dump or no hit =
+INCONCLUSIVE. --compare prints two arms side by side. The old driver stays.
+
+CPU: tests/models/qwen4_exp/test_qsa_engine_lifecycle2.py (13 passed).
+---
+ .../qwen4_exp/test_qsa_engine_lifecycle2.py   | 259 ++++++++++++
+ tools/b70_qsa/qsa_engine_lifecycle2.py        | 393 ++++++++++++++++++
+ 2 files changed, 652 insertions(+)
+ create mode 100644 tests/models/qwen4_exp/test_qsa_engine_lifecycle2.py
+ create mode 100644 tools/b70_qsa/qsa_engine_lifecycle2.py
+
+diff --git a/tests/models/qwen4_exp/test_qsa_engine_lifecycle2.py b/tests/models/qwen4_exp/test_qsa_engine_lifecycle2.py
+new file mode 100644
+index 0000000000..58bc05476a
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_engine_lifecycle2.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU tests for qsa_engine_lifecycle2.py with synthetic traces (no engine, no HTTP).
++
++The fake engine reproduces what B2b measured: a cold run is bit-identical up to row ~132 (token ~528) and noisy
++after it, and its greedy tokens diverge from another cold run within the first tens of tokens. A cache hit copies
++the reused rows exactly and recomputes the rest with the same noise. Knobs inject real defects."""
++import copy
++import hashlib
++import importlib.util
++import json
++import os
++import random
++import sys
++
++import pytest
++import torch
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++for _c in ("qsa_engine_lifecycle2.py", "../../../tools/b70_qsa/qsa_engine_lifecycle2.py"):
++    _p = os.path.join(_HERE, _c)
++    if os.path.exists(_p):
++        _spec = importlib.util.spec_from_file_location("qsa_engine_lifecycle2", _p)
++        L = importlib.util.module_from_spec(_spec)
++        sys.modules["qsa_engine_lifecycle2"] = L
++        _spec.loader.exec_module(L)
++        break
++else:
++    raise FileNotFoundError("qsa_engine_lifecycle2.py")
++
++D = 16
++ONSET = 132
++
++
++def _seed(ids, extra=""):
++    return int(hashlib.sha1((",".join(map(str, ids[:50])) + str(len(ids)) + extra).encode()).hexdigest()[:8], 16)
++
++
++class FakeEngine:
++    """layers dumped: 23, 47. noise: scale of the nondeterminism after ONSET."""
++
++    model = "fake"
++
++    def __init__(self, noise=0.5, seed=0, hit_noise=None, corrupt=None, early_onset=None, tok_noise=True,
++                 zero_rows=False, no_dump=False, cache_hits=True, block=832):
++        self.noise, self.rng = noise, random.Random(seed)
++        self.hit_noise = noise if hit_noise is None else hit_noise
++        self.corrupt, self.early_onset, self.tok_noise = corrupt, early_onset, tok_noise
++        self.zero_rows, self.no_dump, self.cache_hits, self.block = zero_rows, no_dump, cache_hits, block
++        self.cache = {}  # salt -> {tuple(prefix ids): {layer: rows}}
++        self.log = []
++
++    def tokens(self, n, seed):
++        r = random.Random(seed)
++        return [r.randrange(1000, 60000) for _ in range(n)]
++
++    def _truth(self, ids, layer):
++        g = torch.Generator().manual_seed(_seed(ids, f"L{layer}"))
++        return torch.randn(len(ids) // 4 + 1, D, generator=g)
++
++    def _tokens(self, ids, max_tokens, noisy):
++        base = random.Random(_seed(ids, "tok"))
++        div = self.rng.randrange(2, 30) if (noisy and self.tok_noise) else max_tokens
++        toks, tops = [], []
++        for i in range(max_tokens):
++            top1 = f"t{base.randrange(50)}" if i < div else f"x{self.rng.randrange(50)}"
++            lp1 = -(0.2 + 0.3 * self.rng.random())
++            lp2 = lp1 - (0.5 + self.rng.random())
++            toks.append(top1)
++            tops.append([(top1, lp1), (f"y{i}", lp2), (f"z{i}", lp2 - 1), (f"w{i}", lp2 - 2), (f"v{i}", lp2 - 3)])
++        return toks, tops
++
++    def complete(self, ids, salt, max_tokens=96):
++        hit = 0
++        stored = self.cache.get(salt)
++        if stored and self.cache_hits:
++            for k, rows in stored.items():
++                if tuple(ids[:len(k)]) == k and len(k) > hit:
++                    hit = len(k)
++        hit = hit // self.block * self.block
++        g = hit // 4
++        dumps = {}
++        for layer in (23, 47):
++            truth = self._truth(ids, layer)
++            noise_scale = self.hit_noise if hit else self.noise
++            on = self.early_onset or ONSET
++            n = torch.randn_like(truth) * noise_scale
++            n[:on] = 0
++            rows = truth + n
++            if hit:
++                src = stored[next(k for k in stored if tuple(ids[:len(k)]) == k)][layer]
++                rows[:g] = src[:g]
++                if self.corrupt == "reused":
++                    rows[700] += 0.5
++            if self.corrupt == "tail" and hit:
++                rows[g + 50:] += torch.randn(rows.shape[0] - g - 50, D) * 3
++            if self.zero_rows:
++                rows[-40:] = 0
++            keep = set(range(120))
++            for _ in range(self.rng.randint(4, 14) if noise_scale else 0):  # a few swapped selections (J ~ 0.9)
++                keep.discard(self.rng.randrange(120))
++                keep.add(self.rng.randrange(120, 400))
++            sel = torch.tensor(sorted(keep))
++            dumps[layer] = {"compressed": rows, "last_row_selected": sel, "seq_len": len(ids)}
++        if self.cache_hits:
++            self.cache.setdefault(salt, {})[tuple(ids)] = {L_: d["compressed"] for L_, d in dumps.items()}
++        toks, tops = self._tokens(ids, max_tokens, noisy=True)
++        m = {"vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"}": float(hit)} if hit else {}
++        return {"tokens": toks, "top": tops, "metrics": m, "dumps": {} if self.no_dump else dumps}
++
++    def cancel_after_first_chunk(self, ids, salt):
++        self.log.append("cancel")
++
++
++class Args:
++    label = "t"
++    prompt_tokens = 6150
++    junction_tokens = 4101
++    evict_tokens = 24000
++    filler_tokens = 12000
++    max_tokens = 64
++    floor_runs = 3
++    rel_margin = 0.5
++    strict_tail = False
++    compress_ratio = 4
++    skip = "interleave"
++
++
++def go(eng, **kw):
++    a = Args()
++    for k, v in kw.items():
++        setattr(a, k, v)
++    return L.run(eng, a)
++
++
++def test_noise_only_passes_every_path():
++    rep = go(FakeEngine(noise=0.5, seed=1))
++    assert rep["failed"] == []
++    for name, p in rep["paths"].items():
++        if "verdict" in p:
++            assert p["verdict"] in ("PASS", "INCONCLUSIVE"), (name, p)
++    g = rep["paths"]["gpu_hit"]
++    assert g["verdict"] == "PASS" and g["hit_tokens_reported"] == 5824
++    lay = g["dumps"]["23"]
++    assert lay["exact_ok"] and lay["reused_rows"] == 1456 and lay["floor_onset_row"] == ONSET
++
++
++def test_old_fixed_thresholds_would_fail_the_same_traces():
++    """The point of the floor: at noise 0.5 a cold-vs-cold pair is far over the old 0.05 atol."""
++    e = FakeEngine(noise=0.5, seed=2)
++    P = e.tokens(6150, 1)
++    a, b = e.complete(P, "a"), e.complete(P, "b")
++    diff = L.row_diff(a["dumps"][23]["compressed"], b["dumps"][23]["compressed"])
++    assert int((diff > 0.05).sum()) > 1000
++
++
++def test_corrupt_reused_row_fails():
++    rep = go(FakeEngine(noise=0.5, seed=3, corrupt="reused"))
++    p = rep["paths"]["gpu_hit"]
++    assert p["verdict"] == "FAIL" and not p["dumps"]["23"]["exact_ok"]
++    assert p["dumps"]["23"]["cand_onset_row"] == 700
++
++
++def test_tail_noise_far_above_floor_fails():
++    rep = go(FakeEngine(noise=0.3, seed=4, corrupt="tail"))
++    p = rep["paths"]["gpu_hit"]
++    assert p["verdict"] == "FAIL"
++    assert not p["dumps"]["23"]["checks"]["q90"]
++
++
++def test_zero_rows_fail():
++    # zero rows only on the hit path: build floor runs clean, then switch the knob for the candidate
++    e = FakeEngine(noise=0.5, seed=5)
++    orig = e.complete
++    calls = {"n": 0}
++
++    def complete(ids, salt, max_tokens=96):
++        calls["n"] += 1
++        e.zero_rows = calls["n"] > 3  # the three cold runs are clean
++        return orig(ids, salt, max_tokens)
++
++    e.complete = complete
++    p = go(e, skip="cpu_reload,junction,cancel,interleave")["paths"]["gpu_hit"]
++    assert p["verdict"] == "FAIL" and not p["dumps"]["23"]["checks"]["zero_rows"]
++
++
++def test_no_reuse_demands_identity_up_to_floor_onset():
++    # a path with no reused rows that diverges at row 40, earlier than the cold runs do (132)
++    e = FakeEngine(noise=0.5, seed=6)
++    P = e.tokens(6150, 1)
++    colds = [e.complete(P, f"c{i}") for i in range(3)]
++    bad = FakeEngine(noise=0.5, seed=7, early_onset=40).complete(P, "x")
++    lay = L.compare_layer(colds[0]["dumps"][23], bad["dumps"][23], [c["dumps"][23] for c in colds], 0)
++    assert lay["exact_zone_rows"] == ONSET and lay["cand_onset_row"] == 40 and not lay["exact_ok"] and not lay["ok"]
++    good = e.complete(P, "y")
++    lay = L.compare_layer(colds[0]["dumps"][23], good["dumps"][23], [c["dumps"][23] for c in colds], 0)
++    assert lay["exact_ok"] and lay["ok"]
++
++
++def test_deterministic_engine_degenerates_to_exact():
++    rep = go(FakeEngine(noise=0.0, seed=8, tok_noise=False))
++    p = rep["paths"]["gpu_hit"]
++    assert p["verdict"] == "PASS" and p["tokens"]["exact"]
++    # and one wrong element in the noise zone is then a failure (floor is 0, bound is abs_eps only)
++    e = FakeEngine(noise=0.0, seed=8, tok_noise=False, corrupt="tail")
++    assert go(e)["paths"]["gpu_hit"]["verdict"] == "FAIL"
++
++
++def test_token_stats_catch_a_degenerate_continuation():
++    e = FakeEngine(noise=0.5, seed=9)
++    P = e.tokens(6150, 1)
++    colds = [e.complete(P, f"c{i}") for i in range(3)]
++    cand = copy.deepcopy(e.complete(P, "c0"))
++    # a candidate whose continuation is confidently wrong: very low top-1 logprob and tiny margins
++    cand["top"] = [[(t, -3.0), ("a", -3.01), ("b", -3.5), ("c", -4), ("d", -5)] for t, _ in [x[0] for x in cand["top"]]]  # noqa: E501
++    r = L.compare_tokens(colds[0], cand, colds)
++    assert not r["ok"] and not r["checks"]["mean_top1_logprob"]
++    assert L.compare_tokens(colds[0], colds[1], colds)["ok"]
++
++
++def test_no_dump_and_no_hit_are_inconclusive_not_pass():
++    rep = go(FakeEngine(no_dump=True, seed=10), skip="cpu_reload,junction,cancel,interleave")
++    assert rep["paths"]["gpu_hit"]["verdict"] == "INCONCLUSIVE" and rep["failed"] == []
++    rep = go(FakeEngine(cache_hits=False, seed=11), skip="cpu_reload,junction,cancel,interleave")
++    assert rep["paths"]["gpu_hit"]["verdict"] == "INCONCLUSIVE"
++
++
++def test_all_paths_run_and_json_roundtrips(tmp_path):
++    rep = go(FakeEngine(noise=0.4, seed=12), skip="")  # interleave thread uses the fake as well
++    assert set(rep["paths"]) >= {"cold", "gpu_hit", "cpu_reload", "junction", "cancel_then_hit", "interleave_hit"}
++    json.loads(json.dumps(rep, default=str))
++
++
++def test_compare_arms_table():
++    a = go(FakeEngine(noise=0.5, seed=13), label="drop-on", skip="cpu_reload,junction,cancel,interleave")
++    b = go(FakeEngine(noise=0.5, seed=14, block=416), label="drop-off", skip="cpu_reload,junction,cancel,interleave")
++    t = L.compare_arms(a, b)
++    assert "drop-on" in t and "drop-off" in t and "gpu_hit" in t and "q50/fl" in t
++
++
++def test_cli_compare(tmp_path, capsys):
++    a = go(FakeEngine(seed=15), label="A", skip="cpu_reload,junction,cancel,interleave")
++    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
++    pa.write_text(json.dumps(a, default=str))
++    b = copy.deepcopy(a)
++    b["label"] = "B"
++    pb.write_text(json.dumps(b, default=str))
++    assert L.main(["--compare", str(pa), str(pb)]) == 0
++    assert "gpu_hit" in capsys.readouterr().out
++
++
++def test_early_token_divergence_fails_and_late_does_not():
++    mk = lambda toks: {"tokens": toks, "top": [[(x, -0.3), ("o", -1.5), ("p", -2), ("q", -3), ("r", -4)] for x in toks]}
++    base = [f"t{i}" for i in range(40)]
++    ref = mk(base)
++    floor = [ref, mk(base[:25] + ["x"] * 15), mk(base[:30] + ["y"] * 10)]
++    assert L.compare_tokens(ref, mk(base[:26] + ["z"] * 14), floor)["ok"]
++    floor = [ref, mk(base[:30] + ["x"] * 10), mk(base[:35] + ["y"] * 5)]
++    r = L.compare_tokens(ref, mk(["bad"] + base[1:]), floor)
++    assert not r["ok"] and not r["checks"]["not_earlier_than_floor"]
+diff --git a/tools/b70_qsa/qsa_engine_lifecycle2.py b/tools/b70_qsa/qsa_engine_lifecycle2.py
+new file mode 100644
+index 0000000000..572fc452c4
+--- /dev/null
++++ b/tools/b70_qsa/qsa_engine_lifecycle2.py
+@@ -0,0 +1,393 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA-P: prefix / offload lifecycle of a running sparse engine, judged against a same-run noise floor.
++
++Replaces the fixed thresholds of qsa_engine_lifecycle.py (0.05 on compressed rows, 0.1 nat near-tie). Both engines
++(sparse and dense) are run-to-run nondeterministic from about token 512, so a cold run and a warm run of the same
++prompt differ no matter what the cache does, and the fixed thresholds fail every path (B2b §4). This driver
++measures the noise first and asks a different question of every cache path: *is it distinguishable from a second
++cold run?*
++
++For every prompt it runs ``--floor-runs`` cold runs with fresh cache salts. Run 0 is the reference; all pairs of
++cold runs give the noise floor. A cache path (GPU hit, CPU reload, junction, cancel + hit, interleave) is compared
++with the reference by the same statistics:
++
++  compressed rows (per dumped layer, per-row max |diff|)
++    exact zone   rows [0, g) are copied from the reference run when the path reports g reused rows (hit tokens /
++                 compress ratio): they must be bit-identical. With no reuse the zone is rows [0, onset), where onset
++                 is the first row at which any pair of cold runs differs: before it the engine is deterministic,
++                 so the path must be too.
++    noise zone   the remaining rows: q50 and q90 of the per-row diff, and the last-row selection Jaccard, must not
++                 be worse than the worst cold pair (plus --rel-margin and a small absolute term). max and q99 are
++                 reported, and gate only with --strict-tail (single rows are too noisy for a few pairs).
++    zero rows    an all-zero row that the cold runs do not have is a failure.
++  greedy tokens
++    identical up to the first divergence of the cold pairs (the path may not diverge earlier than noise does),
++    then the mean top-1 logprob and the mean top-1/top-2 margin of the continuation must lie within the cold runs'
++    spread (plus a margin). The old "near tie and in the base top-5" test is kept as information.
++
++Arm comparison: ``--compare lifeA.json lifeB.json`` prints, per path, reused tokens, exactness and the noise-zone
++statistics as a ratio to each arm's own floor, so "block drop on" and "off" can be read side by side.
++
++Engine env (all default off): B70_QSA_DEBUG_DUMP=<dir> B70_QSA_DEBUG_DUMP_LAYERS=0,23,47 B70_QSA_TOPK=torch.
++Exit status is non-zero if any path FAILs. A path with no moved prefix-cache metric is INCONCLUSIVE, not PASS.
++"""
++from __future__ import annotations
++
++import argparse
++import itertools
++import json
++import re
++import statistics
++import threading
++import time
++import urllib.request
++import uuid
++from pathlib import Path
++
++import torch
++
++# ------------------------------------------------------------------------------------------ http engine
++
++
++def post(base, path, body, timeout=1800):
++    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
++                                 headers={"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.loads(r.read())
++
++
++def get(base, path):
++    with urllib.request.urlopen(base + path, timeout=60) as r:
++        return r.read().decode()
++
++
++METRIC = re.compile(r"^(vllm:(?:prefix_cache_\w+|external_prefix_cache_\w+|prompt_tokens_by_source\w*))"
++                    r"(\{[^}]*\})?\s+([0-9.eE+-]+)$")
++
++
++def metrics(base):
++    out = {}
++    for line in get(base, "/metrics").splitlines():
++        m = METRIC.match(line)
++        if m:
++            labels = re.sub(r'(model_name|engine)="[^"]*",?', "", m.group(2) or "")
++            out[m.group(1) + labels] = float(m.group(3))
++    return out
++
++
++def delta(after, before):
++    return {k: after[k] - before.get(k, 0.0) for k in after if after[k] - before.get(k, 0.0)}
++
++
++class Engine:
++    def __init__(self, base, dump_dir):
++        self.base, self.dump = base, Path(dump_dir)
++        self.model = json.loads(get(base, "/v1/models"))["data"][0]["id"]
++
++    def tokens(self, n, seed):
++        words, i = [], 0
++        while len(words) < n * 2:
++            words.append(f"Record {seed}-{i}: item {i * 7919 % 10007} weighs {i * 104729 % 997} units "
++                         f"and sits beside shelf {i % 61}.")
++            i += 1
++        ids = post(self.base, "/tokenize", {"model": self.model, "prompt": " ".join(words)})["tokens"]
++        assert len(ids) >= n, (len(ids), n)
++        return ids[:n]
++
++    def complete(self, ids, salt, max_tokens=96):
++        before_files = set(self.dump.glob("qsa-L*.pt")) if self.dump.exists() else set()
++        before = metrics(self.base)
++        res = post(self.base, "/v1/completions", {
++            "model": self.model, "prompt": ids, "max_tokens": max_tokens, "temperature": 0.0, "logprobs": 5,
++            "cache_salt": salt, "ignore_eos": True})
++        time.sleep(0.5)
++        files = sorted(set(self.dump.glob("qsa-L*.pt")) - before_files)
++        lp = res["choices"][0]["logprobs"]
++        return {"tokens": lp["tokens"],
++                "top": [sorted(d.items(), key=lambda kv: -kv[1]) for d in lp["top_logprobs"]],
++                "metrics": delta(metrics(self.base), before),
++                "dumps": self.load_dumps(files, len(ids))}
++
++    @staticmethod
++    def load_dumps(files, seq_len):
++        found = {}
++        for f in files:
++            d = torch.load(f, weights_only=False)
++            for r in d["requests"]:
++                if r["seq_len"] == seq_len:
++                    found[d["layer"]] = r  # last matching step wins
++        return found
++
++    def cancel_after_first_chunk(self, ids, salt):
++        body = {"model": self.model, "prompt": ids, "max_tokens": 200, "stream": True, "cache_salt": salt}
++        req = urllib.request.Request(self.base + "/v1/completions", data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"})
++        with urllib.request.urlopen(req, timeout=1800) as r:
++            r.readline()  # first chunk, then drop the connection
++
++
++# ------------------------------------------------------------------------------------------ statistics
++
++
++def _q(v: torch.Tensor, p: float) -> float:
++    return float(torch.quantile(v.float(), p)) if v.numel() else 0.0
++
++
++def first_over(diff: torch.Tensor, eps: float) -> int:
++    idx = (diff > eps).nonzero().flatten()
++    return int(idx[0]) if idx.numel() else int(diff.numel())
++
++
++def row_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++    return (a.float() - b.float()).abs().amax(dim=1)
++
++
++def jaccard(a, b) -> float:
++    sa, sb = set(a.tolist()) - {-1}, set(b.tolist()) - {-1}
++    return len(sa & sb) / max(1, len(sa | sb))
++
++
++def zone_stats(diff: torch.Tensor, start: int) -> dict:
++    z = diff[start:]
++    return {"rows": int(z.numel()), "q50": _q(z, 0.5), "q90": _q(z, 0.9), "q99": _q(z, 0.99),
++            "max": float(z.max()) if z.numel() else 0.0}
++
++
++def upper_bound(vals, rel, abs_):
++    return max(vals) * (1 + rel) + abs_
++
++
++def compare_layer(ref, cand, floor_runs, g, rel=0.5, abs_eps=1e-3, exact_eps=0.0, strict_tail=False):
++    """ref/cand: dump dicts ({'compressed': [rows, dim], 'last_row_selected': [k]}); floor_runs: dumps of the other
++    cold runs of the same prompt, ref first. g = rows reused from ref by this path (0 if none)."""
++    runs = floor_runs
++    if any(r["compressed"].shape != ref["compressed"].shape for r in runs) or \
++            cand["compressed"].shape != ref["compressed"].shape:
++        return {"ok": False, "why": "shape mismatch", "shapes": [tuple(r["compressed"].shape) for r in runs]
++                + [tuple(cand["compressed"].shape)]}
++    pairs = list(itertools.combinations(runs, 2))
++    f_diff = [row_diff(a["compressed"], b["compressed"]) for a, b in pairs]
++    onset = min((first_over(d, exact_eps) for d in f_diff), default=ref["compressed"].shape[0])
++    c_diff = row_diff(ref["compressed"], cand["compressed"])
++    c_onset = first_over(c_diff, exact_eps)
++    n = c_diff.numel()
++    need = g if g else onset              # rows that must be bit-identical
++    out = {"rows": n, "floor_onset_row": onset, "cand_onset_row": c_onset, "exact_zone_rows": need,
++           "reused_rows": g, "exact_ok": c_onset >= need}
++    start = need
++    cs = zone_stats(c_diff, start)
++    fs = [zone_stats(d, start) for d in f_diff]
++    out["cand"], out["floor"] = cs, fs
++    zero_c = int((cand["compressed"].abs().amax(dim=1) == 0).sum())
++    zero_f = max(int((r["compressed"].abs().amax(dim=1) == 0).sum()) for r in runs)
++    cj = jaccard(ref["last_row_selected"], cand["last_row_selected"])
++    fj = [jaccard(a["last_row_selected"], b["last_row_selected"]) for a, b in pairs]
++    out["jaccard"], out["floor_jaccard"] = round(cj, 4), [round(x, 4) for x in fj]
++    out["all_zero_rows"], out["floor_all_zero_rows"] = zero_c, zero_f
++    checks = {"exact_zone": out["exact_ok"], "zero_rows": zero_c <= zero_f}
++    ratios = {}
++    for k in ("q50", "q90") + (("q99", "max") if strict_tail else ()):
++        b = upper_bound([s[k] for s in fs], rel, abs_eps)
++        checks[k] = cs[k] <= b
++    for k in ("q50", "q90", "q99", "max"):
++        m = max(s[k] for s in fs)
++        ratios[k] = round(cs[k] / m, 3) if m > 0 else (0.0 if cs[k] == 0 else None)
++    checks["jaccard"] = cj >= min(fj) - max(0.08, 0.5 * (max(fj) - min(fj)))
++    out["ratio_to_worst_floor"] = ratios
++    out["checks"] = checks
++    out["ok"] = all(checks.values())
++    return out
++
++
++def _tok_stats(r):
++    """(mean, standard error) of the top-1 logprob and of the top-1/top-2 margin over the generated tokens."""
++    top1 = [t[0][1] for t in r["top"] if t]
++    margin = [t[0][1] - t[1][1] for t in r["top"] if len(t) > 1]
++
++    def ms(v):
++        if not v:
++            return 0.0, 0.0
++        return statistics.fmean(v), (statistics.pstdev(v) / len(v) ** 0.5 if len(v) > 1 else 0.0)
++
++    return ms(top1), ms(margin)
++
++
++def first_div(a, b) -> int:
++    for i, (x, y) in enumerate(zip(a["tokens"], b["tokens"])):
++        if x != y:
++            return i
++    return min(len(a["tokens"]), len(b["tokens"]))
++
++
++def compare_tokens(ref, cand, floor_runs, near_margin=0.1, rel=0.25, abs_eps=0.05, early_rel=0.25):
++    """floor_runs: the cold runs of the same prompt, ref first. The divergence of the candidate from ref is compared
++    with the divergence of the other cold runs from ref (the same kind of pair); with 2-4 samples a strict
++    "not earlier than the earliest" would fail one run in n by chance, so the candidate fails only if it diverges
++    before ``early_rel`` of the earliest cold divergence (minus two tokens): this catches a divergence at the very
++    start of the continuation and nothing subtler. The continuation statistics carry the rest."""
++    d_floor = [first_div(ref, r) for r in floor_runs[1:]]
++    d_c = first_div(ref, cand)
++    n = min(len(ref["tokens"]), len(cand["tokens"]))
++    exact = d_c >= n and len(ref["tokens"]) == len(cand["tokens"])
++    out = {"exact": exact, "first_divergence": None if exact else d_c, "floor_first_divergence": d_floor}
++    if not exact:
++        top = ref["top"][d_c]
++        out["near_tie_vs_ref"] = len(top) > 1 and top[0][1] - top[1][1] < near_margin
++        out["cand_token_in_ref_top5"] = cand["tokens"][d_c] in [t for t, _ in top]
++    cm = _tok_stats(cand)
++    fms = [_tok_stats(r) for r in floor_runs]
++    checks = {"not_earlier_than_floor": exact or d_c >= early_rel * min(d_floor) - 2}
++    for i, name in enumerate(("mean_top1_logprob", "mean_top1_top2_margin")):
++        vals = [f[i][0] for f in fms]
++        # a mean over a few dozen tokens has a sampling error; with 2-4 cold runs their range alone under-covers it
++        se = max([f[i][1] for f in fms] + [cm[i][1]])
++        tol = rel * (max(vals) - min(vals)) + 3 * se + abs_eps
++        out[name] = {"cand": round(cm[i][0], 4), "floor": [round(v, 4) for v in vals], "se": round(se, 4)}
++        checks[name] = min(vals) - tol <= cm[i][0] <= max(vals) + tol
++    out["checks"] = checks
++    out["ok"] = all(checks.values())
++    return out
++
++
++def hit_tokens(m):
++    return int(sum(v for k, v in m.items() if "prompt_tokens_by_source" in k and ("cache" in k or "external" in k)))
++
++
++# ------------------------------------------------------------------------------------------ the run
++
++
++def run(eng, a):
++    salt = f"qsaq-{uuid.uuid4().hex[:8]}"
++    skip = set(filter(None, a.skip.split(",")))
++    report = {"label": a.label, "prompt_tokens": a.prompt_tokens, "floor_runs": a.floor_runs, "paths": {}}
++    P = eng.tokens(a.prompt_tokens, 1)
++
++    def colds(ids, tag):
++        """floor_runs cold runs with fresh salts; [0] is the reference."""
++        return [eng.complete(ids, f"{salt}-{tag}{i}", a.max_tokens) for i in range(a.floor_runs)]
++
++    def judge(name, ref, floor, cand, expect_hit=True):
++        h = hit_tokens(cand["metrics"])
++        g = h // a.compress_ratio
++        dumps, layers = {}, sorted(set(ref["dumps"]) & set(cand["dumps"]) & set.intersection(
++            *[set(f["dumps"]) for f in floor]))
++        for L in layers:
++            dumps[str(L)] = compare_layer(ref["dumps"][L], cand["dumps"][L], [f["dumps"][L] for f in floor], g,
++                                          rel=a.rel_margin, strict_tail=a.strict_tail)
++        dok = bool(layers) and all(d["ok"] for d in dumps.values())
++        tk = compare_tokens(ref, cand, floor)
++        entry = {"hit_tokens_reported": h, "metrics": cand["metrics"], "tokens": tk, "dumps": dumps,
++                 "dumps_ok": dok}
++        if not layers:
++            entry["verdict"], entry["why"] = "INCONCLUSIVE", "no dump for this prompt (engine env?)"
++        elif expect_hit and not cand["metrics"]:
++            entry["verdict"], entry["why"] = "INCONCLUSIVE", "no prefix-cache metric moved; did the hit happen?"
++        else:
++            entry["verdict"] = "PASS" if (tk["ok"] and dok) else "FAIL"
++        report["paths"][name] = entry
++        brief = {"verdict": entry["verdict"], "hit": h, "tokens_ok": tk["ok"], "tokens": tk["checks"],
++                 "dumps": {L: {"exact": d.get("exact_ok"), **(d.get("checks") or {})} for L, d in dumps.items()}}
++        print(name, json.dumps(brief, default=str), flush=True)
++
++    cold = colds(P, "cold")
++    ref = cold[0]
++    report["paths"]["cold"] = {"metrics": ref["metrics"], "dump_layers": sorted(ref["dumps"]),
++                               "floor_first_divergence": [first_div(ref, x) for x in cold[1:]]}
++    if "gpu_hit" not in skip:
++        judge("gpu_hit", ref, cold, eng.complete(P, f"{salt}-cold0", a.max_tokens))
++    if "cpu_reload" not in skip:
++        n = 0
++        while n < a.evict_tokens:
++            eng.complete(eng.tokens(a.filler_tokens, 1000 + n), f"fill-{uuid.uuid4().hex}", max_tokens=1)
++            n += a.filler_tokens
++        judge("cpu_reload", ref, cold, eng.complete(P, f"{salt}-cold0", a.max_tokens))
++    if "junction" not in skip:
++        J = P[: a.junction_tokens] + eng.tokens(1500, 2)
++        jc = colds(J, "jcold")
++        # the junction prompt shares an unaligned prefix with P: run it under P's salt so it can hit P's blocks
++        judge("junction", jc[0], jc, eng.complete(J, f"{salt}-cold0", a.max_tokens), expect_hit=False)
++    if "cancel" not in skip:
++        eng.cancel_after_first_chunk(eng.tokens(30000, 3), f"{salt}-cancel")
++        judge("cancel_then_hit", ref, cold, eng.complete(P, f"{salt}-cold0", a.max_tokens))
++    if "interleave" not in skip:
++        Q = eng.tokens(a.prompt_tokens + 401, 4)
++        stop = threading.Event()
++
++        def long_decode():
++            while not stop.is_set():
++                eng.complete(eng.tokens(2000, 5), f"{salt}-bg", max_tokens=400)
++
++        t = threading.Thread(target=long_decode, daemon=True)
++        t.start()
++        time.sleep(2)
++        qc = colds(Q, "qcold")                      # floor under the same background load
++        q_hit = eng.complete(Q, f"{salt}-qcold0", a.max_tokens)
++        stop.set()
++        judge("interleave_hit", qc[0], qc, q_hit)
++    bad = [k for k, v in report["paths"].items() if v.get("verdict") == "FAIL"]
++    unk = [k for k, v in report["paths"].items() if v.get("verdict") == "INCONCLUSIVE"]
++    report["failed"], report["inconclusive"] = bad, unk
++    return report
++
++
++# ------------------------------------------------------------------------------------------ arm comparison
++
++
++def compare_arms(ra: dict, rb: dict) -> str:
++    """Side-by-side of two run reports (e.g. EAGLE block drop on vs off)."""
++    lines = [f"{'path':<16}{'arm':<10}{'verdict':<13}{'hit tok':>8}{'exact':>7}{'q50/fl':>8}{'q90/fl':>8}{'jacc':>7}"
++             f"{'div@':>6}"]
++    for name in sorted(set(ra["paths"]) | set(rb["paths"])):
++        for arm, r in ((ra["label"], ra), (rb["label"], rb)):
++            p = r["paths"].get(name)
++            if not p or "tokens" not in p:
++                continue
++            ds = list(p["dumps"].values())
++            ex = "yes" if ds and all(d.get("exact_ok") for d in ds) else "NO"
++            q50 = max((d.get("ratio_to_worst_floor", {}).get("q50") or 0) for d in ds) if ds else 0
++            q90 = max((d.get("ratio_to_worst_floor", {}).get("q90") or 0) for d in ds) if ds else 0
++            jac = min((d.get("jaccard", 1) for d in ds), default=1)
++            dv = p["tokens"]["first_divergence"]
++            lines.append(f"{name:<16}{arm:<10}{p['verdict']:<13}{p['hit_tokens_reported']:>8}{ex:>7}{q50:>8.2f}"
++                         f"{q90:>8.2f}{jac:>7.3f}{'-' if dv is None else dv:>6}")
++    lines.append("exact: reused rows bit-identical to the reference. q50/q90 ratio: noise-zone diff over the worst "
++                 "cold pair (<= 1.5 is inside the floor). hit tok: cached prompt tokens the engine reported.")
++    return "\n".join(lines)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--base", default="http://127.0.0.1:8001")
++    ap.add_argument("--dump-dir")
++    ap.add_argument("--label")
++    ap.add_argument("--prompt-tokens", type=int, default=6150)  # not 832-aligned
++    ap.add_argument("--junction-tokens", type=int, default=4101)
++    ap.add_argument("--evict-tokens", type=int, default=420000, help="filler volume; must exceed the engine's GPU KV tokens")
++    ap.add_argument("--filler-tokens", type=int, default=12000)
++    ap.add_argument("--max-tokens", type=int, default=96, help="more tokens, better token statistics")
++    ap.add_argument("--floor-runs", type=int, default=3, help="cold runs per prompt (>= 2); pairs = n(n-1)/2")
++    ap.add_argument("--rel-margin", type=float, default=0.5)
++    ap.add_argument("--strict-tail", action="store_true", help="q99 and max also gate")
++    ap.add_argument("--compress-ratio", type=int, default=4)
++    ap.add_argument("--out", default=None)
++    ap.add_argument("--skip", default="", help="comma list: gpu_hit,cpu_reload,junction,cancel,interleave")
++    ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"))
++    a = ap.parse_args(argv)
++    if a.compare:
++        print(compare_arms(*(json.loads(Path(p).read_text()) for p in a.compare)))
++        return 0
++    if not (a.dump_dir and a.label):
++        ap.error("--dump-dir and --label are required")
++    if a.floor_runs < 2:
++        ap.error("--floor-runs must be >= 2")
++    report = run(Engine(a.base, a.dump_dir), a)
++    text = json.dumps(report, indent=1, default=str)
++    if a.out:
++        Path(a.out).write_text(text)
++    print("FAILED:" if report["failed"] else "ALL OK", report["failed"], "inconclusive:", report["inconclusive"])
++    return 1 if report["failed"] else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

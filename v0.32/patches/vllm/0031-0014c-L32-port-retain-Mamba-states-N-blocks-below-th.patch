@@ -1,7 +1,7 @@
 From e6c025c8832dfe69dc4ed474df0b62ee135f6019 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 08:55:14 +0000
-Subject: [PATCH 31/49] 0014c (L32 port): retain Mamba states N blocks below
+Subject: [PATCH 31/50] 0014c (L32 port): retain Mamba states N blocks below
  the replay boundary (B70_OFFLOAD_GDN_BACKSTEP=N)
 
 Re-done on 0.32 (replay boundaries became the module function replay_boundaries); semantics of b70/v0.30.0 80aacb5725, tests from that commit.

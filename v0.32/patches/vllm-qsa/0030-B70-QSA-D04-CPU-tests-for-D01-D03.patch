@@ -1,7 +1,7 @@
-From fc8a5527ba57e93411a8de90cceff981dd5fb072 Mon Sep 17 00:00:00 2001
+From 68afed90ed7d8cd257a52e1935e7715bad99116d Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:13:39 +0000
-Subject: [PATCH 30/32] B70-QSA-D04: CPU tests for D01-D03
+Subject: [PATCH 30/36] B70-QSA-D04: CPU tests for D01-D03
 
 test_qsa_topk_levers.py checks the following:
 - D01: select equals the torch selector element for element on tie-heavy

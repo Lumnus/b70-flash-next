@@ -14,6 +14,7 @@ ap.add_argument("--base", required=True)
 ap.add_argument("--trunk", required=True)
 ap.add_argument("--hotcold-count", type=int, default=12)
 ap.add_argument("--hotcold-base", default=None)
+ap.add_argument("--hotcold-tip", default=None, help="last hot/cold commit when it is not the trunk tip (default: the trunk)")
 ap.add_argument("--rules", required=True)
 ap.add_argument("--series", action="append", required=True, help="patch directory, applied in the order given")
 ap.add_argument("--show", type=int, default=60, help="max diff lines printed per drifting file")
@@ -106,11 +107,13 @@ def hunks(t1, t2):
 
 
 A, nfiles = series_tree()
-hb = a.hotcold_base or f"{a.trunk}~{a.hotcold_count}"
+tip = a.hotcold_tip or a.trunk
+hb = a.hotcold_base or f"{tip}~{a.hotcold_count}"
 B = scrubbed_tree(a.trunk)
 Bb = scrubbed_tree(hb)
+Bt = B if tip == a.trunk else scrubbed_tree(tip)
 dAB = hunks(A, B)          # what separates the series from scrubbed trunk
-dHC = hunks(Bb, B)         # what the hot/cold commits change (scrubbed)
+dHC = hunks(Bb, Bt)        # what the hot/cold commits change (scrubbed)
 print(f"series: {nfiles} patches -> tree A {A[:12]}")
 print(f"trunk {git('rev-parse', a.trunk).strip()[:12]} scrubbed -> tree B {B[:12]};  hot/cold base {git('rev-parse', hb).strip()[:12]} -> {sum(dHC.values())} hunks in {len({k[0] for k in dHC})} files")
 

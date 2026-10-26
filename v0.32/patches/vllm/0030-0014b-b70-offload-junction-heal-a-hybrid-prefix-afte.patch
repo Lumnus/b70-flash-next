@@ -1,7 +1,7 @@
 From 9449b362707e3d5f9e4ae930c27e19d6b37ecbfb Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 21:38:00 +0000
-Subject: [PATCH 30/49] 0014b-b70-offload-junction: heal a hybrid prefix after
+Subject: [PATCH 30/50] 0014b-b70-offload-junction: heal a hybrid prefix after
  one miss (B70_OFFLOAD_JUNCTION=1)
 
 Default off. On a hybrid (full attention + Mamba/GDN) model with sparse Mamba

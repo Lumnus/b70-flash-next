@@ -1,7 +1,7 @@
 From bedf4366cf25e3606c9f7df8a87174aec5da6bde Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 09:05:09 +0000
-Subject: [PATCH 33/49] L32 tests: B70-L32-0013 resolve_ids/stage gather test;
+Subject: [PATCH 33/50] L32 tests: B70-L32-0013 resolve_ids/stage gather test;
  0014c test on replay_boundaries(); host-hash tests skipped (not used on 0.32)
 
 ---

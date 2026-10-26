@@ -1,7 +1,7 @@
-From c0e2e5b9da87a28553669c6aa0a2e7565fb722c9 Mon Sep 17 00:00:00 2001
+From 88c325722aa7afb94069aa359029865691d8eef9 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:48:36 +0000
-Subject: [PATCH 19/32] B70-QSA-Q03: QSA side-cache state-contract tests and an
+Subject: [PATCH 19/36] B70-QSA-Q03: QSA side-cache state-contract tests and an
  engine lifecycle driver
 
 tests/models/qwen4_exp/test_qsa_state_contracts.py drives one layer's ring

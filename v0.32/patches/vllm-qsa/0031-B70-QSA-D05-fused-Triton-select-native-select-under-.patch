@@ -1,7 +1,7 @@
-From 5efd1667db22594270a426eaba3140c15c074702 Mon Sep 17 00:00:00 2001
+From 8eb4a7e62b60cd3160e5c22c8967a23e5d8920af Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:28:07 +0000
-Subject: [PATCH 31/32] B70-QSA-D05: fused Triton select, native + select under
+Subject: [PATCH 31/36] B70-QSA-D05: fused Triton select, native + select under
  capture, radix schedule by width, one-card bench
 
 - B70_QSA_TOPK_SELECT_IMPL=triton (default torch): the native-anchored

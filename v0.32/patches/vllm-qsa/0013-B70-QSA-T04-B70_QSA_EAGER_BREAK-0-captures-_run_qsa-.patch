@@ -1,7 +1,7 @@
-From 3c91483ecf67f82e47a3fb19e1ece35d257fb2ad Mon Sep 17 00:00:00 2001
+From 9e1bb62730bdf8b5fc86f8e59385b52e5749a86a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:34:31 +0000
-Subject: [PATCH 13/32] B70-QSA-T04: B70_QSA_EAGER_BREAK=0 captures _run_qsa
+Subject: [PATCH 13/36] B70-QSA-T04: B70_QSA_EAGER_BREAK=0 captures _run_qsa
  into the graph segments (measurement arm)
 
 vLLM auto-enables breakable CUDA graphs for Qwen4Exp (journal: "Auto-enabling

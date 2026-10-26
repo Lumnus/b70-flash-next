@@ -1,7 +1,7 @@
 From a0d3f91e4b17555b8152a314a2d46c496d0c617b Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Thu, 1 Oct 2026 16:06:07 +0000
-Subject: [PATCH 20/49] 0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer: drop
+Subject: [PATCH 20/50] 0020-b70-qwen4exp-mtp-dense-qsa-skip-indexer: drop
  *.self_attn.indexer.* in the MTP loaders
 
 0019 for the draft model. Dense-QSA configs (no indexer_n_heads) build no

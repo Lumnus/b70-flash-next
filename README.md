@@ -1,43 +1,49 @@
 # b70-flash-next
 
 vLLM for **Qwen3.8-Flash-Next on 4× Intel Arc Pro B70**. This page describes the current line, **0.32**: release
-**0.32.0-b70.3** (dense series unchanged from b70.1; sparse near dense speed). The line is vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain, our patches on top, DFlash2 speculative decoding and a vllm-xpu-kernels
+**0.32.0-b70.4** (dense and sparse attention both working). The line is vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain, our patches on top, DFlash2 speculative decoding and a vllm-xpu-kernels
 build carrying our upstream fixes. Its files are in [`v0.32/`](v0.32/README.md), which has the full build recipe and
 measurement method. The previous line, **0.30.0-b70.2** (vLLM v0.30.0), stays as the stable fallback; its files are
 the rest of this repository root (`patches/`, `engines/`, `image/`), and its page is
 [docs/line-0.30.md](docs/line-0.30.md). Every number on this page names the line it was measured on.
 
-The 0.32 line has two attention variants: **dense** (the release below: the checkpoint's QSA indexer is dropped and
-the full-attention layers attend over the whole context) and **sparse** (QSA with the indexer kept; **working,
-experimental, 0.90–1.00× dense speed and 14 % less KV**; added in 0.32.0-b70.2, near dense speed since 0.32.0-b70.3,
-see [v0.32/README.md](v0.32/README.md#sparse-attention-qsa)). Both are listed as working.
+The 0.32 line has two attention variants, **both working**: **dense** (the checkpoint's QSA indexer is dropped and
+the full-attention layers attend over the whole context; FlashAttention) and **sparse** (QSA with the indexer kept; the
+full-attention layers attend over the indexer's 2,048-token selection; **experimental**). The dense series is the default
+and the recommended configuration when you want the most measured one; the sparse variant is on par or ahead of it
+on agent-style sessions and long context and a few percent behind on short context
+(see [v0.32/README.md](v0.32/README.md#sparse-attention-qsa)).
 
-**Latest, 2026-10-26: 0.32.0-b70.3 brings the sparse (QSA) variant to near dense speed; it is working and
-experimental.** Same harness and window as the dense numbers: 0.90× dense on one-stream decode (153 tok/s) and on
-prefill up to 32K, 1.00× at 4 concurrent streams (306 tok/s), 0.94× at 8 streams (569 tok/s), and faster than dense
-at 131K prefill (4,916 against 4,641 tok/s); GPU KV 342K against 397K tokens for dense with the optional oneCCL plugin
-(`serve-plugin.env`; the default `serve.env` has 389K). Identical to dense up to 2K tokens; beyond that KL 0.0224
-against dense on a 12K-token document, where dense's own run-to-run floor is about 0.013–0.014. This also fixes the
-b70.2 sparse build, which ran out of GPU memory on 131K prefills under load; the b70.3 build passed a stress stage of
-repeated 131K prefills and 8-stream decode. The dense series is unchanged, and the dense engine args now keep DFlash's
-trailing KV block (`disable_eagle_block_drop`: agent-session replay 232 s against 266 s).
-[Measurements](docs/measurements/v0.32-qsa.md) · [section](v0.32/README.md#sparse-attention-qsa).
+**Latest, 2026-10-26: 0.32.0-b70.4 lists both attention variants as working, on one shared code base.** Same harness and
+trunk code; dense and sparse were booted back to back in the comparison drill and the b70.4 sparse build re-run on the
+replay. On a recorded agent-session replay sparse finishes in about 205 s against about 232 s
+for dense (median decode about 61 against 45–50 tok/s); on short context it is 0.90–0.97× dense (one-stream decode
+0.92×, 8 streams 0.93×, prefill up to 32K 0.89×); on long prefill it is ahead, 1.06× at 131K and 1.31× at 260K; on a
+long-context task set it scores the same as dense up to 8K and about 7 points higher at 128K (80/78 % against 72/72 %;
+retrieval-type tasks only). GPU KV is 344,706 tokens for sparse against 397,309 for dense with the optional oneCCL
+plugin. What changed since b70.3: the sparse build packs its KV cache into 66 small groups instead of 7 large ones (on
+by default; the agent replay's GPU prefix hit rate goes from about 0.37 to about 0.46); both variants carry the
+upstream DFlash fix vllm-project/vllm#54163 (patch 0050), so `disable_eagle_block_drop` is no longer set in either
+engine file; and both engine files run 12 sequences. The dense engine at 12 slots was not re-measured: the dense
+numbers on this page were taken at 8.
+[Measurements](docs/measurements/v0.32-qsa.md) · [sparse section](v0.32/README.md#sparse-attention-qsa) ·
+[release notes](RELEASE-NOTES-b70.4.md).
 
-## Current line: 0.32.0-b70.3 (dense series unchanged from b70.1; sparse near dense speed)
+## Current line: 0.32.0-b70.4 (dense and sparse attention both working)
 
 | | |
 |---|---|
-| release | [`v0.32.0-b70.3`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.3), 2026-10-26: dense patches unchanged from [`v0.32.0-b70.1`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.1) (2026-10-25; the dense configuration validated on 2026-10-24), dense engine args keep DFlash's trailing KV block; sparse brought to 0.90–1.00× dense (it was added in [`v0.32.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.2)) |
-| code | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers: fork tag [`v0.32.0-b70.1`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.1) (`103f2f2eb9`), exported to [`v0.32/patches/vllm/`](v0.32/patches/vllm/) (49 patches) |
+| release | `v0.32.0-b70.4`, 2026-10-26 ([release notes](RELEASE-NOTES-b70.4.md)): both attention variants listed as working; dense gains patch 0050 (upstream #54163) and 12 sequences; sparse gains split KV groups by default (patches 0033–0036). Earlier: [`v0.32.0-b70.3`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.3), [`v0.32.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.2) (sparse added), [`v0.32.0-b70.1`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.32.0-b70.1) (2026-10-25; the dense configuration validated on 2026-10-24) |
+| code | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers: fork tag [`v0.32.0-b70.4-dense`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4-dense), exported to [`v0.32/patches/vllm/`](v0.32/patches/vllm/) (50 patches; 0001–0049 are the b70.1 series, `v0.32.0-b70.1` / `103f2f2eb9`); sparse add-on: fork tag `v0.32.0-b70.4`, [`v0.32/patches/vllm-qsa/`](v0.32/patches/vllm-qsa/) (36 patches) |
 | model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound recommended** (the only build measured on 0.32); AWQ is validated on the 0.30 line only; Minachist's recalibrated experts are a supported variant, measured on the 0.30 perf line ([Models](#models)) |
 | GPUs | 4× Intel Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
-| decoding | DFlash2 speculative decoding, 7 draft tokens (incoai's drafter; the drafter on `TRITON_ATTN`, the target on vLLM's XPU default, FlashAttention); async scheduling; 8 sequences; 4096-token prefill chunks; 262K context; GPU memory fraction 0.89 |
+| decoding | DFlash2 speculative decoding, 7 draft tokens (incoai's drafter; the drafter on `TRITON_ATTN`, the target on vLLM's XPU default, FlashAttention); async scheduling; 12 sequences (b70.4; the numbers below were taken at 8); 4096-token prefill chunks; 262K context; GPU memory fraction 0.89 |
 | KV cache | GPU pool 388,872 tokens with the default `serve.env` (397,309 with the optional oneCCL plugin, `serve-plugin.env`) + **128 GiB in host RAM** (CPU tier, a private pinned pool per rank; no `/dev/shm` requirement) |
 | PLE n-gram table | **INT8, served from NVMe** (8 GiB pinned row cache instead of 48.9 GiB in RAM) |
 | software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 (stock plugin; an optional legacy plugin rebuilt from oneCCL #229 adds ~2 % KV), vllm-xpu-kernels `release/0.1.15.4` + our three PRs ([v0.32/README.md](v0.32/README.md#software)) |
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| status | gates, quality, speed and an agent-session replay measured; no multi-day run yet ([known issues](#known-issues-032)) |
-| sparse variant | QSA add-on (32 patches on top of the dense series), added in 0.32.0-b70.2, near dense speed since 0.32.0-b70.3: working, experimental; 0.90× dense at one stream and prefill, 1.00× at 4 streams, 0.94× at 8, KV 342K against 397K ([below](#sparse-attention-qsa-experimental)) |
+| status | dense and sparse both working (sparse experimental); gates, quality, speed and an agent-session replay measured for both; no multi-day run yet ([known issues](#known-issues-032)) |
+| sparse variant | **working, experimental.** QSA add-on (36 patches on top of the dense series), added in 0.32.0-b70.2, near dense speed since b70.3, split KV groups since b70.4: agent-session replay about 205 s against about 232 s for dense, 0.90–0.97× dense on short context, ahead on long prefill (131K 1.06×, 260K 1.31×) and on 128K tasks; KV 344,706 against 397,309 tokens ([below](#sparse-attention-qsa-experimental)) |
 | stable fallback | [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), multi-day validated ([below](#the-030-line-stable-fallback)) |
 
 ## Numbers (0.32.0-b70.1)
@@ -136,7 +142,7 @@ form from a clean clone.
 1. **Host.** 4× B70 on the xe driver, compute-runtime 26.35.39758.10, oneAPI DPC++ 2026.1.1 for the native builds.
 2. **vLLM and the Python environment** (torch 2.14.0+xpu, oneCCL 2022.1.2 from pip):
    ```bash
-   git clone -b v0.32.0-b70.1 https://github.com/Lumnus/vllm.git vllm-b70-0.32
+   git clone -b v0.32.0-b70.4-dense https://github.com/Lumnus/vllm.git vllm-b70-0.32
    uv venv --python 3.12 /opt/b70/venv
    uv pip install --python /opt/b70/venv/bin/python --index-strategy unsafe-best-match \
        --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/xpu/ \
@@ -166,7 +172,7 @@ repository.
 
 ## What is in the 0.32 series
 
-[`v0.32/patches/vllm/`](v0.32/patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.1` of the fork, 49 commits:
+[`v0.32/patches/vllm/`](v0.32/patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.4-dense` of the fork, 50 commits:
 
 | patches | what |
 |---|---|
@@ -175,6 +181,7 @@ repository.
 | 0017–0034 | our 0.30 layers ported: INT8 PLE from NVMe, per-effort thinking budget, repetition stop, effort alias, dense-QSA indexer skip, MTP draft prefill graphs, uniform-drafts guard, step trace, offload fixes, prompt-logprobs chunks, and their CPU tests |
 | 0035–0037 | our upstream vLLM fixes #63564 and #63566 cherry-picked (replacing our earlier forms) |
 | 0038–0049 | 0.32-specific: copy-path, hyper-connection, PLE-hash and FP8-head changes, the private pinned KV pool (RC1); a few off by default |
+| 0050 | b70.4: backport of vllm-project/vllm#54163 (DFlash/DSpark no longer drop the trailing prefix-cache block, so `disable_eagle_block_drop` is not needed) |
 
 Beside it: [`v0.32/patches/vllm-xpu-kernels-py/`](v0.32/patches/vllm-xpu-kernels-py/) (the Python side of
 vllm-xpu-kernels 0.1.15.4) and [`v0.32/patches/libgdn-index64/`](v0.32/patches/libgdn-index64/). The engine files
@@ -198,12 +205,13 @@ Details and workarounds: [v0.32/README.md](v0.32/README.md#known-issues-032).
 
 ## Sparse attention (QSA, experimental)
 
-Added in release 0.32.0-b70.2 on top of the dense 0.32 line, which is unchanged; brought to near dense speed in
-0.32.0-b70.3. The checkpoint's QSA indexer is
+**Status: working, experimental.** Added in release 0.32.0-b70.2 on top of the dense 0.32 line; brought to near dense speed
+in 0.32.0-b70.3; KV packing fixed in 0.32.0-b70.4 (split groups by default). The checkpoint's QSA indexer is
 kept, and the full-attention layers attend over the indexer's selection (a 2,048-token budget) with Triton kernels
 instead of over the whole context. It boots on 4× B70, passes the gates and the long-context needles, and its output
-matches dense up to the selection budget. Measured on 0.32.0-b70.3 with the same harness, host and window as dense,
-single runs, Intel AutoRound, both variants with the patched oneCCL plugin:
+matches dense up to the selection budget. Micro-benchmark table, measured on 0.32.0-b70.3 with the same harness, host and
+window as dense, single runs, Intel AutoRound, both variants with the patched oneCCL plugin (dense at 8 slots); the b70.4
+build changes KV packing and slot count, not these kernels, and its end-to-end results follow the table:
 
 | | dense (`serve-plugin.env`) | sparse QSA (`qsa-serve.env`) | sparse / dense |
 |---|---|---|---|
@@ -213,18 +221,21 @@ single runs, Intel AutoRound, both variants with the patched oneCCL plugin:
 | prefill 8K / 32K / 131K (tok/s) | 6,305 / 6,114 / 4,641 | 5,659 / 5,475 / 4,916 | 0.90 / 0.90 / 1.06 |
 | GPU KV cache (tokens) | 397,309 | 342,144 | 0.86 |
 
+**b70.4, end to end** (same trunk code for both variants; details in
+[docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md) §0): agent-session replay about 205 s sparse against
+about 232 s dense; short context 0.90–0.97× dense; prefill at 131K 1.06× and at 260K 1.31×; long-context tasks equal to
+dense up to 8K and 80/78 % against 72/72 % at 128K; GPU KV 344,706 tokens (12 slots) against 397,309 for dense.
 The b70.2 sparse build was 0.46–0.81× dense and ran out of GPU memory on 131K prefills under load; b70.3 fixes both.
 Beyond 2K tokens its output drifts from dense (KL 0.0224 on a 12K-token document, against dense's own run-to-run floor
 of about 0.013–0.014); graph-capturing the sparse path degrades output beyond 2K and must not be served. Not measured
-for sparse: a multi-day run, a task-level quality comparison with dense, and the dense engine's
-`disable_eagle_block_drop` and stock oneCCL plugin. Its files: [`v0.32/patches/vllm-qsa/`](v0.32/patches/vllm-qsa/), [`v0.32/engines/qsa-serve.args`](v0.32/engines/qsa-serve.args),
+for sparse: a multi-day run, generation and reasoning quality against dense, and the stock oneCCL plugin. Its files: [`v0.32/patches/vllm-qsa/`](v0.32/patches/vllm-qsa/), [`v0.32/engines/qsa-serve.args`](v0.32/engines/qsa-serve.args),
 [`v0.32/engines/qsa-serve.env`](v0.32/engines/qsa-serve.env), [`v0.32/engines/serve-config-qsa.json`](v0.32/engines/serve-config-qsa.json).
 How to build and run it, its known issues: [v0.32/README.md](v0.32/README.md#sparse-attention-qsa); fidelity and
 what the measurement does not show: [docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md).
 
 ## Work in progress
 
-1. **Sparse attention (QSA) on 0.32: working, experimental, near dense speed** (0.32.0-b70.3, [v0.32/README.md](v0.32/README.md#sparse-attention-qsa)). Open: DFlash's trailing-block drop off and the stock oneCCL plugin on the sparse engine (not run), an in-engine profile (the torch profiler hangs the engine on XPU), why graph-capturing the sparse path breaks fidelity beyond 2K, a multi-day run, and a task-level quality comparison with dense.
+1. **Sparse attention (QSA) on 0.32: working, experimental** (0.32.0-b70.4, [v0.32/README.md](v0.32/README.md#sparse-attention-qsa)). Open: the stock oneCCL plugin on the sparse engine (not run), why graph-capturing the sparse path breaks fidelity beyond 2K, generation and reasoning quality against dense (only retrieval-type tasks and next-token prediction are measured), a multi-day run, and the dense engine at 12 slots (not re-measured).
 2. **A stricter token compare**: the greedy compare above checks for garbage, not equivalence; the gate rows will be
    re-run with the stricter one.
 
@@ -250,7 +261,7 @@ comparison, the KV-tier measurements, its quick start, its patch series, its ope
 
 | line | what | state |
 |---|---|---|
-| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork branch [`b70/v0.32.0`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0), tag `v0.32.0-b70.1`, dense; sparse add-on on [`b70/v0.32.0-qsa-release`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-release)), release `v0.32.0-b70.3`, torch 2.14, vllm-xpu-kernels `release/0.1.15.4` + our three kernel PRs ([v0.32/](v0.32/README.md)) | **the configuration validated on 2026-10-24**; gates, quality and speed measured, no multi-day run yet. Dense and sparse (QSA) attention both working; sparse is experimental, 0.90–1.00× dense speed since b70.3 ([measurements](docs/measurements/v0.32-qsa.md)) |
+| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork tags `v0.32.0-b70.4-dense` and `v0.32.0-b70.4`, dense and sparse, on branches [`b70/v0.32.0-dense-b70.4`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-dense-b70.4) and [`b70/v0.32.0-qsa-b70.4`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-b70.4)), release `v0.32.0-b70.4`, torch 2.14, vllm-xpu-kernels `release/0.1.15.4` + our three kernel PRs ([v0.32/](v0.32/README.md)) | **the configuration validated on 2026-10-24**; gates, quality and speed measured, no multi-day run yet. Dense and sparse (QSA) attention both working; sparse is experimental, 0.90–1.00× dense speed since b70.3 ([measurements](docs/measurements/v0.32-qsa.md)) |
 | **stable fallback `0.30.0-b70.N`** | stock vLLM v0.30.0 + the series in `patches/` (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`; b70.1 was [`b70/v0.30.0`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0)), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 ([docs/line-0.30.md](docs/line-0.30.md)) | the multi-day validated line (Intel and AWQ); the fallback |
 | edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our 0.1.15.4 kernel build | **not recommended**: a progressive decode corruption under concurrency ([known issues](docs/known-issues.md) item 5) |
 
@@ -258,7 +269,7 @@ comparison, the KV-tier measurements, its quick start, its patch series, its ope
 
 | path / repo | what |
 |---|---|
-| [`v0.32/`](v0.32/README.md) | the 0.32 line: `patches/vllm/` (49 commits on v0.32.0, dense), `patches/vllm-qsa/` (the sparse add-on), `patches/vllm-xpu-kernels-py/`, `patches/libgdn-index64/`, `engines/` (`serve.args`, `serve.env`, `serve-plugin.env`; `qsa-serve.args`, `qsa-serve.env`, `serve-config-qsa.json`), `scripts/check-series.sh` (`--qsa` for the add-on), build recipe and numbers |
+| [`v0.32/`](v0.32/README.md) | the 0.32 line: `patches/vllm/` (50 commits on v0.32.0, dense), `patches/vllm-qsa/` (the sparse add-on, 36 commits), `patches/vllm-xpu-kernels-py/`, `patches/libgdn-index64/`, `engines/` (`serve.args`, `serve.env`, `serve-plugin.env`; `qsa-serve.args`, `qsa-serve.env`, `serve-config-qsa.json`), `scripts/check-series.sh` (`--qsa` for the add-on), build recipe and numbers |
 | [`docs/line-0.30.md`](docs/line-0.30.md) | the 0.30.0-b70.2 line: validation, endurance, per-build numbers, KV-tier measurements, quick start, series |
 | `patches/vllm/`, `patches/vllm-tests/` | the 0.30 series 0001–0032, exported from the fork branch (one commit per patch on v0.30.0); CPU tests (never applied to the image) |
 | `patches/vllm-xpu-kernels/` | `b70.3/`: our kernel series on vllm-xpu-kernels 0.1.14.1 (the 64-bit GDN conv-state offset, five upstream fixes, B70-K1); `0001-…` at the top: the b70.1 form of the 64-bit fix ([docs/kernels.md](docs/kernels.md)) |
@@ -268,7 +279,7 @@ comparison, the KV-tier measurements, its quick start, its patch series, its ope
 | `engines/` | 0.30 line: environments and `vllm serve` flags ([engines/README.md](engines/README.md)); the two serve configs are shared with 0.32 |
 | `docs/` | [0.30 line](docs/line-0.30.md) · [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [known issues](docs/known-issues.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) |
 | `tools/` | `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `minachist_repack.py` (Minachist experts into the Intel snapshot), `repro_band.py` (reproduce the offload miss); used by both lines |
-| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.32.0` (tag `v0.32.0-b70.1`, the 0.32 line, dense), `b70/v0.32.0-qsa-release` (the sparse add-on), `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
+| [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.32.0-dense-b70.4` (tag `v0.32.0-b70.4-dense`, the 0.32 line, dense) and `b70/v0.32.0-qsa-b70.4` (tag `v0.32.0-b70.4`, dense plus the sparse add-on); older: `b70/v0.32.0` (tag `v0.32.0-b70.1`), `b70/v0.32.0-qsa-release` (b70.2/b70.3 sparse), `b70/v0.30.0-stable` (the release branch from b70.2 on), `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style). `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` are the two working lines that b70.2 consolidates; they are not updated any more |
 | [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, the 0.30 line's kernels), `b70/v0.1.15` (edge). The 0.32 line builds upstream `release/0.1.15.4` + our PRs instead ([v0.32/README.md](v0.32/README.md#build-and-run), step 3) |
 | [Lumnus/b70-fan-control](https://github.com/Lumnus/b70-fan-control) | sibling repo: a user-space fan table for the B70 |
 
@@ -276,7 +287,7 @@ comparison, the KV-tier measurements, its quick start, its patch series, its ope
 
 ## The code lives in the fork
 
-Changes are made on the fork branch, then exported here: for 0.32 with `git format-patch v0.32.0..v0.32.0-b70.1`,
+Changes are made on the fork branch, then exported here: for 0.32 with `git format-patch v0.32.0..v0.32.0-b70.4-dense`,
 checked by `v0.32/scripts/check-series.sh`; for 0.30 with `scripts/export-series.sh`, checked by
 `scripts/check-series.sh`. Both checks fail on any drift.
 

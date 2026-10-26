@@ -1,0 +1,51 @@
+From bc34fce5ba6747817a849698f87df823335d3004 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 14:30:06 +0000
+Subject: [PATCH 36/36] B70-K2-0002: split KV groups default ON
+ (B70_KV_SPLIT_GROUPS=0 opts out)
+
+The split packed-bucket layout of B70-K2-0001 is now the default on the sparse (QSA) engine:
+66 groups of 905,216 B blocks instead of 7 groups of 10,862,592 B. B70_KV_SPLIT_GROUPS=0
+restores the old packing; B70_KV_PACK_REPEATS=<n> still wins over both. Dense is unaffected
+(the floor is only consulted when a balanced bucket mixes page sizes). Test expectations updated.
+---
+ tests/v1/core/test_b70_kv_pack_repeats.py | 6 +++---
+ vllm/v1/core/kv_cache_utils.py            | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/core/test_b70_kv_pack_repeats.py b/tests/v1/core/test_b70_kv_pack_repeats.py
+index 8707ff7229..8f40e6743b 100644
+--- a/tests/v1/core/test_b70_kv_pack_repeats.py
++++ b/tests/v1/core/test_b70_kv_pack_repeats.py
+@@ -61,10 +61,10 @@ def _stub(monkeypatch):
+     monkeypatch.delenv("B70_KV_SPLIT_GROUPS", raising=False)
+ 
+ 
+-# env -> (groups, bytes per block); unset = upstream packing
++# env -> (groups, bytes per block); unset = split (default on)
+ CASES = [
+-    ({}, 7, 10_862_592),
+-    ({"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592),
++    ({}, 66, 905_216),  # default ON
++    ({"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592),  # opt-out = upstream packing
+     ({"B70_KV_SPLIT_GROUPS": "1"}, 66, 905_216),
+     ({"B70_KV_PACK_REPEATS": "1"}, 66, 905_216),
+     ({"B70_KV_PACK_REPEATS": "3"}, 23, 2_715_648),
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 9d9e1bd067..b4d86477db 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1868,10 +1868,10 @@ def _b70_pack_repeats_floor(floor: int) -> int:
+     (QSA: 12 full-attention + 12 compressed-key layers) in one group. With one
+     group every per-request state group (GDN, PLE, QSA ring, draft SWA) pays a
+     whole ~10.9 MB block; splitting the bucket shrinks the block (~0.9 MB at
+-    n=1). B70_KV_SPLIT_GROUPS=1 means n=1; B70_KV_PACK_REPEATS=<n> sets n
+-    explicitly and wins. Both unset (default) = upstream behaviour."""
++    n=1). Default ON (n=1); B70_KV_SPLIT_GROUPS=0 restores the upstream floor.
++    B70_KV_PACK_REPEATS=<n> sets n explicitly and wins."""
+     raw = os.environ.get("B70_KV_PACK_REPEATS")
+-    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "0") not in ("", "0"):
++    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "1") not in ("0",):
+         raw = "1"
+     if not raw:
+         return floor

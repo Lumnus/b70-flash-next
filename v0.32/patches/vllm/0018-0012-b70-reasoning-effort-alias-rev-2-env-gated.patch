@@ -1,7 +1,7 @@
 From a219ecfec190e01d2b794bfb78f4db58c1522ddb Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Wed, 30 Sep 2026 06:56:32 +0000
-Subject: [PATCH 18/49] 0012-b70-reasoning-effort-alias (rev 2: env-gated)
+Subject: [PATCH 18/50] 0012-b70-reasoning-effort-alias (rev 2: env-gated)
 
 B70-0012: map OpenRouter-style {"reasoning":{"effort":X}} (Hermes extra_body)
 onto reasoning_effort when the request did not set it, so B70-0009 budgets and

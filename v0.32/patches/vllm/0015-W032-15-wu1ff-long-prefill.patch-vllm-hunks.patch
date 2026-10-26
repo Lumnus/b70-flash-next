@@ -1,7 +1,7 @@
 From 3ffc275542fa6f4a081a4f12d526d21d56b83d39 Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 15/49] W032-15: wu1ff long-prefill.patch (vllm/ hunks)
+Subject: [PATCH 15/50] W032-15: wu1ff long-prefill.patch (vllm/ hunks)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

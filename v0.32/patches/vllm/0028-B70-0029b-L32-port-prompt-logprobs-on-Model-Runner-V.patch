@@ -1,7 +1,7 @@
 From eb4ee794de20145c4dce5e2717674e6bedcfeb58 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 08:54:24 +0000
-Subject: [PATCH 28/49] B70-0029b (L32 port): prompt logprobs on Model Runner
+Subject: [PATCH 28/50] B70-0029b (L32 port): prompt logprobs on Model Runner
  V2 in 128-row chunks (B70_PROMPT_LOGPROBS_CHUNK)
 
 Re-done on 0.32 module constant CHUNK_SIZE; same semantics as b70/v0.30.0 4b05162ebb.

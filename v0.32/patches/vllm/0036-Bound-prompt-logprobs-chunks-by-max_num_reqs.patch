@@ -1,7 +1,7 @@
 From 76ccfac00f86c6b47ea0ad4f257b61a907c3d3ab Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 20:18:31 +0000
-Subject: [PATCH 36/49] Bound prompt-logprobs chunks by max_num_reqs
+Subject: [PATCH 36/50] Bound prompt-logprobs chunks by max_num_reqs
 
 Model Runner V2 computes prompt logprobs in chunks of 1024 rows of
 full-vocabulary logits. profile_run's sampler step only materializes one

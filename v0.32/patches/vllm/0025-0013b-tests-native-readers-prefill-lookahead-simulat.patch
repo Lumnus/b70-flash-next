@@ -1,7 +1,7 @@
 From 6682713975db43d6b42b0c1bf4ec8b43c0670935 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 29 Sep 2026 20:24:26 +0000
-Subject: [PATCH 25/49] 0013b tests: native readers, prefill lookahead
+Subject: [PATCH 25/50] 0013b tests: native readers, prefill lookahead
  (simulated + real I/O), bench reader knob
 
 (cherry picked from commit aa42e95d537667559a0d9a36ce0bbaa66404faf0)

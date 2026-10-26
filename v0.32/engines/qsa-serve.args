@@ -1,10 +1,9 @@
-# qsa-serve.args — `vllm serve` flags for the sparse (QSA) variant of 0.32.0-b70.3, one flag and its value per line.
-# Every flag is the same as serve.args (the dense line) except one, named below: sparse QSA changes the model code and the serve config, not the
-# server flags. Run: vllm serve <qsa serve dir> $(these flags). The serve dir is the Intel AutoRound snapshot with
-# engines/serve-config-qsa.json copied over its config.json (the dense config plus the five indexer_* keys; see
-# v0.32/README.md, "Sparse attention (QSA)"). The speculative config does not set
-# disable_eagle_block_drop, which serve.args does: that setting has not been run on the sparse engine (the sparse side caches are also
-# affected by the block drop).
+# qsa-serve.args — `vllm serve` flags for the sparse (QSA) variant of 0.32.0-b70.4, one flag and its value per line.
+# Every flag is the same as serve.args (the dense line): sparse QSA changes the model code and the serve config, not the
+# server flags. This is the configuration served and validated on 2026-10-26 (12 slots, no disable_eagle_block_drop, split
+# KV groups on by default from patch 0036). Run: vllm serve <qsa serve dir> $(these flags). The serve dir is the Intel
+# AutoRound snapshot with engines/serve-config-qsa.json copied over its config.json (the dense config plus the five
+# indexer_* keys; see v0.32/README.md, "Sparse attention (QSA)").
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
@@ -18,12 +17,13 @@
 --max-model-len 262144
 # prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
 --max-num-batched-tokens 4096
-# 8 concurrent sequences
---max-num-seqs 8
+# 12 concurrent sequences. 8 against 12 slots on this engine: every difference within boot-to-boot noise or under 1 %
+# (1, 4, 6, 8 streams, prefill 8K/32K/131K). 16 with a power-of-two capture list lost about 6 % at 4 streams.
+--max-num-seqs 12
 --limit-mm-per-prompt {"image":2,"video":0}
-# FULL graphs for uniform decode, piecewise for the rest. Capture sizes are multiples of 1+K = 8 (K = 7 draft tokens),
-# so a uniform spec-decode step is never padded, plus three prefill sizes.
---compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,256,512,1024]}
+# FULL graphs for uniform decode, piecewise for the rest. Capture sizes are every multiple of 1+K = 8 (K = 7 draft tokens)
+# up to 12 x 8 = 96, so a uniform spec-decode step of 1..12 requests is never padded, plus three prefill sizes.
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,72,80,88,96,256,512,1024]}
 --cudagraph-metrics
 --enable-auto-tool-choice
 --tool-call-parser qwen3_xml

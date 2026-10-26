@@ -1,7 +1,7 @@
 From c987cdc31971d7c2d29409d52e22e2d6b2fc639f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 08:28:24 +0000
-Subject: [PATCH 01/49] W032-00: wu1ff MIT license + pack NOTICE for the
+Subject: [PATCH 01/50] W032-00: wu1ff MIT license + pack NOTICE for the
  vendored 1.0.5 chain
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain.
