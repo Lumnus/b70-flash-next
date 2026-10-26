@@ -175,7 +175,7 @@ vllm-xpu-kernels 0.1.15.4) and [`v0.32/patches/libgdn-index64/`](v0.32/patches/l
 
 ## Known issues (0.32)
 
-1. **No multi-day run yet.** The line has served since 2026-10-24 with planned stops for development windows.
+1. **No multi-day run yet.** Since 2026-10-24 the line has run in serving and development windows; no engine has run for days in one go.
 2. **One hang in development**, before the copy-through-lock fix; it did not recur; cause unknown.
 3. **GPU KV below the 0.30 perf line**: ~2 % with `serve-plugin.env`, ~4 % with the default `serve.env`; not yet
    attributed.
@@ -292,8 +292,9 @@ This work stands on other people's:
 
 1. **wu1ff — [B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller)** (MIT). The Qwen3.8-Flash-Next B70
    pack: the XPU gate, the pinned-host PLE table, the HC down-GEMM K-split, the GDN spec-metadata fusion, the 64-bit
-   GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. Patches 0001–0005 are
-   wu1ff's changes re-derived as source diffs; two binaries are copied from wu1ff's public image by digest. The 0.32
+   GDN conv-state offset fix, the Level Zero peer-residency shim and the dense-QSA serve config. In the 0.30 series, patches
+   0001–0005 are wu1ff's changes re-derived as source diffs, and two binaries are copied from wu1ff's public image by
+   digest. In the 0.32 series, patches 0001–0016 are his. The 0.32
    line is built on wu1ff's 1.0.5 chain for vLLM 0.32 (DFlash2 path, C1 verify/target graphs, the astra500 MoE,
    hyper-connection and prefill kernels), taken unchanged with his authorship and MIT notice. Thank you.
 2. **Intel** — the [`Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
