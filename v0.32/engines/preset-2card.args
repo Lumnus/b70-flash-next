@@ -1,5 +1,5 @@
 # preset-2card.args — `vllm serve` flags of the 2-card preset, 0.32.0-b70.4 (tensor parallel 2 + expert parallel, DFlash2 K=7 with the
-# draft at TP2, 4 slots, 16 GiB host-RAM KV tier, 262,144-token context, sparse attention by default). It uses two cards so the other
+# draft at TP2, 4 slots, 64 GiB host-RAM KV tier, 262,144-token context, sparse attention by default). It uses two cards so the other
 # pair stays free for any other model. One flag and its value per line. Pair with preset-2card.env (cards, hot/cold expert offload) and a
 # serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../engines/serve-config-intel-autoround.json (dense);
 # every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration measured on 2026-10-26 (fork tag
@@ -34,10 +34,11 @@
 --override-generation-config {"temperature": 0.7}
 # when the per-effort thinking budget (B70_THINKING_BUDGET) runs out, close thinking with a short transition
 --reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
-# CPU KV tier: 16 GiB in host RAM = 8 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm). Small on
-# purpose: it leaves host RAM for the model on the other pair (155 GiB MemAvailable with this preset up on our 256 GB host).
-# PARAMETER KV offload size (GiB, host RAM; pinned, split evenly over the ranks): 16 on 2 cards (v0.32/README.md Parameters)
---kv-offloading-size 16
+# CPU KV tier: 64 GiB in host RAM = 32 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm). About half
+# the free host RAM goes to this engine; the rest stays for the model on the other pair (measured: 154.9 GiB MemAvailable at a 16 GiB
+# tier, so about 107 GiB expected at 64 on our 256 GB host). Use 16 for a dev engine or with less RAM.
+# PARAMETER KV offload size (GiB, host RAM; pinned, split evenly over the ranks): 64 on 2 cards (v0.32/README.md Parameters)
+--kv-offloading-size 64
 --kv-offloading-backend native
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
 # 2 cards (draft_tensor_parallel_size 2; its KV page fits through patch 0038 of the sparse series); async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on

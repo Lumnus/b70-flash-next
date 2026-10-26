@@ -22,7 +22,7 @@ One release (no intermediate b70.4 builds were published).
 - **Two presets.** `v0.32/engines/preset-4card.{args,env}` (TP4, sparse, 12 slots, 128 GiB KV tier): 156.4 tok/s at one
   stream, 287.4 at 4 concurrent, 580.9 at 8 streams, GPU KV 344,021. `v0.32/engines/preset-2card.{args,env}` (TP2 on two
   cards, the other pair free for any other model; sparse, 4 slots, 262,144 context, hot/cold with 145 cold experts per layer per
-  rank, 16 GiB KV tier): 58.2 / 69.4 / 109.2 tok/s, GPU KV 273,169, 154.9 GiB host RAM left free. They replace `serve.args`,
+  rank, 64 GiB KV tier): 58.2 / 69.4 / 109.2 tok/s and GPU KV 273,169, measured at a 16 GiB tier (154.9 GiB host RAM left free; about 107 GiB expected at 64). They replace `serve.args`,
   `serve.env`, `serve-plugin.env`, `qsa-serve.args` and `qsa-serve.env`. Attention, cards, drafter, expert offload, KV offload
   size, slots, GPU memory, oneCCL plugin and two opt-outs are tabulated with their defaults and what each was measured at in
   [v0.32/README.md](v0.32/README.md#parameters).

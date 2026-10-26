@@ -16,8 +16,8 @@ run it:
    KV tier. 156.4 tok/s at one stream, 287 at 4 concurrent, 581 at 8 streams, 344K GPU KV tokens.
 2. **2-card** ([`preset-2card`](v0.32/engines/preset-2card.args)): two cards, so the other pair stays free for any other
    model. Sparse attention, 4 slots, the full 262K context, hot/cold expert offload (145 of 256 experts per layer per rank in
-   host RAM), 16 GiB KV tier. 58.2 tok/s at one stream, 69 at 4 concurrent, 273K GPU KV tokens, 155 GiB of host RAM left free on our
-   256 GB host.
+   host RAM), 64 GiB KV tier. 58.2 tok/s at one stream, 69 at 4 concurrent, 273K GPU KV tokens (measured at a 16 GiB tier, which left
+   155 GiB of host RAM free on our 256 GB host; about 107 GiB expected at 64).
 
 Attention (sparse or dense), cards, drafter, expert offload, KV offload size, slots and GPU memory are parameters of the same
 engine, each with its default and what it was measured at: [Parameters](v0.32/README.md#parameters). Both attention values
@@ -32,7 +32,7 @@ work; sparse is the default. [Release notes](RELEASE-NOTES-b70.4.md) · [measure
 | model | Qwen3.8-Flash-Next W4A16, **Intel AutoRound recommended** (the only build measured on 0.32); AWQ is validated on the 0.30 line only; Minachist's recalibrated experts are a supported variant, measured on the 0.30 perf line ([Models](#models)) |
 | GPUs | 4× Intel Arc Pro B70 (32 GB each): all four with the 4-card preset (tensor parallel 4 + expert parallel), two with the 2-card preset (tensor parallel 2) |
 | decoding | DFlash2 speculative decoding, 7 draft tokens (incoai's drafter, on `TRITON_ATTN`); async scheduling; 4096-token prefill chunks; 262K context; GPU memory fraction 0.89 |
-| KV cache | 4-card preset: 344,021 GPU tokens + 128 GiB in host RAM. 2-card preset: 273,169 GPU tokens + 16 GiB in host RAM. The host tier is a private pinned pool per rank; no `/dev/shm` requirement |
+| KV cache | 4-card preset: 344,021 GPU tokens + 128 GiB in host RAM. 2-card preset: 273,169 GPU tokens + 64 GiB in host RAM. The host tier is a private pinned pool per rank; no `/dev/shm` requirement |
 | PLE n-gram table | **INT8, served from NVMe** (a pinned row cache of 8 GiB at 4 cards, 4 GiB at 2, instead of 48.9 GiB in RAM) |
 | software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 (both presets use the legacy plugin rebuilt from oneCCL #229, +~2 % KV; the stock plugin is a parameter), vllm-xpu-kernels 0.1.16.2 + our #660/#662, with #658 merged upstream (main only) and carried by our `libgdn_index64` ([v0.32/README.md](v0.32/README.md#software)) |
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
@@ -89,7 +89,7 @@ All builds serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE 
 ## Host RAM and the KV tier (0.32)
 
 Agent sessions resend long, growing prompts. The CPU tier keeps their KV cache in pinned host RAM and loads it back
-instead of recomputing it: 128 GiB in the 4-card preset (32 GiB per rank), 16 GiB in the 2-card preset, each a private
+instead of recomputing it: 128 GiB in the 4-card preset (32 GiB per rank), 64 GiB in the 2-card preset (32 GiB per rank), each a private
 pinned pool per rank (`B70_OFFLOAD_PRIVATE_PINNED=1`), copied to the GPU directly, with no `/dev/shm` requirement. Pinned
 memory does not count against a container memory limit: watch the host's MemAvailable, and lower `--kv-offloading-size` with
 less RAM. What each preset takes and leaves free: [v0.32/README.md](v0.32/README.md#host-ram). The deeper measurement of the same mechanism (prompt-token reuse under real

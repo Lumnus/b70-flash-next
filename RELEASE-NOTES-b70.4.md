@@ -7,10 +7,10 @@
 | cards | 4 (TP 4) | 2 (TP 2); the other pair stays free for any other model |
 | attention, slots, context | sparse, 12, 262,144 | sparse, 4, 262,144 |
 | expert offload | off | hot/cold, 145 of 256 experts per layer per rank in host RAM |
-| KV tier (host RAM) | 128 GiB | 16 GiB |
+| KV tier (host RAM) | 128 GiB | 64 GiB (the numbers below were measured at 16 GiB) |
 | decode 1 / 4 / 8 streams (tok/s) | 156.4 / 287.4 / 580.9 | 58.2 / 69.4 / 109.2 |
 | GPU KV cache (tokens) | 344,021 | 273,169 |
-| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB |
+| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB at a 16 GiB tier; about 107 GiB expected at 64 |
 
 Attention (sparse default, dense), cards, drafter, expert offload, KV offload size, slots and GPU memory are parameters of the
 same engine, each with its default and what it was measured at: `v0.32/README.md` §Parameters.

@@ -13,7 +13,7 @@ two kernel PRs + our `libgdn_index64.so` ([Software](#software)). On top of them
    performance configuration. Tensor parallel 4, sparse attention, 12 slots, 128 GiB KV tier.
 2. **2-card preset** ([`engines/preset-2card.args`](engines/preset-2card.args) / [`.env`](engines/preset-2card.env)): tensor
    parallel 2 on two cards, so the other pair is free for any other model. Sparse attention, 4 slots, the full 262,144-token
-   context, hot/cold expert offload, 16 GiB KV tier.
+   context, hot/cold expert offload, 64 GiB KV tier.
 
 Everything else is a parameter of the same engine ([Parameters](#parameters)), dense attention included.
 
@@ -40,13 +40,13 @@ thinking off), with the harness of the earlier 12-slot measurements on the 0.1.1
 | cards, tensor parallel | 4, TP 4 (draft TP 4) | 2, TP 2 (draft TP 2); measured on cards 0 and 3 |
 | attention, slots, context | sparse, 12, 262,144 | sparse, 4, 262,144 |
 | expert offload | off (all experts in VRAM) | hot/cold, 145 of 256 experts per layer per rank in host RAM |
-| KV tier (host RAM) | 128 GiB | 16 GiB |
+| KV tier (host RAM) | 128 GiB | 64 GiB (rows below measured at 16 GiB) |
 | GPU KV cache (tokens) | 344,021 (344,145 on a second boot) | 273,169 |
 | decode, 1 stream (tok/s; ms per step) | 156.4 (23.9) | 58.2 (61.5) |
 | decode, 4 concurrent (total tok/s; ms per step) | 287.4 (46.4) | 69.4 (187.9) |
 | decode, 8 streams (total tok/s, two runs) | 580.9 / 577.8 | 109.2 / 119.7 |
 | prefill 32K (tok/s) | not re-measured (5,475 on the b70.3 build, 8 slots) | 2,768 (2,753 / 2,769 / 2,782) |
-| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB |
+| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB at a 16 GiB tier; about 107 GiB expected at 64 |
 | gates | burst 0/150; token compare (det2) against the 0.1.15.4 build: PASS (c=1 3/8 identical + 5 near-tie; c=8 0/8 + 8 near-tie) | completion correct, journal clean; burst 0/150, structured output, mix probe and a 128K needle passed on the pre-release environment (below) |
 
 How to read it:
@@ -76,7 +76,7 @@ each was measured at.
 | **cards** | `--tensor-parallel-size`, `draft_tensor_parallel_size`, `ZE_AFFINITY_MASK` | 4 | 2 (the 2-card preset) | both: [Presets](#presets) |
 | **drafter** | `--speculative-config` | DFlash2, K = 7 (incoai's drafter), both presets | MTP (`"method":"mtp"`, k = 3; the MTP draft-prefill patch 0021 and the uniform-drafts guard 0026 are in the series) | DFlash K = 7: every 0.32 number. MTP: only on the 0.30.0-b70.2 line (107.5 tok/s at one stream, 16 slots); not measured on 0.32 |
 | **expert offload (hot/cold)** | `B70_MOE_HOTCOLD=1`, `B70_MOE_COLD_EXPERTS=N` (cold experts per layer per rank, of 128 at TP4 and 256 at TP2) and the keys of the hot/cold block in `preset-2card.env` | off (4-card) | on with N = 145 (2-card) | off: the 4-card preset. On, N = 145 at TP2: the 2-card preset. At TP4 (N = 16, before the capture fix, prefetch off): booted at KV 471,821 tokens; no speed or fidelity number |
-| **KV offload size** | `--kv-offloading-size` (GiB of host RAM, split evenly over the ranks; keep it a power of two times the card count) | 128 (4-card) | 16 (2-card); lower it with less host RAM | 128: the 4-card preset and every replay number. 16: the 2-card preset. 48 at TP2 (pre-release environment): KV 274,069, host MemAvailable ~119 GiB, so 16 frees ~35 GiB more |
+| **KV offload size** | `--kv-offloading-size` (GiB of host RAM, split evenly over the ranks; keep it a power of two times the card count) | 128 (4-card) | 64 (2-card); 16 for a dev engine or with less host RAM | 128: the 4-card preset and every replay number. 16: the 2-card measurements. 48 at TP2 (pre-release environment): KV 274,069, host MemAvailable ~119 GiB, so 16 frees ~35 GiB more |
 | **slots** | `--max-num-seqs` and the capture list (every multiple of 8 up to slots × 8, then 256 / 512 / 1024) | 12 (4-card) | 8 (within noise of 12 on the sparse engine); 4 (2-card); 16 was dropped (one preemption under 12-session load, −6 % at 4 streams) | sparse at 4 cards, 0.1.15.4 environment: 8 against 12 slots 280 against 287 tok/s at 4 streams, replay 204.5 against 206.6 s. 4: the 2-card preset |
 | **GPU memory** | `--gpu-memory-utilization` | 0.89, both presets | lower for more headroom; 0.88 leaves too little KV for one 262,144-token request at TP4 | 0.89: every 0.32 number; the highest value vLLM's start-up check accepts on compute-runtime 26.35 |
 | **oneCCL plugin** | `CCL_PLUGIN`, the five `CCL_SYCL_*_TMP_BUF` keys and the `expandable_segments` part of `PYTORCH_ALLOC_CONF` | patched legacy plugin (build step 6; +~2 % KV), both presets | the stock plugin: remove those three groups of lines; never enable expandable segments with the shipped plugin | dense, 8 slots, b70.1 build: KV 388,872 (stock) against 397,309 (patched), speed within noise. Stock plugin with sparse: not run |
@@ -264,7 +264,7 @@ container would need `/dev/shm` ≥ 140 GiB for a 128 GiB tier.
 The 4-card preset takes ~164 GiB after start on our 256 GB host: the CPU KV tier is 128 GiB of pinned memory (32 GiB per
 rank, which is why `AllowUnrestrictedSize=1` is needed), the PLE row cache 8 GiB, and the rest is the four workers.
 MemAvailable was 35–39 GiB with ~20 GiB of other work on the host (b70.1) and 60.4 GiB with the released preset up
-(2026-10-26). The 2-card preset leaves 154.9 GiB available: it holds a 16 GiB tier, a 4 GiB PLE row cache and the cold
+(2026-10-26). The 2-card preset left 154.9 GiB available with a 16 GiB tier (about 107 GiB expected with the shipped 64 GiB tier): it holds the tier, a 4 GiB PLE row cache and the cold
 experts (145 per layer per rank, pinned). Pinned memory does not count against a container memory limit, so watch the
 host's MemAvailable, not the container's. With less RAM, lower `--kv-offloading-size` (keep it a power of two times the
 card count) or move the PLE table into RAM only if you have the 49 GiB it then needs.
