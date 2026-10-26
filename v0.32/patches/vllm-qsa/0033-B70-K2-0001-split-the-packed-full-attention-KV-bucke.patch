@@ -1,7 +1,7 @@
 From 8a21a4b3053b5decc2827861262fd55ad596e445 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 09:42:34 +0000
-Subject: [PATCH 33/36] B70-K2-0001: split the packed full-attention KV bucket
+Subject: [PATCH 33/38] B70-K2-0001: split the packed full-attention KV bucket
  (QSA), env-gated
 
 On the sparse (QSA) engine the trunk packs all 12 full-attention layers and

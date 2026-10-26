@@ -1,7 +1,7 @@
 From 1dafc7527671e956934683919b978d58703f072d Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 00:02:39 +0000
-Subject: [PATCH 26/36] B70-QSA-E01: one-time log line naming the sparse
+Subject: [PATCH 26/38] B70-QSA-E01: one-time log line naming the sparse
  attention implementation
 
 attn_impl() is read per call; the boot log now proves which kernel (splitk|attn2) the engine ran.

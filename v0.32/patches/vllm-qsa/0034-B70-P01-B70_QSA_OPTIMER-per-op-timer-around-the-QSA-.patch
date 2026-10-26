@@ -1,7 +1,7 @@
 From 8e852701d856a683cba274893bac9f356232f755 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 09:42:34 +0000
-Subject: [PATCH 34/36] B70-P01: B70_QSA_OPTIMER per-op timer around the QSA
+Subject: [PATCH 34/38] B70-P01: B70_QSA_OPTIMER per-op timer around the QSA
  ops (default off)
 
 Host perf_counter_ns + pooled XPU events around run_qsa, indexer, prepare,

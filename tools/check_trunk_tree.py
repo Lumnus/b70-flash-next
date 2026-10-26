@@ -14,6 +14,7 @@ ap.add_argument("--base", required=True)
 ap.add_argument("--trunk", required=True)
 ap.add_argument("--hotcold-count", type=int, default=12)
 ap.add_argument("--hotcold-base", default=None)
+ap.add_argument("--hotcold-extra", action="append", default=[], help="a hot/cold commit outside the range (its own diff against its parent counts as hot/cold); repeatable")
 ap.add_argument("--hotcold-tip", default=None, help="last hot/cold commit when it is not the trunk tip (default: the trunk)")
 ap.add_argument("--rules", required=True)
 ap.add_argument("--series", action="append", required=True, help="patch directory, applied in the order given")
@@ -114,6 +115,18 @@ Bb = scrubbed_tree(hb)
 Bt = B if tip == a.trunk else scrubbed_tree(tip)
 dAB = hunks(A, B)          # what separates the series from scrubbed trunk
 dHC = hunks(Bb, Bt)        # what the hot/cold commits change (scrubbed)
+if a.hotcold_extra:
+    # the extra commits' own diffs are applied on top of the hot/cold tip tree, so a hot/cold file that a later
+    # commit changed again is compared in its final form (not as two separate hunk sets)
+    idx = tempfile.mktemp(); env = {"GIT_INDEX_FILE": idx}
+    git("read-tree", f"{tip}^{{tree}}", env=env)
+    for x in a.hotcold_extra:
+        d = git("diff", "--binary", f"{x}~1", x, raw=True)
+        r = subprocess.run(["git", "apply", "--cached", "-"], input=d, capture_output=True,
+                           env=dict(os.environ, GIT_DIR=GD, GIT_INDEX_FILE=idx))
+        if r.returncode: sys.exit(f"--hotcold-extra {x} does not apply on the hot/cold tip: {r.stderr.decode().strip()}")
+    Bt = scrubbed_tree(git("write-tree", env=env).strip()); os.unlink(idx)
+    dHC = hunks(Bb, Bt)
 print(f"series: {nfiles} patches -> tree A {A[:12]}")
 print(f"trunk {git('rev-parse', a.trunk).strip()[:12]} scrubbed -> tree B {B[:12]};  hot/cold base {git('rev-parse', hb).strip()[:12]} -> {sum(dHC.values())} hunks in {len({k[0] for k in dHC})} files")
 

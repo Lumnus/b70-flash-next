@@ -1,7 +1,7 @@
 From bc34fce5ba6747817a849698f87df823335d3004 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 14:30:06 +0000
-Subject: [PATCH 36/36] B70-K2-0002: split KV groups default ON
+Subject: [PATCH 36/38] B70-K2-0002: split KV groups default ON
  (B70_KV_SPLIT_GROUPS=0 opts out)
 
 The split packed-bucket layout of B70-K2-0001 is now the default on the sparse (QSA) engine:

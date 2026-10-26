@@ -1,7 +1,7 @@
 From 6636bbbffbe95508f3efab2bbeae73528ba6f747 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:12:55 +0000
-Subject: [PATCH 29/36] B70-QSA-D03: C2 scorer launch defaults on XPU (bf16
+Subject: [PATCH 29/38] B70-QSA-D03: C2 scorer launch defaults on XPU (bf16
  indexer)
 
 From the Triton scorer sweep (candidate tune.json, Triton 3.8.0+xpu, B70):

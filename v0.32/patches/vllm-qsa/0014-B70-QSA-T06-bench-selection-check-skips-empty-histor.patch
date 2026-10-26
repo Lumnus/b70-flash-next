@@ -1,7 +1,7 @@
 From 21f1848f43997d5a960b941a226b6e03ee5014a3 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:40:55 +0000
-Subject: [PATCH 14/36] B70-QSA-T06: bench selection check skips empty-history
+Subject: [PATCH 14/38] B70-QSA-T06: bench selection check skips empty-history
  rows (first prefill rows select nothing)
 
 The check took max() over an empty tensor at prefill row 0 and aborted the run. A row with no visible

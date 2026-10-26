@@ -2,7 +2,7 @@
 # check-trunk-tree.sh — tree-level check that the kit's series equal a trunk, except the hot/cold commits.
 #
 #   tools/check-trunk-tree.sh --trunk-ref REF --rules FILE [--trunk-url URL] [--git-dir DIR] [--hotcold-count N]
-#                             [--hotcold-base REF] [--hotcold-tip REF] [--no-qsa]
+#                             [--hotcold-base REF] [--hotcold-tip REF] [--hotcold-extra REF]... [--no-qsa]
 #
 # 1. tree A = vanilla vLLM v0.32.0 + v0.32/patches/vllm (dense) + v0.32/patches/vllm-qsa (sparse), applied in order
 # 2. tree B = the trunk at REF, with the scrub rules applied to file contents (text transforms, not history)
@@ -18,6 +18,7 @@
 #                working branch into the published series. They name the working host's paths, so they are not in
 #                this repository: the maintainer who holds the trunk keeps them.
 #   --git-dir    a vLLM clone (default ./vllm-src-032, cloned on demand from https://github.com/Lumnus/vllm.git)
+#   --hotcold-extra  a single hot/cold commit that sits outside the range (e.g. one landed after later series commits); its own diff counts as hot/cold
 #   --no-qsa     check the dense series only (trunk then has to be dense-only too)
 #
 # Nothing is checked out and no branch is moved: the trees are built with a temporary index. New objects (scrubbed
@@ -26,7 +27,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
 REPO_URL=https://github.com/Lumnus/vllm.git
-gd="$PWD/vllm-src-032"; tref=""; turl=""; rules=""; n=12; hb=""; ht=""; qsa=1
+gd="$PWD/vllm-src-032"; tref=""; turl=""; rules=""; n=12; hb=""; ht=""; qsa=1; hx=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --trunk-ref) tref=$2; shift 2 ;;
@@ -36,6 +37,7 @@ while [ $# -gt 0 ]; do
     --hotcold-count) n=$2; shift 2 ;;
     --hotcold-tip) ht=$2; shift 2 ;;
     --hotcold-base) hb=$2; shift 2 ;;
+    --hotcold-extra) hx+=(--hotcold-extra "$2"); shift 2 ;;
     --no-qsa) qsa=0; shift ;;
     -h|--help) sed -n 2,25p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -56,4 +58,5 @@ series=(--series "$here/v0.32/patches/vllm")
 args=(--git-dir "$gd" --base "$BASE" --trunk "$tref" --hotcold-count "$n" --rules "$rules" "${series[@]}")
 [ -n "$hb" ] && args+=(--hotcold-base "$hb")
 [ -n "$ht" ] && args+=(--hotcold-tip "$ht")
+[ ${#hx[@]} -gt 0 ] && args+=("${hx[@]}")
 exec python3 -I "$here/tools/check_trunk_tree.py" "${args[@]}"

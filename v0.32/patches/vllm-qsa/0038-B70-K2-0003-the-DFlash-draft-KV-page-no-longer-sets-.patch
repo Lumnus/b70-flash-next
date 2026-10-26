@@ -1,0 +1,359 @@
+From 6950e3cf370b506762a22efc471442db9559fba1 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 17:25:24 +0000
+Subject: [PATCH 38/38] B70-K2-0003: the DFlash draft KV page no longer sets
+ the block alone (TP2)
+
+At TP2 the DFlash2 draft holds 8/2 = 4 KV heads per rank, so one draft
+sliding-window layer's page (3,407,872 B at block 1664) is 2x the attention
+page. With one repeat per group (B70-K2-0002) that page set every KV block,
+and every other group padded it to ~50 %: 3.4 MB blocks, 1,170 MiB of state
+per running request, KV 77,885 tokens at 3.34 GiB/rank (measured at TP2).
+
+When a sliding-window bucket's groups are wider than every other bucket's
+group, split that bucket like a state bucket (as many layers per group as fit
+the block, at least one) and, as upstream #60996 does, choose the repeats
+per group that minimise the pool bytes a max-length request draws. At TP2
+this gives two QSA layers (+ their compressed caches) per group and two GDN
+layers per group, one draft layer per group: 36 groups, 3,620,864 B per
+block, 663 MiB of state per running request (CPU model: ~221K tokens at the
+3.32 GiB/rank W5 measured, vs 78K). TP4 is unchanged: its draft page
+(851,968 B) is narrower than a QSA group (905,216 B), so nothing engages.
+Token block sizes are untouched (no hash or kernel block change).
+B70_KV_DRAFT_PAGE_FIT=0 opts out. Log line "B70-K2-0003" when it engages.
+
+CPU: tests/v1/core/test_b70_kv_pack_repeats.py extended with per-rank TP2
+specs (79 passed; the 11 new TP2 checks fail on the previous tree);
+test_kv_cache_utils.py + test_contiguous_kv_packing.py: same 4 failures
+before and after (pre-existing).
+---
+ tests/v1/core/test_b70_kv_pack_repeats.py |  92 +++++++++++-
+ vllm/v1/core/kv_cache_utils.py            | 175 +++++++++++++++-------
+ 2 files changed, 208 insertions(+), 59 deletions(-)
+
+diff --git a/tests/v1/core/test_b70_kv_pack_repeats.py b/tests/v1/core/test_b70_kv_pack_repeats.py
+index 8f40e6743b..2d0ecc9271 100644
+--- a/tests/v1/core/test_b70_kv_pack_repeats.py
++++ b/tests/v1/core/test_b70_kv_pack_repeats.py
+@@ -3,6 +3,9 @@
+ # B70_KV_SPLIT_GROUPS / B70_KV_PACK_REPEATS. CPU only: real-shaped Flash-Next
+ # QSA specs, shuffled insertion orders; checks partition, per-layer pairing of
+ # compressed-key caches with their own attention layer, and block sizes.
++# B70-K2-0003: the same specs per TP rank at TP2 (block 1664, GDN state 2x, the
++# DFlash draft 4 KV heads per rank); the draft page no longer sets the block,
++# and TP4 is unchanged.
+ import random
+ import re
+ import types
+@@ -22,21 +25,24 @@ BS = 832
+ K = 7
+ 
+ 
+-def _items():
+-    gdn = C.gated_delta_net_state_shape(4, 16, 48, 128, 128, 4, K)
++def _items(tp=4):
++    # per-rank specs; TP4 is the live ks12 layout (block 832), TP2 the W4/W5 twin (block 1664)
++    bs = {4: BS, 2: 2 * BS}[tp]
++    pad = bs * max(1, 2 // tp) * 256 * 4
++    gdn = C.gated_delta_net_state_shape(tp, 16, 48, 128, 128, 4, K)
+     ple = C.short_conv_state_shape(1, 10240, 10, K)
+     items = []
+     for L in range(48):
+         p = f"language_model.model.layers.{L}"
+         if L % 4 == 3:
+-            items.append((f"{p}.self_attn.attn", FullAttentionSpec(block_size=BS, num_kv_heads=1, head_size=256, head_size_v=256, dtype=BF)))
+-            items.append((f"{p}.self_attn.indexer.compressed_key_cache", MLAAttentionSpec(block_size=BS, num_kv_heads=1, head_size=128, dtype=BF, tokens_per_state=4)))
++            items.append((f"{p}.self_attn.attn", FullAttentionSpec(block_size=bs, num_kv_heads=max(1, 2 // tp), head_size=256, head_size_v=256, dtype=BF)))
++            items.append((f"{p}.self_attn.indexer.compressed_key_cache", MLAAttentionSpec(block_size=bs, num_kv_heads=1, head_size=128, dtype=BF, tokens_per_state=4)))
+             items.append((f"{p}.self_attn.indexer.raw_key_cache", CircularBufferSpec(block_size=16, num_kv_heads=1, head_size=128, head_size_v=0, dtype=BF)))
+         else:
+-            items.append((f"{p}.linear_attn", MambaSpec(shapes=tuple(gdn), dtypes=(BF, torch.float32), block_size=BS, page_size_padded=851968, mamba_cache_mode="align", num_speculative_blocks=K)))
+-    items.append(("language_model.model.layers.2.ple.short_conv", MambaSpec(shapes=tuple(ple), dtypes=(BF,), block_size=BS, page_size_padded=851968, mamba_cache_mode="align", num_speculative_blocks=K, tp_replicated=True)))
++            items.append((f"{p}.linear_attn", MambaSpec(shapes=tuple(gdn), dtypes=(BF, torch.float32), block_size=bs, page_size_padded=pad, mamba_cache_mode="align", num_speculative_blocks=K)))
++    items.append(("language_model.model.layers.2.ple.short_conv", MambaSpec(shapes=tuple(ple), dtypes=(BF,), block_size=bs, page_size_padded=pad, mamba_cache_mode="align", num_speculative_blocks=K, tp_replicated=True)))
+     for i in range(5):
+-        items.append((f"drafter.model.layers.{i}.self_attn.attn", SlidingWindowSpec(block_size=BS, num_kv_heads=2, head_size=128, dtype=BF, sliding_window=2048)))
++        items.append((f"drafter.model.layers.{i}.self_attn.attn", SlidingWindowSpec(block_size=bs, num_kv_heads=8 // tp, head_size=128, dtype=BF, sliding_window=2048)))
+     return items
+ 
+ 
+@@ -59,6 +65,7 @@ def _stub(monkeypatch):
+     monkeypatch.setattr(U, "_uses_trailing_mtp_layers", lambda *a, **k: False)
+     monkeypatch.delenv("B70_KV_PACK_REPEATS", raising=False)
+     monkeypatch.delenv("B70_KV_SPLIT_GROUPS", raising=False)
++    monkeypatch.delenv("B70_KV_DRAFT_PAGE_FIT", raising=False)
+ 
+ 
+ # env -> (groups, bytes per block); unset = split (default on)
+@@ -89,3 +96,74 @@ def test_pack_repeats(monkeypatch, seed, env, groups, bpb):
+     assert sorted(n for x in g for n in x.layer_names) == sorted(sp)
+     assert len(g) == groups
+     assert U._get_kv_cache_bytes_per_block(g, KVCacheLayout.BLNHC) == bpb
++
++
++# B70-K2-0003, (tp, env) -> (groups, bytes per block, draft layers per group)
++CASES_TP = [
++    (4, {}, 66, 905_216, 1),  # TP4: the draft page is narrower than a QSA group, no-op
++    (4, {"B70_KV_DRAFT_PAGE_FIT": "0"}, 66, 905_216, 1),
++    (4, {"B70_KV_PACK_REPEATS": "3"}, 23, 2_715_648, 3),
++    (4, {"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592, 5),
++    (2, {}, 36, 3_620_864, 1),  # TP2: two QSA layers per group fill the block the draft page forces
++    (2, {"B70_KV_DRAFT_PAGE_FIT": "0"}, 66, 3_407_872, 1),  # opt-out: the draft page pads every block
++    (2, {"B70_KV_PACK_REPEATS": "2"}, 36, 3_620_864, 1),
++    (2, {"B70_KV_PACK_REPEATS": "2", "B70_KV_DRAFT_PAGE_FIT": "0"}, 34, 6_815_744, 2),
++    (2, {"B70_KV_SPLIT_GROUPS": "0"}, 7, 21_725_184, 5),
++]
++
++
++def _groups(tp, seed):
++    it = _items(tp)
++    random.seed(seed)
++    random.shuffle(it)
++    sp = dict(it)
++    return sp, U._get_packed_kv_cache_groups(_cfg(), sp)
++
++
++@pytest.mark.parametrize("seed", range(5))
++@pytest.mark.parametrize("tp,env,groups,bpb,draft", CASES_TP)
++def test_pack_per_tp(monkeypatch, seed, tp, env, groups, bpb, draft):
++    for k, v in env.items():
++        monkeypatch.setenv(k, v)
++    sp, g = _groups(tp, seed)
++    for x in g:
++        cmp_ = [_idx(n) for n in x.layer_names if n.endswith("compressed_key_cache")]
++        att = [_idx(n) for n in x.layer_names if n.endswith("self_attn.attn") and not n.startswith("drafter")]
++        assert sorted(cmp_) == sorted(att), x.layer_names
++        drafts = [n for n in x.layer_names if n.startswith("drafter")]
++        assert not drafts or (len(drafts) <= draft and len(drafts) == len(x.layer_names)), x.layer_names
++    assert sorted(n for x in g for n in x.layer_names) == sorted(sp)
++    assert len(g) == groups
++    assert U._get_kv_cache_bytes_per_block(g, KVCacheLayout.BLNHC) == bpb
++
++
++@pytest.mark.parametrize("seed", range(3))
++def test_tp4_identical_with_and_without_draft_fit(monkeypatch, seed):
++    _, on = _groups(4, seed)
++    monkeypatch.setenv("B70_KV_DRAFT_PAGE_FIT", "0")
++    _, off = _groups(4, seed)
++    assert [(x.layer_names, x.kv_cache_spec) for x in on] == [(x.layer_names, x.kv_cache_spec) for x in off]
++
++
++def test_tp2_fit_halves_the_state_per_running_request():
++    # blocks a running request holds at decode: 2+K per Mamba group, 1 per ring group,
++    # the draft window per SWA group (K2 runtime_fixed); bytes = blocks x bytes per block
++    def held(g):
++        n = 0
++        for x in g:
++            f = getattr(x.kv_cache_spec, "first_spec", x.kv_cache_spec)
++            if isinstance(f, MambaSpec):
++                n += 2 + K
++            elif isinstance(f, SlidingWindowSpec):
++                n += -(-(2048 - 1 + 8) // f.block_size) + 1
++            elif type(f) is CircularBufferSpec:
++                n += 1
++        return n * U._get_kv_cache_bytes_per_block(g, KVCacheLayout.BLNHC)
++    _, fit = _groups(2, 0)
++    import os
++    os.environ["B70_KV_DRAFT_PAGE_FIT"] = "0"
++    try:
++        _, old = _groups(2, 0)
++    finally:
++        del os.environ["B70_KV_DRAFT_PAGE_FIT"]
++    assert held(fit) < 0.6 * held(old), (held(fit), held(old))
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b4d86477db..cd75915898 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1949,69 +1949,140 @@ def _get_packed_kv_cache_groups(
+         else None
+     )
+ 
+-    def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:
+-        if balanced and repeats_per_group is not None:
+-            return cdiv(spec.get_max_layers_per_page_size(), repeats_per_group)
+-        return 1
+-
+     def widest_group_bytes(page_size_layers: dict[int, list[str]], n: int) -> int:
+         """Page bytes of the largest of the n groups a bucket splits into."""
+         return sum(
+             cdiv(len(names), n) * page for page, names in page_size_layers.items()
+         )
+ 
+-    # Bytes a block must hold however the state buckets end up split: mamba,
+-    # circular-buffer and unsplit sliding-window buckets can go down to one
+-    # state per group, every other bucket's split is fixed by the repeat pattern.
+-    def is_state_bucket(spec: UniformTypeKVCacheSpecs) -> bool:
+-        if isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec)):
+-            return True
+-        return repeats_per_group is None and isinstance(
+-            spec.first_spec, SlidingWindowSpec
++    def plan(repeats: int | None, fitted: frozenset[int]) -> list[KVCacheGroupSpec]:
++        """Groups for one repeat count. ``fitted`` (B70-K2-0003): buckets split like
++        state buckets, as many layers per group as fit the block, never wider."""
++
++        def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:
++            if balanced and repeats is not None:
++                return cdiv(spec.get_max_layers_per_page_size(), repeats)
++            return 1
++
++        # Bytes a block must hold however the state buckets end up split: mamba,
++        # circular-buffer and unsplit sliding-window buckets can go down to one
++        # state per group, every other bucket's split is fixed by the repeat pattern.
++        def is_state_bucket(i: int, spec: UniformTypeKVCacheSpecs) -> bool:
++            if isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec)):
++                return True
++            if i in fitted:
++                return True
++            return repeats is None and isinstance(spec.first_spec, SlidingWindowSpec)
++
++        anchor_bytes = max(
++            (
++                widest_group_bytes(
++                    page_size_layers,
++                    len(spec.kv_cache_specs)
++                    if is_state_bucket(i, spec)
++                    else num_groups_for(spec, balanced),
++                )
++                for i, (spec, page_size_layers, balanced) in enumerate(bucketed)
++            ),
++            default=0,
+         )
+ 
+-    anchor_bytes = max(
+-        (
+-            widest_group_bytes(
+-                page_size_layers,
+-                len(spec.kv_cache_specs)
+-                if is_state_bucket(spec)
+-                else num_groups_for(spec, balanced),
+-            )
+-            for spec, page_size_layers, balanced in bucketed
+-        ),
+-        default=0,
+-    )
++        groups = []
++        for i, (spec, page_size_layers, balanced) in enumerate(bucketed):
++            num_groups = num_groups_for(spec, balanced)
++            # Cap a state group at the states a block already fits rather than let
++            # it widen the block.
++            if anchor_bytes and is_state_bucket(i, spec):
++                states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
++                num_groups = max(
++                    num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
++                )
++            if num_groups == 1:
++                groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
++                continue
+ 
+-    groups = []
+-    for spec, page_size_layers, balanced in bucketed:
+-        num_groups = num_groups_for(spec, balanced)
+-        # Cap a state group at the states a block already fits rather than let
+-        # it widen the block.
+-        if anchor_bytes and is_state_bucket(spec):
+-            states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
+-            num_groups = max(
+-                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
++            # B70-K2: pair the layers of one repeat by layer index, not by dict
++            # order, so a split group always holds full_i with its own side caches.
++            pattern_repeats = list(
++                zip(*(sorted(v, key=_b70_layer_index) for v in page_size_layers.values()))
++            )
++            for g in range(num_groups):
++                group_layer_names = [
++                    name for repeat in pattern_repeats[g::num_groups] for name in repeat
++                ]
++                group_layer_specs = {
++                    name: spec.kv_cache_specs[name] for name in group_layer_names
++                }
++                group_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
++                assert group_spec is not None
++                groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
++        return groups
++
++    groups = plan(repeats_per_group, frozenset())
++
++    # B70-K2-0003: a sliding-window bucket whose groups are wider than every other
++    # bucket's group (the DFlash draft at TP2: 4 KV heads per rank, a one-layer
++    # page 2x the attention page) sets the block alone, and every other group then
++    # pads it (~50 %). Split that bucket like a state bucket (as many layers per
++    # group as fit, at least one) and, as upstream #60996 does, pick the repeat
++    # count that minimises the pool bytes a max-length request draws, so the
++    # other buckets fill the block the draft page forces. A no-op whenever no
++    # such bucket exists (TP4: the draft page is narrower than a QSA group).
++    if (
++        repeats_per_group is not None
++        and os.environ.get("B70_KV_DRAFT_PAGE_FIT", "1") != "0"
++    ):
++        def widest(i: int, spec, page_size_layers, balanced) -> int:
++            if isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec)):
++                return widest_group_bytes(page_size_layers, len(spec.kv_cache_specs))
++            n = (
++                cdiv(spec.get_max_layers_per_page_size(), repeats_per_group)
++                if balanced
++                else 1
++            )
++            return widest_group_bytes(page_size_layers, n)
++
++        fitted = frozenset(
++            i
++            for i, (spec, page_size_layers, balanced) in enumerate(bucketed)
++            if balanced
++            and len(page_size_layers) == 1
++            and isinstance(spec.first_spec, SlidingWindowSpec)
++            and widest(i, spec, page_size_layers, balanced)
++            > max(
++                (
++                    widest(j, *other)
++                    for j, other in enumerate(bucketed)
++                    if j != i
++                ),
++                default=widest(i, spec, page_size_layers, balanced),
+             )
+-        if num_groups == 1:
+-            groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
+-            continue
+-
+-        # B70-K2: pair the layers of one repeat by layer index, not by dict
+-        # order, so a split group always holds full_i with its own side caches.
+-        pattern_repeats = list(
+-            zip(*(sorted(v, key=_b70_layer_index) for v in page_size_layers.values()))
+         )
+-        for i in range(num_groups):
+-            group_layer_names = [
+-                name for repeat in pattern_repeats[i::num_groups] for name in repeat
+-            ]
+-            group_layer_specs = {
+-                name: spec.kv_cache_specs[name] for name in group_layer_names
+-            }
+-            group_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
+-            assert group_spec is not None
+-            groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
++        if fitted:
++            max_repeats = max(
++                spec.get_max_layers_per_page_size()
++                for spec, _, balanced in bucketed
++                if balanced
++            )
++            best = None
++            for repeats in range(repeats_per_group, max_repeats + 1):
++                candidate = plan(repeats, fitted)
++                cost = _max_memory_usage_bytes_from_groups(vllm_config, candidate)
++                if best is None or cost < best[0]:
++                    best = (cost, repeats, candidate)
++            assert best is not None
++            layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
++            logger.info_once(
++                "B70-K2-0003: draft KV page %d B set the block alone; "
++                "repeats per group %d -> %d, bytes per block %d -> %d "
++                "(B70_KV_DRAFT_PAGE_FIT=0 opts out)",
++                max(bucketed[i][0].first_spec.page_size_bytes for i in fitted),
++                repeats_per_group,
++                best[1],
++                _get_kv_cache_bytes_per_block(groups, layout),
++                _get_kv_cache_bytes_per_block(best[2], layout),
++            )
++            groups = best[2]
+ 
+     _annotate_eagle_groups(
+         vllm_config,

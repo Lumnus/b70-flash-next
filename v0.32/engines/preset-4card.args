@@ -1,6 +1,8 @@
-# serve.args — `vllm serve` flags for 0.32.0-b70.4 (the dense series, 50 patches), one flag and its value per line (same format as engines/*.args).
-# Run: vllm serve <serve dir> $(these flags). The serve dir is the Intel AutoRound snapshot with
-# engines/serve-config-intel-autoround.json copied over its config.json (see v0.32/README.md, step 7).
+# preset-4card.args — `vllm serve` flags of the 4-card preset, 0.32.0-b70.4 (tensor parallel 4 + expert parallel, DFlash2 K=7,
+# 12 slots, 128 GiB host-RAM KV tier, sparse attention by default). One flag and its value per line. Pair with preset-4card.env
+# and a serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../engines/serve-config-intel-autoround.json
+# (dense); every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration served and validated on
+# 2026-10-26 (trunk a68ab313fe, vllm-xpu-kernels 0.1.16.2 + libgdn_index64). Run: vllm serve <serve dir> $(these flags).
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
@@ -10,13 +12,14 @@
 --trust-remote-code
 # 0.88 leaves too little KV for one 262,144-token request on this stack; 0.89 is the highest value vLLM's start-up
 # free-memory check accepts on compute-runtime 26.35.
+# PARAMETER gpu-memory: 0.89 measured; see v0.32/README.md Parameters
 --gpu-memory-utilization 0.89
 --max-model-len 262144
 # prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
 --max-num-batched-tokens 4096
-# 12 concurrent sequences (b70.4; 8 before). Measured on the sparse engine: 8 against 12 slots is within boot-to-boot noise,
-# and a decode of 1..12 requests replays a FULL graph without padding (capture list below). The dense engine at 12
-# slots was not re-measured; the dense numbers on the README pages were taken at 8.
+# 12 concurrent sequences. 8 against 12 slots on this engine: every difference within boot-to-boot noise or under 1 %
+# (1, 4, 6, 8 streams, prefill 8K/32K/131K). 16 with a power-of-two capture list lost about 6 % at 4 streams.
+# PARAMETER slots: 12 (8 and 12 within noise on the sparse engine; 16 dropped, it overloads). Keep the capture list a multiple of 1+K = 8 up to slots x 8.
 --max-num-seqs 12
 --limit-mm-per-prompt {"image":2,"video":0}
 # FULL graphs for uniform decode, piecewise for the rest. Capture sizes are every multiple of 1+K = 8 (K = 7 draft tokens)
@@ -31,14 +34,13 @@
 # when the per-effort thinking budget (B70_THINKING_BUDGET) runs out, close thinking with a short transition
 --reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
 # CPU KV tier: 128 GiB in host RAM = 32 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm)
+# PARAMETER KV offload size (GiB, host RAM; pinned, split evenly over the ranks): 128 on 4 cards
 --kv-offloading-size 128
 --kv-offloading-backend native
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
 # 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
 # TRITON_ATTN; the target model takes vLLM's XPU default backend (FlashAttention), so no --attention-backend flag.
-# No disable_eagle_block_drop: patch 0050 (vllm-project/vllm#54163, merged upstream 2026-10-23) makes DFlash/DSpark skip vLLM's
-# EAGLE trailing-block drop on their own. b70.1-b70.3 set that flag here (agent-session replay 232 s against 266 s with it);
-# on a tree without 0050 add "disable_eagle_block_drop":true to the config below.
+# PARAMETER drafter: DFlash2 K=7 (default). MTP: see v0.32/README.md Parameters
 --speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 # clients see cached prompt tokens in usage
 --enable-prompt-tokens-details

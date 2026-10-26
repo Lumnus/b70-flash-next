@@ -1,7 +1,7 @@
 From 5765f13ac490bb561428631072683cfdcef1f13a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 01:30:52 +0000
-Subject: [PATCH 32/36] B70-QSA-D06: profiler buckets for attn2 and select
+Subject: [PATCH 32/38] B70-QSA-D06: profiler buckets for attn2 and select
 
 qsa_profile_summary.py now has buckets for the attn2 tile and merge kernels
 and the D05 select kernels (before, they fell into "other").

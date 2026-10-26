@@ -1,7 +1,7 @@
 From ab1e9c14377fcf6cf0dc2bd36a625dfeedc3f664 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 23:47:34 +0000
-Subject: [PATCH 24/36] B70-QSA-K03: attn2 defaults from the B70 sweep (BLOCK_N
+Subject: [PATCH 24/38] B70-QSA-K03: attn2 defaults from the B70 sweep (BLOCK_N
  32 x 8 chunks, 256 GRF; prefill row_chunk 512); refuse num_warps>1 at
  BLOCK_N>=32
 

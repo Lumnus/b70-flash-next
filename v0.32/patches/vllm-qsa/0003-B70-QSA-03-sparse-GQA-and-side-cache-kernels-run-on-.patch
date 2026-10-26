@@ -1,7 +1,7 @@
 From 730e74137d5d9fa768f4e3ca3c8239131dfb49d9 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 19:53:38 +0000
-Subject: [PATCH 03/36] B70-QSA-03: sparse GQA and side-cache kernels run on
+Subject: [PATCH 03/38] B70-QSA-03: sparse GQA and side-cache kernels run on
  XPU
 
 - qsa_store_cache_rows / qsa_compress_groups_with_ratio gated on is_cuda,

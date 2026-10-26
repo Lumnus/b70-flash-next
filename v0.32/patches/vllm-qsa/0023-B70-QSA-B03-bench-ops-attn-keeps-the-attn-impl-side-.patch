@@ -1,7 +1,7 @@
 From 616ed0f1b367278dbe3632e097c8b4533cbefd36 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 23:45:26 +0000
-Subject: [PATCH 23/36] B70-QSA-B03: bench --ops attn keeps the attn@<impl>
+Subject: [PATCH 23/38] B70-QSA-B03: bench --ops attn keeps the attn@<impl>
  side-by-side rows
 
 The --ops filter matched names exactly, so --ops attn --attn-impls splitk,attn2 silently timed only the default attn op (K1/K2 as written in K s6 produced no attn2 rows).

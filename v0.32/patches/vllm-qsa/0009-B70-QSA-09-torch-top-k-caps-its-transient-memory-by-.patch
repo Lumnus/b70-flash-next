@@ -1,7 +1,7 @@
 From 04a53d0c6f705d5189dd0391d55a0b4e01ad3b14 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 20:46:59 +0000
-Subject: [PATCH 09/36] B70-QSA-09: torch top-k caps its transient memory by
+Subject: [PATCH 09/38] B70-QSA-09: torch top-k caps its transient memory by
  processing rows in chunks
 
 The deterministic torch top-k (B70_QSA_TOPK=torch) builds an int64 key per

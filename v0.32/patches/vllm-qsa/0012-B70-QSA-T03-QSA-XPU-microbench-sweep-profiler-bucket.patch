@@ -1,7 +1,7 @@
 From 95a70c653bf0d9f5aa703cc8bbe732b6d575f91f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:31:25 +0000
-Subject: [PATCH 12/36] B70-QSA-T03: QSA XPU microbench + sweep, profiler
+Subject: [PATCH 12/38] B70-QSA-T03: QSA XPU microbench + sweep, profiler
  bucket summary
 
 - benchmarks/kernels/bench_qwen4_qsa_xpu.py: every QSA op per sparse layer at

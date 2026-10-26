@@ -288,7 +288,7 @@ B70. Our host image is internal and not published.
 | fork | github.com/Lumnus/vllm `b70/v0.32.0` = tag `v0.32.0-b70.1` → `103f2f2eb94074e91e91f0c13652272f819bef70` (49 commits; the first 34 were published on 2026-10-23 as `979482e2e`) |
 | wu1ff pack | wu1ff/B70-LLM-Controller `5e5cf43f048d9b32146bb22925d4a2cf198400b0` (release `qwen3.8-flash-next-v1.0.5`, MIT) |
 | kernels | vllm-project/vllm-xpu-kernels `release/0.1.15.4` `ddf336d86e3c8602888572a3502f951abd51df12` + `848aca4` (#660), `71b7c5a` (#658; same code as the posted head `ab17bc7`), `3c8d392` (an earlier, pinned-only form of #662, whose posted head is `dc16c9f`) |
-| oneCCL plugin (optional, for `serve-plugin.env` only) | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
+| oneCCL plugin (optional here; the b70.4 presets use it) | uxlfoundation/oneCCL#229 head `caeb329166bb048b564a5dd8bd4e3d88c1ecdab3` on `master-v2` `c5108e7`; built against the oneCCL 2022.1.2 wheel. We ran `21e2f85`, which differs only in its commit message |
 | weights | Intel/Qwen3.8-Flash-Next-W4A16-AutoRound `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897`; drafter incoai/Qwen3.8-Flash-Next-DFlash2 `a22a1744e85c17364dcc54a6a420af7135d4c7f6` (model.safetensors sha256 `d6723f2a…4d3186f`) |
 | serve config | `engines/serve-config-intel-autoround.json`, sha256 `e6d529e6b791168a252978202596e794b101e1e679ad29494311fba90d5fbfb7` (byte-identical to the served file) |
 | runtime | compute-runtime 26.35.39758.10; torch 2.14.0+xpu; triton 3.8.0+xpu; intel-sycl-rt 2026.1.1; oneccl 2022.1.2; transformers 5.17.0; auto-round-lib 0.16.0; icpx 2026.1.1 for builds |
@@ -306,6 +306,8 @@ tree.
 | piece | pin |
 |---|---|
 | fork, dense | github.com/Lumnus/vllm tag `v0.32.0-b70.4-dense` = `v0.32.0-b70.1` + 1 commit: 0050, vllm-project/vllm#54163 (upstream merge `0bfeb8d0e3`, 2026-10-23), applied by hand where the 0.32 line lacks `is_xpress` (50 commits) |
-| fork, sparse | tag `v0.32.0-b70.4` = the dense tag + 36 commits (`patches/vllm-qsa/`); 0001–0032 are the b70.3 commits replayed on the new base (same content), 0033–0036 are new |
-| authorship | all new commits `Lumnus`; trailers and internal paths scrubbed as for b70.2/b70.3; `tools/check-trunk-tree.sh` shows the series equal the maintainers' trunk after the scrub rules, apart from the hot/cold commits |
-| kernels | unchanged: `release/0.1.15.4` + the local 64-bit GDN conv-state offset patch. vllm-xpu-kernels 0.1.16.2 (PyPI) was tried and not taken: it does not contain #658 |
+| fork, sparse | tag `v0.32.0-b70.4` = the dense tag + 38 commits (`patches/vllm-qsa/`); 0001–0032 are the b70.3 commits replayed on the new base (same content), 0033–0038 are new (0033–0036 K2-0001, P01, P02, K2-0002; 0037 B70-C1-R1; 0038 B70-K2-0003) |
+| trunk | the maintainers' trunk `a68ab313fe` (`b70/v0.32-trunk`); `tools/check-trunk-tree.sh` shows the series (dense + sparse, 88 patches) equal the trunk after the scrub rules, apart from the hot/cold commits (`--hotcold-tip ec62e8f532 --hotcold-extra 680ce6c4c6`): 0 drift. B70-V32-HC3 (`680ce6c4c6`) is one of them |
+| authorship | all new commits `Lumnus`; trailers and internal paths scrubbed as for b70.2/b70.3 |
+| kernels | vllm-xpu-kernels **0.1.16.2** from PyPI (wheel sha256 starts `86bfa26abbb6`, 150 MB; no GitHub tag) + `libgdn_index64.so` (sha256 starts `aabd7ae6`; `patches/libgdn-index64/` applied to wu1ff's `dependencies/gdn-headers`). 0.1.15.4 (`release/0.1.15.4` `ddf336d` + #660/#658/#662, section above) is retired; the b70.4 speed and replay numbers were measured on it with the identical trunk. Gate on 0.1.16.2: GPU KV 345,392, det2 identical, `_gdn_index64` 3/3 |
+| kernels, Python | the three astra modules from `patches/vllm-xpu-kernels-py/` (`git apply --exclude=vllm_xpu_kernels/fused_moe_interface.py`): byte-identical to the validated venv's files (sha256 starts `9346e3d4`, `ed313260`, `6650c391`) |

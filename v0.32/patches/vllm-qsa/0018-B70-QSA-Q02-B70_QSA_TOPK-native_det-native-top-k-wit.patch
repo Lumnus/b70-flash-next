@@ -1,7 +1,7 @@
 From 7027ad86a7ea2e27a6c0e54a97e4aab1930a546f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:48:36 +0000
-Subject: [PATCH 18/36] B70-QSA-Q02: B70_QSA_TOPK=native_det, native top-k with
+Subject: [PATCH 18/38] B70-QSA-Q02: B70_QSA_TOPK=native_det, native top-k with
  the torch selector's output
 
 Exact 0.0 indexer scores tie often at the top-k boundary, and the native

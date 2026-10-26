@@ -1,7 +1,7 @@
 From 548fb10764cf8f11c90beb2e82f2b3e66787407b Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:30:46 +0000
-Subject: [PATCH 10/36] B70-QSA-T01: one XPU launch-override hook
+Subject: [PATCH 10/38] B70-QSA-T01: one XPU launch-override hook
  (B70_QSA_TUNE) for every QSA Triton kernel
 
 Measurement/tuning only; nothing changes unless an override is set.

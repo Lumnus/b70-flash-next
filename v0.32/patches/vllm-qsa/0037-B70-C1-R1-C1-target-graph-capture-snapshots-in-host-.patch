@@ -1,0 +1,250 @@
+From 8e2fbcc244139ab4c0edcdf3ee92cec93310a327 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 17:34:30 +0000
+Subject: [PATCH 37/38] B70-C1-R1: C1 target-graph capture snapshots in host
+ RAM; footprint in the memory profile
+
+TargetGraphs.run snapshots every spec state row of the batch twice (initial,
+expected_state) before capturing, plus a transient gather copy. On the device
+that is ~0.45 GiB per request per rank per snapshot at TP2 (GDN state 2x of
+TP4), allocated after the KV cache and never seen by the memory profiler:
+TP2 warm-up (3 requests) OOMed at b70_target_graph.py:74 asking 1.27 GiB with
+0.95 GiB free (measured at TP2). Reserving the snapshots
+as they were would take ~3.6 GiB/rank at TP2 (4 slots), and at TP4 more than
+the profiled activation headroom.
+
+The snapshots now live in host RAM and move through the device in chunks of
+<= 256 MiB (save, restore and the exact state compare); the bytes are copied
+exactly, so the capture equality gate is unchanged. The remaining device
+footprint (one chunk each way, 0.5 GiB) is checked inside the memory profile
+after profile_run: if the profiled transient peak does not cover it, it is
+allocated once there, so the profiled peak is max(activations, capture) and
+KV sizing accounts for it (log line "B70-C1-R1"). When the transient already
+covers it (TP4: 1.5 GiB) nothing is allocated: an unconditional 0.5 GiB
+allocate/free moved non-torch memory by ~85 MB on two TP4 ranks (KV 344,706
+-> 338,475 tokens in the first TP4 gate). Qwen4Exp + DFlash2 on XPU with
+VLLM_XPU_C1_TARGET_GRAPH=1 only; elsewhere nothing changes.
+
+CPU: tests/models/qwen4_exp/test_b70_target_graph_snapshot.py (9 passed).
+---
+ .../test_b70_target_graph_snapshot.py         | 76 +++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_target_graph.py      | 61 +++++++++++++--
+ vllm/v1/worker/gpu_worker.py                  | 31 ++++++++
+ 3 files changed, 162 insertions(+), 6 deletions(-)
+ create mode 100644 tests/models/qwen4_exp/test_b70_target_graph_snapshot.py
+
+diff --git a/tests/models/qwen4_exp/test_b70_target_graph_snapshot.py b/tests/models/qwen4_exp/test_b70_target_graph_snapshot.py
+new file mode 100644
+index 0000000000..432b0226eb
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_b70_target_graph_snapshot.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-C1-R1: C1 target-graph capture snapshots in host RAM, moved in chunks (CPU only).
++
++The snapshot must be exact (save -> mutate -> restore gives the original bytes), unions of
++indices over shared views must round-trip, and the equality check must see a one-element
++difference in any chunk."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia import b70_target_graph as tg
++
++
++@pytest.fixture(params=[1 << 30, 3 * 4 * 5 * 4])  # one chunk / a few rows per chunk
++def chunk(request, monkeypatch):
++    monkeypatch.setattr(tg, "SNAPSHOT_CHUNK_BYTES", request.param)
++    return request.param
++
++
++def _routes():
++    torch.manual_seed(0)
++    ssm = torch.randn(40, 3, 4, 5)                      # fp32 state, 240 B per row
++    conv = torch.randn(40, 6, 2).to(torch.bfloat16)
++    shared = torch.randn(40, 7)                         # a view several layers share
++    idx = torch.tensor([3, 9, 10, 11, 17, 25, 26, 39])
++    return [("ssm", ssm, idx), ("conv", conv, idx.flip(0)),
++            ("shared", shared, torch.cat([idx, idx + 0, torch.tensor([0, 1])]).unique())]
++
++
++def test_snapshot_is_host_and_exact(chunk):
++    routes = _routes()
++    before = [t.clone() for _, t, _ in routes]
++    snap = tg.save(routes)
++    assert all(v.device.type == "cpu" for v in snap)
++    for (_, t, i), v in zip(routes, snap):
++        assert torch.equal(v, t[i])
++    for _, t, i in routes:
++        t[i] = torch.randn_like(t[i].float()).to(t.dtype)
++    assert not tg.state_equal(routes, snap)
++    tg.restore(routes, snap)
++    assert all(torch.equal(t, b) for (_, t, _), b in zip(routes, before))
++    assert tg.state_equal(routes, snap)
++
++
++@pytest.mark.parametrize("which", [0, 1, 2])
++def test_one_element_difference_is_seen(chunk, which):
++    routes = _routes()
++    snap = tg.save(routes)
++    _, t, i = routes[which]
++    flat = t[i[-1]].view(-1)
++    flat[-1] = flat[-1] + 1
++    t[i[-1]] = flat.view(t[i[-1]].shape)
++    assert not tg.state_equal(routes, snap)
++
++
++def _runner(method="dflash", arch="DFlash2DraftModel", dev="xpu", mt="qwen4_exp_text"):
++    return SimpleNamespace(
++        speculative_config=SimpleNamespace(method=method,
++                                           draft_model_config=SimpleNamespace(architectures=[arch])),
++        device=SimpleNamespace(type=dev),
++        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=mt)))
++
++
++def test_reserve_only_on_the_c1_path(monkeypatch):
++    monkeypatch.delenv("VLLM_XPU_C1_TARGET_GRAPH", raising=False)
++    assert tg.capture_reserve_bytes(_runner()) == 2 * tg.SNAPSHOT_CHUNK_BYTES
++    assert tg.capture_reserve_bytes(_runner(method="mtp")) == 0
++    assert tg.capture_reserve_bytes(_runner(arch="DFlashDraftModel")) == 0
++    assert tg.capture_reserve_bytes(_runner(dev="cuda")) == 0
++    assert tg.capture_reserve_bytes(_runner(mt="qwen3")) == 0
++    assert tg.capture_reserve_bytes(SimpleNamespace(speculative_config=None)) == 0
++    monkeypatch.setenv("VLLM_XPU_C1_TARGET_GRAPH", "0")
++    assert tg.capture_reserve_bytes(_runner()) == 0
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index 7ed41740af..5a59a83725 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -70,13 +70,65 @@ def qsa_side_snapshot(side):
+     ]
+ 
+ 
++# B70-C1-R1: the capture snapshots (``initial`` and ``expected_state``) live in host
++# RAM, moved through the device in chunks of at most this many bytes. On the device
++# they were 2 x (requests x (1 + K) state blocks x every GDN layer): ~0.45 GiB per
++# request per rank at TP2, plus one transient gather copy, none of it seen by the
++# memory profiler; TP2 warm-up (3 requests) OOMed at the second gather (W5 f,
++# two-engines run). Bytes are copied exactly, so every check below is unchanged.
++SNAPSHOT_CHUNK_BYTES = 256 << 20
++
++
++def _rows_per_chunk(tensor):
++    row = tensor[0].numel() * tensor.element_size() if tensor.shape[0] else 1
++    return max(1, SNAPSHOT_CHUNK_BYTES // max(row, 1))
++
++
+ def save(routes):
+-    return [tensor[indices].clone() for _, tensor, indices in routes]
++    values = []
++    for _, tensor, indices in routes:
++        host = torch.empty((indices.numel(), *tensor.shape[1:]), dtype=tensor.dtype)
++        step = _rows_per_chunk(tensor)
++        for i in range(0, indices.numel(), step):
++            host[i:i + step].copy_(tensor[indices[i:i + step]])
++        values.append(host)
++    return values
+ 
+ 
+ def restore(routes, values):
+     for (_, tensor, indices), value in zip(routes, values):
+-        tensor[indices] = value
++        step = _rows_per_chunk(tensor)
++        for i in range(0, indices.numel(), step):
++            tensor[indices[i:i + step]] = value[i:i + step].to(tensor.device)
++
++
++def state_equal(routes, values):
++    """Exact comparison of the live state rows with a host snapshot, chunk by chunk."""
++    for (_, tensor, indices), value in zip(routes, values):
++        step = _rows_per_chunk(tensor)
++        for i in range(0, indices.numel(), step):
++            if not torch.equal(value[i:i + step].to(tensor.device), tensor[indices[i:i + step]]):
++                return False
++    return True
++
++
++def capture_reserve_bytes(runner) -> int:
++    """Device bytes a target-graph capture needs beyond the step itself (B70-C1-R1):
++    one gathered chunk plus one chunk staged back, while the snapshots are in host RAM.
++    0 when the C1 target-graph path cannot run on this engine."""
++    spec = getattr(runner, "speculative_config", None)
++    try:
++        enabled = (
++            spec is not None
++            and spec.method == "dflash"
++            and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
++            and runner.device.type == "xpu"
++            and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
++            and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1"
++        )
++    except AttributeError:
++        return 0
++    return 2 * SNAPSHOT_CHUNK_BYTES if enabled else 0
+ 
+ 
+ def clone_output(value):
+@@ -284,10 +336,7 @@ class TargetGraphs:
+             graph.replay()
+             torch.xpu.synchronize()
+             # Check every state exactly without another full observed-state copy.
+-            passed = compare(expected, output) and all(
+-                torch.equal(value, tensor[indices])
+-                for (_, tensor, indices), value in zip(routes, expected_state)
+-            )
++            passed = compare(expected, output) and state_equal(routes, expected_state)
+             if side:
+                 side_replayed = qsa_side_snapshot(side)
+                 bad = [
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 188fe9a8d8..709c783390 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -630,6 +630,36 @@ class Worker(WorkerBase):
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def _b70_reserve_c1_capture(self) -> None:
++        """B70-C1-R1: count the C1 target-graph capture's device footprint (built after the
++        KV cache, at warm-up and on first use of a shape) in the profiled transient peak:
++        hold it once here, so the peak is max(activations, capture) and the KV sizing leaves
++        room for it. Qwen4Exp + DFlash2 on XPU only; 0 bytes elsewhere."""
++        hf = getattr(self.model_config, "hf_text_config", None)
++        if getattr(hf, "model_type", None) != "qwen4_exp_text":
++            return
++        from vllm.models.qwen4_exp.nvidia.b70_target_graph import capture_reserve_bytes
++
++        need = capture_reserve_bytes(self.model_runner)
++        if not need:
++            return
++        # Only touch the device when the profiled transient peak does not already
++        # cover the footprint: a large allocate/free is not side-effect free here
++        # (it moved non-torch memory by ~85 MB on two TP4 ranks in the W6 gate).
++        headroom = torch.accelerator.max_memory_allocated(
++            self.device
++        ) - torch.accelerator.memory_allocated(self.device)
++        if need > headroom:
++            held = torch.empty(need, dtype=torch.uint8, device=self.device)
++            del held
++        logger.info_once(
++            "B70-C1-R1: target-graph capture footprint %.2f GiB/rank in the memory "
++            "profile (profiled transient %.2f GiB%s; snapshots in host RAM)",
++            need / 2**30,
++            headroom / 2**30,
++            ", raised" if need > headroom else ", already covers it",
++        )
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much
+@@ -691,6 +721,7 @@ class Worker(WorkerBase):
+             set_current_vllm_config(self.vllm_config),
+         ):
+             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
++            self._b70_reserve_c1_capture()
+ 
+         # Profile CUDA graph memory if graphs will be captured.
+         # ROCm is included: #44825 moved the profiler to

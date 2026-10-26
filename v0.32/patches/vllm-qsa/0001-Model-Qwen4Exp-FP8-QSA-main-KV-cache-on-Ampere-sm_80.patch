@@ -1,7 +1,7 @@
 From 338189e334a4e218a0a53bb5d61eac6a9998c814 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Tue, 13 Oct 2026 15:30:19 +0800
-Subject: [PATCH 01/36] [Model][Qwen4Exp] FP8 QSA main KV cache on Ampere
+Subject: [PATCH 01/38] [Model][Qwen4Exp] FP8 QSA main KV cache on Ampere
  (sm_80, sm_86) (#60602)
 
 Cherry-picked from vllm-project/vllm#60602.

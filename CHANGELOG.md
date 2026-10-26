@@ -6,28 +6,53 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
-## 0.32.0-b70.4 — 2026-10-26: dense and sparse attention both working; split KV groups; upstream DFlash fix; 12 slots
+## 0.32.0-b70.4 — 2026-10-26: one engine, two presets plus parameters; both attention variants working; split KV groups; three trunk fixes; kernels 0.1.16.2
 
+One release (no intermediate b70.4 builds were published).
+
+- **One engine, two presets.** `v0.32/engines/serve.args`, `serve.env`, `serve-plugin.env`, `qsa-serve.args` and `qsa-serve.env`
+  are replaced by `preset-4card.args` / `.env` (tensor parallel 4, sparse attention, DFlash2 K=7, 12 slots, 128 GiB KV tier,
+  patched oneCCL plugin) and `preset-2card.args` / `.env` (TP2, frees the other two cards for any other model;
+  **a placeholder in this tree**: every `TODO-2CARD` line awaits the measured definition). Attention (sparse default / dense),
+  cards, drafter, expert offload, KV offload size, slots and GPU memory are parameters, tabulated with their defaults and what
+  each was measured at in [v0.32/README.md](v0.32/README.md#parameters). The stock-plugin configuration of b70.1–b70.3
+  (`serve.env`) is now the oneCCL-plugin parameter value.
 - **Dense series: 50 patches** (`v0.32/patches/vllm/`, fork tag `v0.32.0-b70.4-dense`). 0001–0049 are the b70.1 series, unchanged
   in content (the `[PATCH n/49]` headers read `n/50`); **0050** backports vllm-project/vllm#54163 (merged upstream
   2026-10-23): DFlash and DSpark no longer drop the trailing prefix-cache block, so `disable_eagle_block_drop` is no longer
-  needed. `v0.32/engines/serve.args` drops it (b70.1–b70.3 set it: agent-session replay 232 s against 266 s).
-- **Sparse (QSA) add-on: 36 patches** (`v0.32/patches/vllm-qsa/`, fork tag `v0.32.0-b70.4`; 0001–0032 unchanged in content from
+  needed (b70.1–b70.3 set it: agent-session replay 232 s against 266 s).
+- **Sparse (QSA) add-on: 38 patches** (`v0.32/patches/vllm-qsa/`, fork tag `v0.32.0-b70.4`; 0001–0032 unchanged in content from
   b70.3, headers regenerated because 0050 now sits below them). 0033 and 0036: the packed full-attention KV bucket is split into
   66 groups of 905,216 B blocks instead of 7 groups of 10,862,592 B, **on by default**; `B70_KV_SPLIT_GROUPS=0` restores the old
   packing, `B70_KV_PACK_REPEATS=<n>` wins over both. GPU KV 344,706 tokens; the agent replay's GPU prefix hit rate about 0.37 →
   0.46. 0034: `B70_QSA_OPTIMER` per-op timer (off by default) and its report script. 0035: cache-path lifecycle driver and
-  tests. The sparse engine file `qsa-serve.args` runs without `disable_eagle_block_drop` (validated on 2026-10-26).
-- **12 sequences** in both `serve.args` and `qsa-serve.args`, with capture sizes at every multiple of 8 up to 96 (then 256, 512,
-  1024). On the sparse engine 8 against 12 slots is within boot-to-boot noise; the dense engine at 12 slots was not re-measured.
+  tests. **0037 (B70-C1-R1):** C1 target-graph capture snapshots live in host RAM and move through the device in chunks of at
+  most 256 MiB; the remaining device footprint is checked inside the memory profile (the TP2 warm-up ran out of memory on an
+  unreserved 1.27 GiB copy; nothing changes at TP4). **0038 (B70-K2-0003):** at TP2 the DFlash draft's sliding-window layer page
+  is twice an attention page and set every KV block; its bucket is now split and the repeats chosen per group by the pool bytes
+  a max-length request draws, as upstream #60996 does (TP4 untouched; `B70_KV_DRAFT_PAGE_FIT=0` opts out).
+- **Trunk fix not in the series: B70-V32-HC3.** Hot/cold cold-expert prefetch never runs under graph capture (it hung capture
+  at TP2 and with hot/cold at TP4; it now reads the cold experts over UVA there and raises if the staging path is called
+  during capture). The hot/cold code (from Niluthon/qwen38-flash-tp2 plus our B70-V32-HC1..HC3) is trunk code this kit's
+  exported series does not carry; `tools/check-trunk-tree.sh --hotcold-extra` accounts for it.
+- **Kernels: vllm-xpu-kernels 0.1.16.2 (PyPI) + our `libgdn_index64.so`; 0.1.15.4 is retired.** Upstream #658 (64-bit GDN
+  conv-state offsets) is merged on main but not in a release, and the wheel lacks it: the wheel's stock op fails
+  `large_state_offset` 3 of 3. The engine does not call that op; its GDN op `torch.ops._gdn_index64` comes from our library
+  (`patches/libgdn-index64/`), which passes the same tests 3 of 3. The wheel does carry the paged-decode row a 2-card layout needs.
+  The wheel lacks #660 (covered by our library), #662 (KV-offload loads copy through a snapshot) and the astra hooks in
+  `fused_moe_interface.py` (the astra Python modules are applied without that file; build step 4).
+- **Numbers.** The b70.4 speed and replay numbers were measured on the 0.1.15.4 kernel build with the identical trunk. The
+  0.1.16.2 build passed the gate with det2 identical (GPU KV 345,392 tokens, gate PASS, `_gdn_index64` 3/3). Speed and the
+  replay were not re-measured on it. Dense at 12 slots: K3 window numbers in the parameter table, not re-measured on 0.1.16.2.
+- **12 sequences** in the 4-card preset, with capture sizes at every multiple of 8 up to 96 (then 256, 512, 1024). On the sparse
+  engine 8 against 12 slots is within boot-to-boot noise.
 - **Both variants listed as working** (README, `v0.32/README.md`). Sparse against dense on the same trunk: agent-session replay
   about 205 s against about 232 s; short context 0.90–0.97×; prefill 131K 1.06×, 260K 1.31×; 128K long-context tasks 80/78 %
   against 72/72 %. Measurements: [docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md) §0.
 - **Tooling.** `tools/check-trunk-tree.sh` gains `--hotcold-tip` (the last hot/cold commit, when later commits sit on the
-  trunk), so those later commits must be in the series. `v0.32/scripts/check-series.sh` defaults to the b70.4 refs.
-  `serve-config-qsa.json` re-indented to the dense file's style (JSON-equal).
-- **Kernels unchanged:** vllm-xpu-kernels `release/0.1.15.4` plus the 64-bit GDN conv-state offset patch. 0.1.16.2 (PyPI) was
-  tried and not taken: it lacks #658 (`large_state_offset` fails 3 of 3 on a card). Re-test when a wheel after #658 appears.
+  trunk, so those later commits must be in the series) and `--hotcold-extra` (a single hot/cold commit outside that range).
+  `v0.32/scripts/check-series.sh` defaults to the b70.4 refs. `serve-config-qsa.json` re-indented to the dense file's style
+  (JSON-equal).
 - Release notes: [RELEASE-NOTES-b70.4.md](RELEASE-NOTES-b70.4.md).
 
 ## 0.32.0-b70.3 — 2026-10-26: sparse attention (QSA) brought near dense speed; dense engine args

@@ -10,7 +10,7 @@
 # The export is `git format-patch` of v0.32.0..REF, one file per commit, abbrev 10, no signature.
 #
 #   --qsa      check the sparse add-on instead: v0.32/patches/vllm-qsa/ against the export of REF..QSA-REF
-#   --qsa-ref  default v0.32.0-b70.4 (tag of the same fork: dense series plus the 36 sparse commits)
+#   --qsa-ref  default v0.32.0-b70.4 (tag of the same fork: dense series plus the 38 sparse commits)
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
