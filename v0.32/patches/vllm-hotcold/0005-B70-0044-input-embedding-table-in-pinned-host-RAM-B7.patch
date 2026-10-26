@@ -1,0 +1,110 @@
+From 905a93e229da30c48a2b1c1fae0545d6e1c426d7 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:12:38 +0000
+Subject: [PATCH 05/13] B70-0044: input embedding table in pinned host RAM
+ (B70_EMBED_UVA); swap policy defaults from an offline replay
+
+B70_EMBED_UVA=1: after loading, the target's embed_tokens (0.59 GiB per card on Qwen3.8-Flash-Next at TP 2)
+moves into the pinned arena behind a UVA view; lookups read a few KB per token over PCIe. lm_head and the MTP
+draft are not touched (the draft shares the target's module). The freed VRAM holds more hot experts: on 2x B70,
+144 hot instead of 136 with KV 193,412 tokens (was 173,505).
+
+0043 swap policy: B70_MOE_HOTCOLD_SWAP_PRIOR (new, default 0.01, was a fixed 0.05) and budget 8 (was 4). An
+offline replay of two agentic-coding traces gave decode cold shares of 12.2 / 15.3 % against 14.3 / 17.2 %.
+
+Port to 0.32 (from Niluthon/qwen38-flash-tp2@e536e33, Apache-2.0, via our 0.30 carry): _b70_maybe_embed_uva(model) runs after 0.32 log_online_quantization_time and before its gc + empty_cache, so the embedding VRAM is returned there.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 11 +++---
+ .../model_loader/base_loader.py               | 35 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index e99d7c590a..3c41aff087 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -259,7 +259,7 @@ class _Swapper:
+ 
+     Every B70_MOE_HOTCOLD_SWAP_S seconds each rank turns the prefill route
+     counts of the last period into a decayed score per (layer, local expert)
+-    (plus a small prior from the rankings file) and swaps up to
++    (plus B70_MOE_HOTCOLD_SWAP_PRIOR x the rankings-file order) and swaps up to
+     B70_MOE_HOTCOLD_SWAP_BUDGET experts per layer whose cold score beats a hot
+     one by 10 %: the hot slot's bytes go to the cold expert's pinned slot and
+     vice versa, and the two expert maps are rewritten in place. The decode
+@@ -310,10 +310,11 @@ class _Swapper:
+         self.plans = plans
+         self.period = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_S", "5"))
+         self.decay = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_DECAY", "0.95"))
+-        self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "4"))
++        self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "8"))
++        self.prior_weight = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_PRIOR", "0.01"))
+         self.total = 0
+-        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer",
+-                    self.period, self.decay, self.budget)
++        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer, prior %.3f",
++                    self.period, self.decay, self.budget, self.prior_weight)
+         return True
+ 
+     def _swap(self, plan, a: int, b: int) -> None:
+@@ -359,7 +360,7 @@ class _Swapper:
+         top = max(float(p.ema.max()) for p in self.plans) or 1.0
+         moves = []
+         for plan in self.plans:
+-            score = plan.ema / top + 0.05 * plan.prior
++            score = plan.ema / top + self.prior_weight * plan.prior
+             hot_g, cold_g = plan.hot_owner, plan.cold_owner
+             cold_best = cold_g[np.argsort(-score[cold_g])][: self.budget]
+             hot_worst = hot_g[np.argsort(score[hot_g])][: self.budget]
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 65f64a3326..2a34ddadf8 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -108,6 +108,7 @@ class BaseModelLoader(ABC):
+ 
+             process_weights_after_loading(model, model_config, target_device)
+             log_online_quantization_time(vllm_config)
++            _b70_maybe_embed_uva(model)
+ 
+             gc.collect()
+             torch.accelerator.empty_cache()
+@@ -115,6 +116,40 @@ class BaseModelLoader(ABC):
+         return model.eval()
+ 
+ 
++def _b70_maybe_embed_uva(model: nn.Module) -> None:
++    """B70 0044: keep the input embedding table in pinned host RAM (B70_EMBED_UVA=1).
++
++    The lookup reads a few rows per token through a UVA view (a few KB over
++    PCIe), so the table's VRAM can hold more hot experts instead. Only the
++    target's embed_tokens moves; lm_head (a full GEMM over every row) and the
++    MTP draft's own copy (replaced by the target's when shared) stay put."""
++    import os
++
++    if os.environ.get("B70_EMBED_UVA", "0") != "1" or not current_platform.is_xpu():
++        return
++    if "MTP" in type(model).__name__:
++        return
++    from vllm.model_executor.layers.fused_moe.b70_hotcold import _ARENA
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        ParallelLMHead,
++        VocabParallelEmbedding,
++    )
++    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++    for name, module in model.named_modules():
++        if (not isinstance(module, VocabParallelEmbedding) or isinstance(module, ParallelLMHead)
++                or not name.endswith("embed_tokens")):
++            continue
++        weight = module.weight
++        pinned = _ARENA.empty(weight.shape, weight.dtype)
++        pinned.copy_(weight.data)
++        weight.data = get_accelerator_view_from_cpu_tensor(pinned)
++        weight._vllm_is_uva_offloaded = True
++        torch.accelerator.empty_cache()
++        logger.info("B70 embed UVA: %s %s %s (%.2f GiB) now in pinned host RAM", name,
++                    tuple(weight.shape), weight.dtype, pinned.numel() * pinned.element_size() / 2**30)
++
++
+ def log_model_inspection(model: nn.Module) -> None:
+     """Log model structure if VLLM_LOG_MODEL_INSPECTION=1."""
+     if not envs.VLLM_LOG_MODEL_INSPECTION:

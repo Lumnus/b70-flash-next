@@ -1,4 +1,4 @@
-From 8d669dc868a1aa42f411e9cef58e2a36d80aacca Mon Sep 17 00:00:00 2001
+From c3b2180c140fa89b3ca5b0490271d4e590abe67c Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 04:24:02 +0000
 Subject: [PATCH 9/9] B70-V32-06: B70_ASTRA_OWNERSHIP=0 keeps the EP expert
@@ -9,7 +9,7 @@ Subject: [PATCH 9/9] B70-V32-06: B70_ASTRA_OWNERSHIP=0 keeps the EP expert
  1 file changed, 3 insertions(+)
 
 diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
-index 0752c60..6cc77cb 100644
+index 0752c60cb3..6cc77cb3f8 100644
 --- a/vllm_xpu_kernels/astra_ownership.py
 +++ b/vllm_xpu_kernels/astra_ownership.py
 @@ -46,6 +46,9 @@ def exchange(tensor, kind, cpu_group):
@@ -22,6 +22,3 @@ index 0752c60..6cc77cb 100644
      if not (
          module.recipe == 'int4' and module.ep_size == 4
          and module.num_experts == 128 and module.inter_size == 640
--- 
-2.43.0
-

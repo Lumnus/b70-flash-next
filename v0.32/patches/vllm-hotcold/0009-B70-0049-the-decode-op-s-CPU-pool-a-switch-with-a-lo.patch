@@ -1,0 +1,81 @@
+From faee9ec045352b95f10dd1474026edb4a62751ef Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 01:38:47 +0000
+Subject: [PATCH 09/13] B70-0049: the decode op's CPU pool: a switch with a log
+ line, and per-rank pinning
+
+B70_MOE_CPU=1 turns the decode op's CPU pool for cold experts on; anything else (0, unset) keeps every cold expert
+on the GPU path. One log line per rank says which: on (threads, first core, share), off by the switch, or off
+because the CPU has no AVX-512 BF16 (then B70_MOE_CPU is set to 0 before the op reads it; the op refused such CPUs
+silently before).
+
+B70_MOE_CPU_FIRST_CORE: unset = 8 x the TP rank (each rank's pool on its own 8-core CCD); one number = the same
+first core for every rank; a comma list ("0,8") = one first core per TP rank. The other env knobs of the CPU path
+(B70_MOE_CPU_PCT, B70_MOE_CPU_THREADS, B70_MOE_CPU_TIMEOUT_MS) stay in the extension.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 45 +++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index 8e1d4d001f..4b6689f8d0 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -226,6 +226,49 @@ def route_count_enabled() -> bool:
+ _DECODE_OP = {"max_rows": None}
+ 
+ 
++def _cpu_has_avx512_bf16() -> bool:
++    try:
++        with open("/proc/cpuinfo") as f:
++            for line in f:
++                if line.startswith("flags"):
++                    return "avx512_bf16" in line.split()
++    except OSError:
++        pass
++    return False
++
++
++def _cpu_path_setup() -> None:
++    """B70 0049: the decode op's CPU pool for cold experts. B70_MOE_CPU=1 turns it on, anything else (0, unset) off:
++    then every cold expert stays on the GPU path. The op itself also refuses CPUs without AVX-512 BF16; this sets
++    B70_MOE_CPU=0 for them, so the state is logged here once per rank instead of silently in the op.
++    The pool pins B70_MOE_CPU_THREADS threads from B70_MOE_CPU_FIRST_CORE: unset = 8 x TP rank (one 8-core CCD
++    per rank on a 16-core Ryzen); one number = the same first core for every rank; a comma list (e.g. "0,8") =
++    one first core per TP rank."""
++    try:
++        from vllm.distributed import get_tensor_model_parallel_rank
++        rank = get_tensor_model_parallel_rank()
++    except Exception:  # noqa: BLE001
++        rank = 0
++    if os.environ.get("B70_MOE_CPU", "0") != "1":
++        logger.info("B70 decode op: CPU path off (B70_MOE_CPU=%s), rank %d: cold experts on the GPU",
++                    os.environ.get("B70_MOE_CPU", "unset"), rank)
++        return
++    if not _cpu_has_avx512_bf16():
++        os.environ["B70_MOE_CPU"] = "0"
++        logger.warning("B70 decode op: CPU path requested but this CPU has no AVX-512 BF16 (avx512_bf16), rank %d: "
++                       "cold experts on the GPU", rank)
++        return
++    first = os.environ.get("B70_MOE_CPU_FIRST_CORE", "").strip()
++    if not first:
++        first = str(8 * rank)
++    elif "," in first:
++        cores = [c.strip() for c in first.split(",")]
++        first = cores[rank] if rank < len(cores) and cores[rank] else str(8 * rank)
++    os.environ["B70_MOE_CPU_FIRST_CORE"] = first
++    logger.info("B70 decode op: CPU path on, rank %d: %s threads from core %s, %s %% of the cold experts", rank,
++                os.environ.get("B70_MOE_CPU_THREADS", "8"), first, os.environ.get("B70_MOE_CPU_PCT", "50"))
++
++
+ def decode_op_max_rows() -> int:
+     """B70 0048: B70_MOE_DECODE_OP=<path to libb70_moe_decode.so> (or 1 = the image's copy) runs batches of at most
+     B70_MOE_DECODE_OP_MAX_ROWS (default 16) tokens through one fused hot+cold kernel set instead of two stock
+@@ -242,6 +285,8 @@ def decode_op_max_rows() -> int:
+                 logger.info("B70 decode op: %s, batches of <= %d tokens", lib, rows)
+             except (OSError, RuntimeError) as e:
+                 logger.warning("B70 decode op: cannot load %s (%s); stock path", lib, e)
++        if rows:
++            _cpu_path_setup()
+         _DECODE_OP["max_rows"] = rows
+     return rows
+ 

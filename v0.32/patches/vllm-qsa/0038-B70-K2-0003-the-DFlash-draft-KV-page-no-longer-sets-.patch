@@ -1,4 +1,4 @@
-From 6950e3cf370b506762a22efc471442db9559fba1 Mon Sep 17 00:00:00 2001
+From d6b1ec6106f6a2889be129f1d796037afa6b1d03 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 17:25:24 +0000
 Subject: [PATCH 38/38] B70-K2-0003: the DFlash draft KV page no longer sets
@@ -17,7 +17,7 @@ per group that minimise the pool bytes a max-length request draws. At TP2
 this gives two QSA layers (+ their compressed caches) per group and two GDN
 layers per group, one draft layer per group: 36 groups, 3,620,864 B per
 block, 663 MiB of state per running request (CPU model: ~221K tokens at the
-3.32 GiB/rank W5 measured, vs 78K). TP4 is unchanged: its draft page
+3.32 GiB/rank measured, vs 78K). TP4 is unchanged: its draft page
 (851,968 B) is narrower than a QSA group (905,216 B), so nothing engages.
 Token block sizes are untouched (no hash or kernel block change).
 B70_KV_DRAFT_PAGE_FIT=0 opts out. Log line "B70-K2-0003" when it engages.
@@ -32,7 +32,7 @@ before and after (pre-existing).
  2 files changed, 208 insertions(+), 59 deletions(-)
 
 diff --git a/tests/v1/core/test_b70_kv_pack_repeats.py b/tests/v1/core/test_b70_kv_pack_repeats.py
-index 8f40e6743b..2d0ecc9271 100644
+index 8f40e6743b..5714f693f6 100644
 --- a/tests/v1/core/test_b70_kv_pack_repeats.py
 +++ b/tests/v1/core/test_b70_kv_pack_repeats.py
 @@ -3,6 +3,9 @@
@@ -52,7 +52,7 @@ index 8f40e6743b..2d0ecc9271 100644
 -def _items():
 -    gdn = C.gated_delta_net_state_shape(4, 16, 48, 128, 128, 4, K)
 +def _items(tp=4):
-+    # per-rank specs; TP4 is the live ks12 layout (block 832), TP2 the W4/W5 twin (block 1664)
++    # per-rank specs; TP4 is the 4-card layout (block 832), TP2 the 2-card layout (block 1664)
 +    bs = {4: BS, 2: 2 * BS}[tp]
 +    pad = bs * max(1, 2 // tp) * 256 * 4
 +    gdn = C.gated_delta_net_state_shape(tp, 16, 48, 128, 128, 4, K)

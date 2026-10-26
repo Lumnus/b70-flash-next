@@ -1,32 +1,30 @@
-# preset-2card.args — PLACEHOLDER. `vllm serve` flags of the 2-card preset (frees the other two cards for any other model), 0.32.0-b70.4.
-# Every line marked TODO-2CARD is a value that is not final: the maintainer replaces it with the measured definition before the release
-# is published (grep -n TODO-2CARD v0.32/engines/preset-2card.*). Everything not marked is the 4-card preset's value.
-# Pair with preset-2card.env and a serve dir whose config.json matches the attention choice below (sparse: serve-config-qsa.json).
+# preset-2card.args — `vllm serve` flags of the 2-card preset, 0.32.0-b70.4 (tensor parallel 2 + expert parallel, DFlash2 K=7 with the
+# draft at TP2, 4 slots, 16 GiB host-RAM KV tier, 262,144-token context, sparse attention by default). It uses two cards so the other
+# pair stays free for any other model. One flag and its value per line. Pair with preset-2card.env (cards, hot/cold expert offload) and a
+# serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../engines/serve-config-intel-autoround.json (dense);
+# every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration measured on 2026-10-26 (fork tag
+# v0.32.0-b70.4, the 0.1.16.2 environment; numbers in v0.32/README.md "Presets"). Run: v0.32/README.md "Build and run" step 8.
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
 --dtype bfloat16
-# TODO-2CARD: tensor parallel 2
 --tensor-parallel-size 2
 --enable-expert-parallel
 --trust-remote-code
 # 0.88 leaves too little KV for one 262,144-token request on this stack; 0.89 is the highest value vLLM's start-up
 # free-memory check accepts on compute-runtime 26.35.
-# TODO-2CARD: gpu memory fraction (0.89 is the 4-card value)
+# PARAMETER gpu-memory: 0.89 measured; see v0.32/README.md Parameters
 --gpu-memory-utilization 0.89
-# TODO-2CARD: max context at 2 cards (262144 is the 4-card value; TP2 KV is much smaller, the engine refuses a context that does not fit one request)
+# the full context: hot/cold (145 cold experts per layer per rank, preset-2card.env) frees the VRAM for it
 --max-model-len 262144
 # prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
 --max-num-batched-tokens 4096
-# 12 concurrent sequences. 8 against 12 slots on this engine: every difference within boot-to-boot noise or under 1 %
-# (1, 4, 6, 8 streams, prefill 8K/32K/131K). 16 with a power-of-two capture list lost about 6 % at 4 streams.
-# PARAMETER slots: 12 (8 and 12 within noise on the sparse engine; 16 dropped, it overloads). Keep the capture list a multiple of 1+K = 8 up to slots x 8.
-# TODO-2CARD: 4 slots (2 as the fallback if preemption churn shows)
+# 4 concurrent sequences (2 is the fallback if preemptions show under load).
+# PARAMETER slots: 4. Keep the capture list a multiple of 1+K = 8 up to slots x 8.
 --max-num-seqs 4
 --limit-mm-per-prompt {"image":2,"video":0}
 # FULL graphs for uniform decode, piecewise for the rest. Capture sizes are every multiple of 1+K = 8 (K = 7 draft tokens)
-# up to 12 x 8 = 96, so a uniform spec-decode step of 1..12 requests is never padded, plus three prefill sizes.
-# TODO-2CARD: capture list = every multiple of 8 up to slots x 8 (32 for 4 slots)
+# up to 4 x 8 = 32, so a uniform spec-decode step of 1..4 requests is never padded, plus three prefill sizes.
 --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,256,512,1024]}
 --cudagraph-metrics
 --enable-auto-tool-choice
@@ -36,15 +34,14 @@
 --override-generation-config {"temperature": 0.7}
 # when the per-effort thinking budget (B70_THINKING_BUDGET) runs out, close thinking with a short transition
 --reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
-# CPU KV tier: 128 GiB in host RAM = 32 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm)
-# PARAMETER KV offload size (GiB, host RAM; pinned, split evenly over the ranks): 128 on 4 cards
-# TODO-2CARD: KV offload 64 GiB
---kv-offloading-size 64
+# CPU KV tier: 16 GiB in host RAM = 8 GiB pinned per rank (with B70_OFFLOAD_PRIVATE_PINNED=1 a private pool, no /dev/shm). Small on
+# purpose: it leaves host RAM for the model on the other pair (155 GiB MemAvailable with this preset up on our 256 GB host).
+# PARAMETER KV offload size (GiB, host RAM; pinned, split evenly over the ranks): 16 on 2 cards (v0.32/README.md Parameters)
+--kv-offloading-size 16
 --kv-offloading-backend native
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
-# 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
+# 2 cards (draft_tensor_parallel_size 2; its KV page fits through patch 0038 of the sparse series); async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
 # TRITON_ATTN; the target model takes vLLM's XPU default backend (FlashAttention), so no --attention-backend flag.
-# TODO-2CARD: draft_tensor_parallel_size 2 with TP2 (confirm)
 # PARAMETER drafter: DFlash2 K=7 (default). MTP: see v0.32/README.md Parameters
 --speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":2,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 # clients see cached prompt tokens in usage

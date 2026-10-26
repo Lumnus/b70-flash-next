@@ -1,0 +1,184 @@
+From 7f3e785b2ba782e72385570767841aa388e45299 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 17:08:12 +0000
+Subject: [PATCH 13/13] B70-V32-HC3: hot/cold cold prefetch never runs under
+ graph capture
+
+apply_cold took the 0042 VRAM-staging path for any batch >= the prefetch
+threshold (512), including the 512/1024-token captures. vLLM captures largest
+first, so capture 1024 recorded the prefetcher side-stream events into the
+graph and the next capture waited forever (ccs+bcs 100 %, all ranks). While the stream is capturing, apply_cold now
+reads the cold experts over UVA (same kernel, same bytes, same math), with a
+one-time log line; _load/acquire/release_and_prefetch raise if called during
+capture, so a regression fails loudly instead of hanging. Eager prefill
+chunks at or above the threshold keep the staging slots.
+
+CPU: tests/model_executor/test_b70_hotcold_capture.py (9 passed; 6 of them
+fail on the previous tree).
+---
+ .../test_b70_hotcold_capture.py               | 88 +++++++++++++++++++
+ .../layers/fused_moe/b70_hotcold.py           | 27 +++++-
+ 2 files changed, 113 insertions(+), 2 deletions(-)
+ create mode 100644 tests/model_executor/test_b70_hotcold_capture.py
+
+diff --git a/tests/model_executor/test_b70_hotcold_capture.py b/tests/model_executor/test_b70_hotcold_capture.py
+new file mode 100644
+index 0000000000..ea7165583e
+--- /dev/null
++++ b/tests/model_executor/test_b70_hotcold_capture.py
+@@ -0,0 +1,88 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-V32-HC3: hot/cold cold prefetch never runs inside a graph capture (CPU only).
++
++Measured 2026-10-26: with B70_MOE_COLD_PREFETCH=1 a 1024-token capture ran the
++prefetcher, recorded its side-stream events into the graph, and the next capture waited forever.
++Capture now takes the UVA path at any size; the prefetcher refuses to run while capturing."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.fused_moe import b70_hotcold
++
++
++class _Cold:
++    def __init__(self):
++        self.calls = []
++
++    def apply(self, **kw):
++        self.calls.append(kw["hidden_states"].shape[0])
++
++
++class _Prefetch:
++    def __init__(self):
++        self.calls = []
++
++    def acquire(self, plan, device):
++        self.calls.append("acquire")
++        raise AssertionError("prefetcher used")
++
++    def release_and_prefetch(self, plan):
++        self.calls.append("release")
++
++
++@pytest.fixture
++def env(monkeypatch):
++    monkeypatch.setenv("B70_MOE_COLD_PREFETCH", "1")
++    monkeypatch.setenv("B70_MOE_COLD_PREFETCH_MIN_TOKENS", "512")
++    fake = _Prefetch()
++    monkeypatch.setattr(b70_hotcold, "_PREFETCH", fake)
++    state = SimpleNamespace(capturing=False)
++    monkeypatch.setattr(torch.xpu, "is_current_stream_capturing", lambda: state.capturing)
++    return SimpleNamespace(prefetch=fake, state=state, mp=monkeypatch)
++
++
++def _apply(n):
++    plan = b70_hotcold.HotColdPlan.__new__(b70_hotcold.HotColdPlan)
++    cold = _Cold()
++    x = torch.zeros(n, 8)
++    plan.apply_cold(cold, torch.zeros_like(x), x, torch.zeros(n, 8), torch.zeros(n, 8, dtype=torch.int32))
++    return cold
++
++
++@pytest.mark.parametrize("n", [512, 1024, 4096])
++def test_capture_reads_cold_over_uva(env, n):
++    env.state.capturing = True
++    cold = _apply(n)
++    assert cold.calls == [n] and env.prefetch.calls == []
++
++
++def test_small_batches_never_prefetch(env):
++    assert _apply(256).calls == [256] and env.prefetch.calls == []
++
++
++def test_eager_large_batch_still_prefetches(env):
++    with pytest.raises(AssertionError, match="prefetcher used"):
++        _apply(1024)
++    assert env.prefetch.calls == ["acquire"]
++
++
++def test_prefetch_off_never_prefetches(env):
++    env.mp.setenv("B70_MOE_COLD_PREFETCH", "0")
++    env.state.capturing = True
++    assert _apply(1024).calls == [1024]
++    env.state.capturing = False
++    assert _apply(1024).calls == [1024] and env.prefetch.calls == []
++
++
++@pytest.mark.parametrize("call", ["_load", "acquire", "release_and_prefetch"])
++def test_prefetcher_refuses_under_capture(env, call):
++    env.state.capturing = True
++    real = b70_hotcold._ColdPrefetcher()
++    plan = SimpleNamespace(layer_idx=3, cold={})
++    args = {"_load": (0, plan), "acquire": (plan, "cpu"), "release_and_prefetch": (plan,)}[call]
++    with pytest.raises(RuntimeError, match="during graph capture"):
++        getattr(real, call)(*args)
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index 4280b37807..c4772f0057 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -148,6 +148,19 @@ def cold_prefetch_min_tokens() -> int:
+     return max(64, int(os.environ.get("B70_MOE_COLD_PREFETCH_MIN_TOKENS", "512")))
+ 
+ 
++def _capturing() -> bool:
++    """True while the current XPU stream is recording a graph (CUDA/XPU graph capture)."""
++    return bool(torch.xpu.is_current_stream_capturing())
++
++
++def _refuse_under_capture(what: str) -> None:
++    """B70-V32-HC3: the prefetcher orders an eager side copy stream against the current stream
++    with events. Recorded into a graph, those events never complete on the eager timeline, so the
++    copy stream and the next eager forward wait forever. Fail loudly instead."""
++    if _capturing():
++        raise RuntimeError(f"B70 hot/cold: cold prefetch {what} called during graph capture")
++
++
+ class _ColdPrefetcher:
+     """Two VRAM slots, each holding one layer's cold experts (kernel layout).
+ 
+@@ -177,6 +190,7 @@ class _ColdPrefetcher:
+                     cold_prefetch_min_tokens(), gib)
+ 
+     def _load(self, slot: int, plan: "HotColdPlan") -> None:
++        _refuse_under_capture("_load")
+         compute = torch.xpu.current_stream()
+         with torch.xpu.stream(self.stream):
+             if self.free[slot] is not None:
+@@ -190,6 +204,7 @@ class _ColdPrefetcher:
+         del compute
+ 
+     def acquire(self, plan: "HotColdPlan", device) -> dict[str, torch.Tensor]:
++        _refuse_under_capture("acquire")
+         self._ensure(plan, device)
+         if plan.layer_idx in self.owner:
+             slot = self.owner.index(plan.layer_idx)
+@@ -201,6 +216,7 @@ class _ColdPrefetcher:
+         return self.bufs[slot]
+ 
+     def release_and_prefetch(self, plan: "HotColdPlan") -> None:
++        _refuse_under_capture("release_and_prefetch")
+         slot = self.last
+         event = torch.xpu.Event()
+         event.record(torch.xpu.current_stream())
+@@ -763,9 +779,16 @@ class HotColdPlan:
+     # -- forward ---------------------------------------------------------------
+ 
+     def apply_cold(self, cold, output, hidden_states, topk_weights, topk_ids) -> None:
+-        """The cold experts' share: UVA reads (decode, graphs) or a VRAM slot (large batches)."""
++        """The cold experts' share: UVA reads (decode, graphs) or a VRAM slot (large eager batches).
++
++        Graph capture always takes the UVA path, whatever the batch size (B70-V32-HC3): the
++        prefetcher's side stream and events cannot live inside a graph. Same kernel, same bytes,
++        same math; a captured 512/1024-token graph reads its cold experts over PCIe."""
+         min_tokens = cold_prefetch_min_tokens()
+-        if not min_tokens or hidden_states.shape[0] < min_tokens:
++        if not min_tokens or hidden_states.shape[0] < min_tokens or _capturing():
++            if min_tokens and hidden_states.shape[0] >= min_tokens:
++                logger.info_once("B70 hot/cold: graph capture at %d tokens reads cold experts over "
++                                 "UVA (prefetch is eager-only)", hidden_states.shape[0])
+             cold.apply(output=output, hidden_states=hidden_states,
+                        topk_weights=topk_weights, topk_ids=topk_ids)
+             return

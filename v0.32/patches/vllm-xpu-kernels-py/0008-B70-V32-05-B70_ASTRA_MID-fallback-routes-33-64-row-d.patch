@@ -1,4 +1,4 @@
-From 25aef22c0c37860ada346a6fe5506497d789157e Mon Sep 17 00:00:00 2001
+From 59687cc6f6dfc7387d1b6adcc2af2b71032ce2b9 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 04:16:54 +0000
 Subject: [PATCH 8/9] B70-V32-05: B70_ASTRA_MID=fallback routes 33-64-row
@@ -9,7 +9,7 @@ Subject: [PATCH 8/9] B70-V32-05: B70_ASTRA_MID=fallback routes 33-64-row
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
-index ca21df9..0752c60 100644
+index ca21df9bb7..0752c60cb3 100644
 --- a/vllm_xpu_kernels/astra_ownership.py
 +++ b/vllm_xpu_kernels/astra_ownership.py
 @@ -18,6 +18,8 @@ torch.ops.load_library(str(Path(__file__).with_name('libdominant_w4_layout.so'))
@@ -41,6 +41,3 @@ index ca21df9..0752c60 100644
          # One input row per routed expert is shared by that expert's one or
          # two owned groups. Gate/up coexecution writes only the activation.
          # Keep C1 and C2-C4's specialized paths above; no extra collective.
--- 
-2.43.0
-

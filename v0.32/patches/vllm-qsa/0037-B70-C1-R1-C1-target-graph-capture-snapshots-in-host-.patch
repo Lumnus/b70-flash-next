@@ -1,4 +1,4 @@
-From 8e2fbcc244139ab4c0edcdf3ee92cec93310a327 Mon Sep 17 00:00:00 2001
+From 8ba9d2c4c65e7f54e9e35ac041734e3f2e7a98c0 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Mon, 26 Oct 2026 17:34:30 +0000
 Subject: [PATCH 37/38] B70-C1-R1: C1 target-graph capture snapshots in host
@@ -20,17 +20,15 @@ footprint (one chunk each way, 0.5 GiB) is checked inside the memory profile
 after profile_run: if the profiled transient peak does not cover it, it is
 allocated once there, so the profiled peak is max(activations, capture) and
 KV sizing accounts for it (log line "B70-C1-R1"). When the transient already
-covers it (TP4: 1.5 GiB) nothing is allocated: an unconditional 0.5 GiB
-allocate/free moved non-torch memory by ~85 MB on two TP4 ranks (KV 344,706
--> 338,475 tokens in the first TP4 gate). Qwen4Exp + DFlash2 on XPU with
+covers it (TP4: 1.5 GiB) nothing is allocated. Qwen4Exp + DFlash2 on XPU with
 VLLM_XPU_C1_TARGET_GRAPH=1 only; elsewhere nothing changes.
 
 CPU: tests/models/qwen4_exp/test_b70_target_graph_snapshot.py (9 passed).
 ---
  .../test_b70_target_graph_snapshot.py         | 76 +++++++++++++++++++
- .../qwen4_exp/nvidia/b70_target_graph.py      | 61 +++++++++++++--
+ .../qwen4_exp/nvidia/b70_target_graph.py      | 60 +++++++++++++--
  vllm/v1/worker/gpu_worker.py                  | 31 ++++++++
- 3 files changed, 162 insertions(+), 6 deletions(-)
+ 3 files changed, 161 insertions(+), 6 deletions(-)
  create mode 100644 tests/models/qwen4_exp/test_b70_target_graph_snapshot.py
 
 diff --git a/tests/models/qwen4_exp/test_b70_target_graph_snapshot.py b/tests/models/qwen4_exp/test_b70_target_graph_snapshot.py
@@ -116,10 +114,10 @@ index 0000000000..432b0226eb
 +    monkeypatch.setenv("VLLM_XPU_C1_TARGET_GRAPH", "0")
 +    assert tg.capture_reserve_bytes(_runner()) == 0
 diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
-index 7ed41740af..5a59a83725 100644
+index 7ed41740af..2c3284c513 100644
 --- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
 +++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
-@@ -70,13 +70,65 @@ def qsa_side_snapshot(side):
+@@ -70,13 +70,64 @@ def qsa_side_snapshot(side):
      ]
  
  
@@ -127,8 +125,7 @@ index 7ed41740af..5a59a83725 100644
 +# RAM, moved through the device in chunks of at most this many bytes. On the device
 +# they were 2 x (requests x (1 + K) state blocks x every GDN layer): ~0.45 GiB per
 +# request per rank at TP2, plus one transient gather copy, none of it seen by the
-+# memory profiler; TP2 warm-up (3 requests) OOMed at the second gather (W5 f,
-+# two-engines run). Bytes are copied exactly, so every check below is unchanged.
++# memory profiler; TP2 warm-up (3 requests) OOMed at the second gather. Bytes are copied exactly, so every check below is unchanged.
 +SNAPSHOT_CHUNK_BYTES = 256 << 20
 +
 +
@@ -187,7 +184,7 @@ index 7ed41740af..5a59a83725 100644
  
  
  def clone_output(value):
-@@ -284,10 +336,7 @@ class TargetGraphs:
+@@ -284,10 +335,7 @@ class TargetGraphs:
              graph.replay()
              torch.xpu.synchronize()
              # Check every state exactly without another full observed-state copy.
@@ -200,7 +197,7 @@ index 7ed41740af..5a59a83725 100644
                  side_replayed = qsa_side_snapshot(side)
                  bad = [
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 188fe9a8d8..709c783390 100644
+index 188fe9a8d8..e0ece8e854 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -630,6 +630,36 @@ class Worker(WorkerBase):
@@ -222,7 +219,7 @@ index 188fe9a8d8..709c783390 100644
 +            return
 +        # Only touch the device when the profiled transient peak does not already
 +        # cover the footprint: a large allocate/free is not side-effect free here
-+        # (it moved non-torch memory by ~85 MB on two TP4 ranks in the W6 gate).
++        # (an unconditional allocation is not needed).
 +        headroom = torch.accelerator.max_memory_allocated(
 +            self.device
 +        ) - torch.accelerator.memory_allocated(self.device)

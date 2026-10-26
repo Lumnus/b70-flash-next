@@ -1,0 +1,74 @@
+From 831ed31ddc813f54cea3cb2df403837c918bb836 Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:38:05 +0000
+Subject: [PATCH 06/13] B70-0046: per-step decode route trace
+ (B70_MOE_ROUTE_TRACE), a diagnostic for expert-cache studies
+
+With B70_MOE_ROUTE_COUNT=1, B70_MOE_ROUTE_TRACE=<path> writes <path>-rank<r>.jsonl: the cold set of every layer,
+then one line per decode step with the experts each layer's decode graph routed to. Read on the host after the
+runner's per-step sync. Off by default; used for the fixed-pool prefetch study (docs/two-cards.md, round 5).
+
+Port to 0.32 (from Niluthon/qwen38-flash-tp2@e536e33, Apache-2.0, via our 0.30 carry): maybe_trace_routes() sits with the other hot/cold host hooks at the top of Qwen4ExpModelState.prepare_inputs.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 34 +++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/model_state.py   |  2 ++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index 3c41aff087..db110f3fda 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -184,6 +184,40 @@ def route_count_enabled() -> bool:
+     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
+ 
+ 
++_TRACE = {"f": None, "last": None, "steps": 0}
++
++
++def maybe_trace_routes() -> None:
++    """B70_MOE_ROUTE_TRACE=<path>: one JSON line per decode step with the experts each
++    layer's decode graph routed to in that step (needs B70_MOE_ROUTE_COUNT=1). Measurement only."""
++    path = os.environ.get("B70_MOE_ROUTE_TRACE", "")
++    if not path or not _COUNTED or not _COUNTED[0].count_graphs:
++        return
++    import numpy as np
++
++    counts = np.stack([p.route_counts[1, :-1].cpu().numpy() for p in _COUNTED])
++    if _TRACE["f"] is None:
++        try:
++            from vllm.distributed import get_tensor_model_parallel_rank
++            rank = get_tensor_model_parallel_rank()
++        except Exception:
++            rank = 0
++        _TRACE["f"] = open(f"{path}-rank{rank}.jsonl", "w")
++        cold = {str(p.layer_idx): np.nonzero(p.cold_map.cpu().numpy() >= 0)[0].tolist() for p in _COUNTED}
++        _TRACE["f"].write(json.dumps({"cold": cold}) + "\n")
++        _TRACE["last"] = counts
++        return
++    delta = counts - _TRACE["last"]
++    _TRACE["last"] = counts
++    if delta.sum() == 0:
++        return
++    step = {str(p.layer_idx): np.nonzero(delta[i])[0].tolist() for i, p in enumerate(_COUNTED)}
++    _TRACE["f"].write(json.dumps(step) + "\n")
++    _TRACE["steps"] += 1
++    if _TRACE["steps"] % 200 == 0:
++        _TRACE["f"].flush()
++
++
+ def maybe_dump_routes() -> None:
+     """Log the cold share of routes and write the cumulative counts (every
+     B70_MOE_ROUTE_COUNT_S seconds). Called by the runner on the host right
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index c9149affac..b25ba9e9ff 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -120,6 +120,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
+         from vllm.model_executor.layers.fused_moe import b70_hotcold
+ 
+         b70_hotcold.maybe_dump_routes()
++        # B70 0046: diagnostic; one .cpu() per step while B70_MOE_ROUTE_TRACE is set.
++        b70_hotcold.maybe_trace_routes()
+         # B70 0043: every B70_MOE_HOTCOLD_SWAP_S; its first .cpu() waits for the previous step.
+         b70_hotcold.maybe_swap()
+         if not self.uses_ngram_embedding:

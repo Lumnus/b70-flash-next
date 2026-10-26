@@ -1,0 +1,262 @@
+From d9f8558b4f0d6228de03273bf5b7b6b7c94a7e2a Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:45:21 +0000
+Subject: [PATCH 07/13] B70-0047: decode-aware expert ranking and a learned hot
+ set that survives restarts
+
+B70_MOE_HOTCOLD_SWAP_SOURCE=decode (with B70_MOE_ROUTE_COUNT=1) scores experts by the routes of the decode graphs
+plus B70_MOE_HOTCOLD_SWAP_PREFILL_W (0.1) x the prefill routes, each normalised per layer and period: prefill
+batches >= 512 tokens read the whole cold set from the 0042 VRAM slots, so only decode pays for a cold expert.
+The route counter in the decode graphs is two kernels per layer (remainder + index_add_ from a static ones buffer)
+instead of four; measured cost within noise (ms/step 49.5/59.1/47.9/45.5 vs 49.5/59.3/46.9/44.9).
+
+B70_MOE_HOTCOLD_STATE=<prefix> keeps a long-term score per expert (decay B70_MOE_HOTCOLD_STATE_DECAY 0.999 per
+active period, idle time does not decay it), writes <prefix>-rank<R>.json every B70_MOE_HOTCOLD_STATE_S (300) s;
+the next boot places the hot set by it (checkpoint order as a 0.05 prior, B70_MOE_HOTCOLD_STATE_PRIOR) once it
+holds B70_MOE_HOTCOLD_STATE_MIN_PERIODS (12) active periods, and seeds the short-term score with it.
+
+Measured on 2x B70 (146 hot, 262K context, KV 279,001 unchanged), one run each: decode cold share in code agent
+sessions 8-10 % -> 6-8 %; 12 sessions at 2 concurrent requests (adapted run) 94.1 -> 99.5 / 100.2 tok/s total;
+general prompts after the code sessions 69.9 -> 113-115 tok/s at 4 streams; first requests after a restart with
+the learned state 55.3 -> 60.7 tok/s mean at 1 stream.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 153 +++++++++++++++++-
+ .../layers/fused_moe/experts/xpu_moe.py       |   7 +-
+ 2 files changed, 151 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index db110f3fda..e2628c6941 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -57,6 +57,45 @@ def _rankings() -> dict[int, list[int]]:
+     return {int(k): [int(e) for e in v] for k, v in raw.items()}
+ 
+ 
++def _rank() -> int:
++    try:
++        from vllm.distributed import get_tensor_model_parallel_rank
++        return get_tensor_model_parallel_rank()
++    except Exception:
++        return 0
++
++
++@cache
++def _learned_state() -> dict | None:
++    """B70 0047: the long-term scores the swapper saved (all ranks merged; each rank's file holds only its
++    own experts), or None (off, missing, or fewer than B70_MOE_HOTCOLD_STATE_MIN_PERIODS active periods)."""
++    import glob
++
++    prefix = os.environ.get("B70_MOE_HOTCOLD_STATE", "")
++    if not prefix:
++        return None
++    layers: dict[int, dict[int, float]] = {}
++    periods = None
++    for path in sorted(glob.glob(f"{glob.escape(prefix)}-rank*.json")):
++        try:
++            with open(path) as handle:
++                raw = json.load(handle)
++        except (OSError, ValueError) as err:
++            logger.warning("B70 hot/cold: ignoring state %s: %s", path, err)
++            continue
++        periods = int(raw.get("periods", 0)) if periods is None else min(periods, int(raw.get("periods", 0)))
++        for layer, scores in raw.get("layers", {}).items():
++            layers.setdefault(int(layer), {}).update({int(g): float(s) for g, s in scores.items()})
++    need = int(os.environ.get("B70_MOE_HOTCOLD_STATE_MIN_PERIODS", "12"))
++    if not layers or periods is None or periods < need:
++        if layers:
++            logger.info("B70 hot/cold: state %s has %s active periods (< %d): not used", prefix, periods, need)
++        return None
++    logger.info("B70 hot/cold: hot sets from the learned state %s (%d layers, %d active periods)",
++                prefix, len(layers), periods)
++    return {"periods": periods, "layers": layers}
++
++
+ class _PinnedArena:
+     """Pinned host memory carved from 1 GiB chunks (first fit, 4 KiB aligned).
+ 
+@@ -184,6 +223,18 @@ def route_count_enabled() -> bool:
+     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
+ 
+ 
++_ONES: dict = {}  # device -> static int64 ones for the route counter (allocated at load time)
++_ONES_N = 1 << 16
++
++
++def route_ones(n: int, device) -> torch.Tensor:
++    """n int64 ones for index_add_: a slice of one static buffer (no fill kernel per layer)."""
++    buf = _ONES.get(str(device))
++    if buf is None or n > buf.numel():
++        return torch.ones(n, dtype=torch.int64, device=device)
++    return buf[:n]
++
++
+ _TRACE = {"f": None, "last": None, "steps": 0}
+ 
+ 
+@@ -308,8 +359,52 @@ class _Swapper:
+         self.t = 0.0
+         self.ready = False
+         self.disabled = False
++        self.saved_t = 0.0
++        self.periods = 0
++
++    # B70 0047 (decode-aware ranking): B70_MOE_HOTCOLD_SWAP_SOURCE=decode scores by the routes of the decode
++    # graphs (needs B70_MOE_ROUTE_COUNT=1) plus B70_MOE_HOTCOLD_SWAP_PREFILL_W x the prefill routes, each
++    # normalised per layer and period. Large prefill batches read the whole cold set from the 0042 VRAM slots
++    # anyway, so only decode (and small batches) pay for a cold expert. B70_MOE_HOTCOLD_STATE=<prefix> keeps a
++    # long-term score per expert (decay B70_MOE_HOTCOLD_STATE_DECAY per active period), writes it to
++    # <prefix>-rank<R>.json every B70_MOE_HOTCOLD_STATE_S seconds; the next boot places the hot set by it
++    # (maybe_plan) and seeds the short-term score with it, so a restart starts from this host's traffic.
++
++    def _combined(self, plan, np):
++        """This period's score mass per global expert."""
++        counts = plan.route_counts[:, :-1].cpu().numpy()
++        delta, plan.last_counts = counts - plan.last_counts, counts.copy()
++        if self.source != "decode":
++            return delta[0].astype(np.float64)
++        pre, dec = delta[0].astype(np.float64), delta[1].astype(np.float64)
++        out = np.zeros(plan.num_global)
++        if dec.sum() > 0:
++            out += dec / dec.sum()
++        if pre.sum() > 0 and self.prefill_w > 0:
++            out += self.prefill_w * pre / pre.sum()
++        return out
++
++    def _save_state(self, np) -> None:
++        rank = _rank()
++        layers = {}
++        for plan in self.plans:
++            layers[str(plan.layer_idx)] = {str(int(g)): round(float(plan.lt[g]), 6)
++                                           for g in plan.local_globals if plan.lt[g] > 0}
++        path = f"{self.state_path}-rank{rank}.json"
++        tmp = path + ".tmp"
++        periods = self.periods + self.prev_periods
++        try:
++            with open(tmp, "w") as handle:
++                json.dump({"version": 1, "source": self.source, "periods": periods, "layers": layers}, handle)
++            os.replace(tmp, path)
++        except OSError as err:
++            logger.warning("B70 hot/cold: cannot write %s: %s", path, err)
++            return
++        logger.info("B70 hot/cold state rank %d: saved %s (%d active periods)", rank, path, periods)
+ 
+     def _setup(self) -> bool:
++        import time
++
+         import numpy as np
+ 
+         plans = [_PLANS[k] for k in sorted(_PLANS)]
+@@ -334,8 +429,9 @@ class _Swapper:
+             for g in np.nonzero(cold_map >= 0)[0]:
+                 plan.cold_owner[cold_map[g]] = g
+             plan.local_globals = np.sort(np.concatenate([plan.hot_owner, plan.cold_owner]))
+-            plan.last_counts = plan.route_counts[0, :-1].cpu().numpy().copy()
++            plan.last_counts = plan.route_counts[:, :-1].cpu().numpy().copy()
+             plan.ema = np.zeros(plan.num_global)
++            plan.lt = np.zeros(plan.num_global)
+             ranked = [g for g in _rankings().get(plan.layer_idx, []) if g in set(plan.local_globals.tolist())]
+             plan.prior = np.zeros(plan.num_global)
+             for i, g in enumerate(ranked):
+@@ -346,9 +442,34 @@ class _Swapper:
+         self.decay = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_DECAY", "0.95"))
+         self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "8"))
+         self.prior_weight = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_PRIOR", "0.01"))
++        self.source = os.environ.get("B70_MOE_HOTCOLD_SWAP_SOURCE", "prefill")
++        if self.source == "decode" and not plans[0].count_graphs:
++            logger.warning("B70 hot/cold swap: SOURCE=decode needs B70_MOE_ROUTE_COUNT=1; using prefill")
++            self.source = "prefill"
++        self.prefill_w = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_PREFILL_W", "0.1"))
++        self.state_path = os.environ.get("B70_MOE_HOTCOLD_STATE", "")
++        self.state_decay = float(os.environ.get("B70_MOE_HOTCOLD_STATE_DECAY", "0.999"))
++        self.state_period = float(os.environ.get("B70_MOE_HOTCOLD_STATE_S", "300"))
++        self.saved_t = time.monotonic()  # the first save after one full state period of uptime
++        self.prev_periods = 0
++        seeded = 0
++        state = _learned_state()
++        if state:
++            self.prev_periods = int(state["periods"])
++            for plan in plans:
++                learned = state["layers"].get(plan.layer_idx, {})
++                for g in plan.local_globals:
++                    plan.lt[g] = learned.get(int(g), 0.0)
++                total = plan.lt.sum()
++                if total > 0 and self.source == "decode":
++                    # the steady state of the short-term score under the long-term distribution
++                    plan.ema = plan.lt / total * (1 + self.prefill_w) / max(1 - self.decay, 1e-3)
++                    seeded += 1
+         self.total = 0
+-        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer, prior %.3f",
+-                    self.period, self.decay, self.budget, self.prior_weight)
++        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer, prior %.3f, "
++                    "source %s (prefill weight %.2f), state %s (%d layers seeded, %d earlier periods)",
++                    self.period, self.decay, self.budget, self.prior_weight, self.source, self.prefill_w,
++                    self.state_path or "off", seeded, self.prev_periods)
+         return True
+ 
+     def _swap(self, plan, a: int, b: int) -> None:
+@@ -386,11 +507,21 @@ class _Swapper:
+             return
+         self.t = now
+         t0 = time.perf_counter()
+-        scores = []
++        active = False
+         for plan in self.plans:
+-            counts = plan.route_counts[0, :-1].cpu().numpy()
+-            delta, plan.last_counts = counts - plan.last_counts, counts.copy()
++            delta = self._combined(plan, np)
++            if delta.sum() <= 0 and self.source == "decode":
++                continue  # no traffic on this layer: keep the scores (idle time does not decay them)
++            active = active or delta.sum() > 0
+             plan.ema = self.decay * plan.ema + delta
++            if self.state_path:
++                total = delta.sum()
++                plan.lt = self.state_decay * plan.lt + delta / total
++        if active:
++            self.periods += 1
++        if self.state_path and active and now - self.saved_t >= self.state_period:
++            self.saved_t = now
++            self._save_state(np)
+         top = max(float(p.ema.max()) for p in self.plans) or 1.0
+         moves = []
+         for plan in self.plans:
+@@ -536,6 +667,8 @@ class HotColdPlan:
+                                             device=device)
+             self.count_graphs = os.environ.get("B70_MOE_ROUTE_COUNT") == "1"
+             _COUNTED.append(self)
++            if str(device) not in _ONES:
++                _ONES[str(device)] = torch.ones(_ONES_N, dtype=torch.int64, device=device)
+ 
+         experts = getattr(moe_kernel, "fused_experts", None)
+         if experts is None or not hasattr(experts, "b70_apply_hotcold"):
+@@ -629,5 +762,13 @@ def maybe_plan(layer_name: str, moe_config, expert_map_manager,
+     ranked = [g for g in _rankings().get(layer_idx, []) if local_of.get(g, -1) >= 0]
+     seen = set(ranked)
+     ranked += [g for g in global_ids if g not in seen]  # never observed: by id
++    state = _learned_state()
++    learned = state["layers"].get(layer_idx, {}) if state else {}
++    if learned:
++        # this host's long-term scores first, the checkpoint order as a small prior (and the tie-break)
++        top = max(learned.values()) or 1.0
++        w = float(os.environ.get("B70_MOE_HOTCOLD_STATE_PRIOR", "0.05"))
++        prior = {g: 1 - i / len(ranked) for i, g in enumerate(ranked)}
++        ranked = sorted(ranked, key=lambda g: -(learned.get(g, 0.0) / top + w * prior[g]))
+     hot_local = [local_of[g] for g in ranked[:hot_count]]
+     return HotColdPlan(layer_name, local_ids, global_ids, num_global, hot_local)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index 7e73133f50..b58b6adc33 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -442,9 +442,10 @@ class XPUExpertsWNA16(XPUExperts):
+             # eager counting starts with the first real batch: the memory-profiling run must not pay for it
+             if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
+                 row = counts[1 if graph else 0]
+-                ids = topk_ids.reshape(-1).long()
+-                ids = torch.where(ids >= 0, ids, row.shape[0] - 1)
+-                row.index_add_(0, ids, torch.ones_like(ids))
++                # two kernels (inside the decode graphs too): negative (padding) ids land in the last
++                # bucket via remainder, and the ones come from a shared static buffer
++                ids = topk_ids.reshape(-1).remainder(row.shape[0])
++                row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
+ 
+ 
+ class XPUExpertsMxFp4(XPUExperts):

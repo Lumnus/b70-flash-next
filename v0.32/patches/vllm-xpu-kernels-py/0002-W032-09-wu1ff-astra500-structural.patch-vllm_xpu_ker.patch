@@ -1,7 +1,7 @@
-From eced9cb2c593bfaaf5869b5478aa2d05f7f428f3 Mon Sep 17 00:00:00 2001
+From 4c71742bd506eaa8a8cc0628386c11e3e21d0d57 Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 2/7] W032-09: wu1ff astra500-structural.patch
+Subject: [PATCH 2/9] W032-09: wu1ff astra500-structural.patch
  (vllm_xpu_kernels/ hunks)
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-structural.patch. MIT.
@@ -13,7 +13,7 @@ Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model
 
 diff --git a/vllm_xpu_kernels/astra_structural.py b/vllm_xpu_kernels/astra_structural.py
 new file mode 100644
-index 0000000..20f75b0
+index 0000000000..20f75b0639
 --- /dev/null
 +++ b/vllm_xpu_kernels/astra_structural.py
 @@ -0,0 +1,47 @@
@@ -65,7 +65,7 @@ index 0000000..20f75b0
 +    )
 +    return True
 diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
-index 810b6f4..a74739a 100644
+index e761195e10..5bcfcf5b28 100644
 --- a/vllm_xpu_kernels/fused_moe_interface.py
 +++ b/vllm_xpu_kernels/fused_moe_interface.py
 @@ -5,6 +5,7 @@ from typing import Optional
@@ -86,6 +86,3 @@ index 810b6f4..a74739a 100644
          num_rows, hidden_size = hidden_states.shape
          num_moe_inputs = self.n_experts_per_token * num_rows
          act_quant = a1q_scale is not None
--- 
-2.43.0
-

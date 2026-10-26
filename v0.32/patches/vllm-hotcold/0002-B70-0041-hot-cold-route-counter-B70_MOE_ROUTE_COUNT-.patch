@@ -1,0 +1,125 @@
+From 6e63273bfb1c644a08cbf05a1cebc197b42f334e Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:10:27 +0000
+Subject: [PATCH 02/13] B70-0041: hot/cold route counter (B70_MOE_ROUTE_COUNT):
+ cold share of routed experts, per layer counts as JSON
+
+Each hot/cold layer adds its topk_ids to a per-layer device counter (works inside FULL graph replays,
+where no Python runs). The runner reads the counters on the host right after the per-step sync it already
+does for the NVMe PLE path, every B70_MOE_ROUTE_COUNT_S seconds (default 60), logs the share of this
+rank's routes that went to cold (pinned host) experts and writes the cumulative counts to
+B70_MOE_ROUTE_COUNT_PATH-rank<r>.json. Off by default; with it off nothing changes.
+
+Port to 0.32 (from Niluthon/qwen38-flash-tp2@e536e33, Apache-2.0, via our 0.30 carry): the per-period host read (maybe_dump_routes) moves to the top of Qwen4ExpModelState.prepare_inputs; 0.32 has no NVMe-PLE host sync at the old place, so the read syncs once per B70_MOE_ROUTE_COUNT_S period.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 55 +++++++++++++++++++
+ .../layers/fused_moe/experts/xpu_moe.py       |  5 ++
+ vllm/models/qwen4_exp/nvidia/model_state.py   |  6 ++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index f078e32d11..0f4098e40f 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -93,6 +93,55 @@ class _PinnedArena:
+ 
+ _ARENA = _PinnedArena()
+ _FINALIZED: list[str] = []
++_COUNTED: list["HotColdPlan"] = []  # plans with a route counter (B70_MOE_ROUTE_COUNT)
++_DUMP = {"t": 0.0}
++
++
++def route_count_enabled() -> bool:
++    return os.environ.get("B70_MOE_ROUTE_COUNT", "0") == "1"
++
++
++def maybe_dump_routes() -> None:
++    """Log the cold share of routes and write the cumulative counts (every
++    B70_MOE_ROUTE_COUNT_S seconds). Called by the runner on the host right
++    after its per-step sync, so the .cpu() below does not stall the GPU."""
++    import time
++
++    if not _COUNTED:
++        return
++    now = time.monotonic()
++    period = float(os.environ.get("B70_MOE_ROUTE_COUNT_S", "60"))
++    if _DUMP["t"] == 0.0:
++        _DUMP["t"] = now
++        return
++    if now - _DUMP["t"] < period:
++        return
++    _DUMP["t"] = now
++    try:
++        from vllm.distributed import get_tensor_model_parallel_rank
++        rank = get_tensor_model_parallel_rank()
++    except Exception:
++        rank = 0
++    out, local_all, cold_all, per_layer = {}, 0, 0, []
++    for plan in _COUNTED:
++        counts = plan.route_counts[:-1].cpu()
++        local = (plan.hot_map >= 0).cpu() | (plan.cold_map >= 0).cpu()
++        cold = (plan.cold_map >= 0).cpu()
++        n_local, n_cold = int(counts[local].sum()), int(counts[cold].sum())
++        local_all += n_local
++        cold_all += n_cold
++        per_layer.append((n_cold / n_local) if n_local else 0.0)
++        match = _LAYER_RE.search(plan.layer_name)
++        out[match.group(1) if match else plan.layer_name] = counts.tolist()
++    share = cold_all / local_all if local_all else 0.0
++    worst = sorted(range(len(per_layer)), key=lambda i: -per_layer[i])[:3]
++    logger.info("B70 routes rank %d: %d local routes, cold share %.3f (layers min %.3f max %.3f; "
++                "worst %s)", rank, local_all, share, min(per_layer), max(per_layer),
++                ", ".join(f"{i}:{per_layer[i]:.2f}" for i in worst))
++    path = os.environ.get("B70_MOE_ROUTE_COUNT_PATH", "")
++    if path:
++        with open(f"{path}-rank{rank}.json", "w") as handle:
++            json.dump(out, handle)
+ 
+ 
+ def _pin(t: torch.Tensor) -> torch.Tensor:
+@@ -214,6 +263,12 @@ class HotColdPlan:
+             (cold_map if is_cold else hot_map)[self.local_to_global[local_id]] = slot
+         self.hot_map = hot_map.to(device)
+         self.cold_map = cold_map.to(device)
++        self.route_counts = None
++        if route_count_enabled():
++            # one bucket per global expert + one for negative (padding) ids
++            self.route_counts = torch.zeros(self.num_global + 1, dtype=torch.int64,
++                                            device=device)
++            _COUNTED.append(self)
+ 
+         experts = getattr(moe_kernel, "fused_experts", None)
+         if experts is None or not hasattr(experts, "b70_apply_hotcold"):
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index 4e1d3da2b1..ed7632bcd1 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -434,6 +434,11 @@ class XPUExpertsWNA16(XPUExperts):
+         cold.apply(output=cold_out, hidden_states=hidden_states,
+                    topk_weights=topk_weights, topk_ids=topk_ids)
+         output.add_(cold_out)
++        counts = self.b70_hotcold.route_counts
++        if counts is not None:
++            ids = topk_ids.reshape(-1).long()
++            ids = torch.where(ids >= 0, ids, counts.shape[0] - 1)
++            counts.index_add_(0, ids, torch.ones_like(ids))
+ 
+ 
+ class XPUExpertsMxFp4(XPUExperts):
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 659f6798f9..71a4c8c75d 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -114,6 +114,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
+         req_states: RequestState,
+     ) -> dict[str, Any]:
+         model_inputs = super().prepare_inputs(input_batch, req_states)
++        # B70 0041 (0.32 port): hot/cold route counts, read on the host every B70_MOE_ROUTE_COUNT_S.
++        # Returns at once when no layer counts; its .cpu() syncs once per period (0.30 called it
++        # right after the NVMe PLE host sync, which 0.32 does not have in that form).
++        from vllm.model_executor.layers.fused_moe import b70_hotcold
++
++        b70_hotcold.maybe_dump_routes()
+         if not self.uses_ngram_embedding:
+             return model_inputs
+ 

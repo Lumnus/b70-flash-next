@@ -1,13 +1,37 @@
-**0.32.0-b70.4**: one engine, two presets plus parameters. Both attention variants of the 0.32 line work, on one code base.
+**0.32.0-b70.4**: one engine, one environment, two presets. Qwen3.8-Flash-Next on Intel Arc Pro B70, vLLM v0.32.0.
 
-**Presets and parameters.** `v0.32/engines/preset-4card.{args,env}`: tensor parallel 4, sparse attention, DFlash2 K=7, 12 sequences, 128 GiB KV tier. `v0.32/engines/preset-2card.{args,env}`: the 2-card layout that frees the other pair of cards for any other model; **a placeholder in this release tree until its measured values are filled in** (every `TODO-2CARD` line). Attention (sparse default, dense), cards, drafter (DFlash K=7, MTP), expert offload, KV offload size, slots, GPU memory and two opt-outs are parameters, in one table with defaults and what each was measured at: `v0.32/README.md` §Parameters. The five engine files of b70.1–b70.3 (`serve.*`, `serve-plugin.env`, `qsa-serve.*`) are gone; the stock-plugin configuration is a parameter value.
+**Presets** (measured on 2026-10-26 with this engine and environment, Intel AutoRound, single runs, greedy):
 
-**Dense** (`v0.32/patches/vllm/`, 50 patches; fork tag `v0.32.0-b70.4-dense`). 0001–0049 unchanged from 0.32.0-b70.1. New **0050** backports vllm-project/vllm#54163 (merged upstream 2026-10-23): DFlash and DSpark no longer drop the trailing prefix-cache block, so `disable_eagle_block_drop` is not set any more.
+| | `preset-4card` | `preset-2card` |
+|---|---|---|
+| cards | 4 (TP 4) | 2 (TP 2); the other pair stays free for any other model |
+| attention, slots, context | sparse, 12, 262,144 | sparse, 4, 262,144 |
+| expert offload | off | hot/cold, 145 of 256 experts per layer per rank in host RAM |
+| KV tier (host RAM) | 128 GiB | 16 GiB |
+| decode 1 / 4 / 8 streams (tok/s) | 156.4 / 287.4 / 580.9 | 58.2 / 69.4 / 109.2 |
+| GPU KV cache (tokens) | 344,021 | 273,169 |
+| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB |
 
-**Sparse (QSA)** (`v0.32/patches/vllm-qsa/`, 38 patches; fork tag `v0.32.0-b70.4`; working, experimental). 0033/0036: the packed KV bucket is split into 66 groups of 905,216 B blocks, on by default (`B70_KV_SPLIT_GROUPS=0` restores the old packing); GPU KV 344,706 tokens, replay GPU prefix hit rate about 0.37 to about 0.46, output unchanged. 0034 `B70_QSA_OPTIMER` (off), 0035 lifecycle driver. **Three trunk fixes since the first prep:** 0037 C1 target-graph capture snapshots in host RAM (the TP2 warm-up ran out of memory without it); 0038 the DFlash draft KV page at TP2 no longer sets every block (`B70_KV_DRAFT_PAGE_FIT=0` opts out; no effect at TP4); and B70-V32-HC3, hot/cold cold prefetch never inside graph capture (trunk code; the hot/cold code is not in this kit's exported series).
+Attention (sparse default, dense), cards, drafter, expert offload, KV offload size, slots and GPU memory are parameters of the
+same engine, each with its default and what it was measured at: `v0.32/README.md` §Parameters.
 
-**Kernels.** vllm-xpu-kernels **0.1.16.2** (PyPI) plus our `libgdn_index64.so`; 0.1.15.4 is retired. Upstream #658 is merged on main but not in a release, and the wheel lacks it; the engine does not need it, because its GDN op (`torch.ops._gdn_index64`) comes from our library, which passes the 64-bit conv-state tests 3 of 3 where the wheel's stock op fails them. The wheel also lacks #660 (covered by our library), #662 (KV-offload loads copy through a snapshot) and the astra hooks in `fused_moe_interface.py`; see `v0.32/README.md` known issue 8.
+**Engine.** Fork tag `v0.32.0-b70.4`, 101 commits on vLLM v0.32.0, in three directories: `v0.32/patches/vllm/` (50, the dense
+base; new 0050 backports vllm-project/vllm#54163, so DFlash keeps its trailing prefix-cache block), `v0.32/patches/vllm-qsa/`
+(38, sparse attention; new: the KV split patches 0033 and 0036, the per-op timer 0034, the lifecycle driver 0035, C1 snapshots
+in host RAM 0037, the DFlash draft page at TP2 0038) and `v0.32/patches/vllm-hotcold/` (13, new: Niluthon's hot/cold expert
+offload from qwen38-flash-tp2 with his authorship, plus our cold-count and graph-capture fixes).
 
-**Numbers.** The speed and replay numbers were measured on the 0.1.15.4 kernel build with the identical trunk. The 0.1.16.2 build passed the gate with det2 identical (GPU KV 345,392 tokens, gate PASS, `_gdn_index64` 3/3) and was not re-measured. Sparse against dense, same trunk code, back-to-back boots: agent-session replay about 205 s against about 232 s (median decode 61–69 against 45–52 tok/s); short context 0.90–0.97× dense; long prefill 131K 1.06×, 260K 1.31×; long-context tasks (384 items) equal up to 8K, 128K 80/78 % against 72/72 %; GPU KV 344,706 against 397,309 tokens. Dense at 12 slots was measured in the K3 window (KV 385,685, replay 232 s), not on 0.1.16.2. Not measured: generation or reasoning quality against dense, a multi-day run, the stock oneCCL plugin with sparse, the 2-card preset's speed. Details: `docs/measurements/v0.32-qsa.md` §0.
+**Environment.** vllm-xpu-kernels 0.1.16.2 rebuilt from its source with our #660 and #662 (`v0.32/patches/vllm-xpu-kernels/`),
+the attention libraries from the PyPI wheel, the astra Python modules (`v0.32/patches/vllm-xpu-kernels-py/`, now written
+against 0.1.16.2), and our `libgdn_index64.so` for the 64-bit GDN offsets: #658 is merged upstream on main only, in no release.
+torch 2.14.0+xpu, compute-runtime 26.35.39758.10, the oneCCL legacy plugin rebuilt with oneCCL #229.
 
-**Tooling.** `tools/check-trunk-tree.sh` gains `--hotcold-tip` and `--hotcold-extra`; `v0.32/scripts/check-series.sh` and `--qsa` default to the b70.4 refs.
+**Sparse against dense**, identical engine code, measured on the 0.1.15.4 kernel build (the 0.1.16.2 environment passed the
+gate with the token compare identical): agent-session replay 204.7 s against 230–235 s; one-stream decode 0.92×, 4 streams
+level, 8 streams 0.93×, prefill up to 32K 0.89×; prefill 131K 1.06×, 260K 1.31×; long-context tasks equal up to 8K, 80/78 %
+against 72/72 % at 128K. Details: `docs/measurements/v0.32-qsa.md` §0.
+
+**Not measured:** a multi-day run; the agent replay and long prefill on the 0.1.16.2 environment; dense attention at 12 slots on
+it; the stock oneCCL plugin with sparse attention; generation or reasoning quality of sparse against dense.
+
+Build recipe: `v0.32/README.md` §Build and run. Changes in full: `CHANGELOG.md`.

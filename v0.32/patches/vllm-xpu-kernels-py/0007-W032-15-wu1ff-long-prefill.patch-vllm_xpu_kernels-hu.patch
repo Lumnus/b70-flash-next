@@ -1,7 +1,7 @@
-From c56d2ea1aa5e10d21195b815511a7b040b7cdc2b Mon Sep 17 00:00:00 2001
+From 89a790e9c4ec5be45bf43443c93fd449291fd4dc Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 7/7] W032-15: wu1ff long-prefill.patch (vllm_xpu_kernels/
+Subject: [PATCH 7/9] W032-15: wu1ff long-prefill.patch (vllm_xpu_kernels/
  hunks)
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/long-prefill.patch. MIT.
@@ -10,7 +10,7 @@ Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model
  1 file changed, 5 insertions(+), 2 deletions(-)
 
 diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
-index 8ec44bb..ca21df9 100644
+index 8ec44bb82b..ca21df9bb7 100644
 --- a/vllm_xpu_kernels/astra_ownership.py
 +++ b/vllm_xpu_kernels/astra_ownership.py
 @@ -16,6 +16,7 @@ torch.ops.load_library(str(Path(__file__).with_name('libastra_batch.so')))
@@ -35,6 +35,3 @@ index 8ec44bb..ca21df9 100644
          return
      # Each selected expert has one group here, plus a second for one rank.
      # Expand to at most 20 local routes, not 50 global virtual-expert routes.
--- 
-2.43.0
-

@@ -1,0 +1,223 @@
+From 587febca2abfdb76c07cd92f58406fc1c02c8fea Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:28:56 +0000
+Subject: [PATCH 11/13] B70-V32-HC1: hot/cold on 0.32: B70_MOE_COLD_EXPERTS=N
+ (cold per layer per rank), stock -1 remap as a helper, CPU tests
+
+- B70_MOE_COLD_EXPERTS=N names the cold count per layer per rank and wins over B70_MOE_HOT_EXPERTS, so one
+  number means the same VRAM saving at TP4 (N of 128) and TP2 (N of 256). B70_MOE_HOTCOLD=1 without either
+  count keeps everything resident (no plan): the 4-card all-resident layout is unchanged unless a def names N.
+- remap_unrouted(): the 0.32 stock remap of topk_ids == -1, shared by the hot/cold call.
+- tests/model_executor/test_b70_hotcold_v032.py: off unless switched; no count = all resident; EP4 (8, 16 cold)
+  and EP2 (138 cold) plans per rank; COLD wins over HOT; clamping; rankings at EP4; remap_unrouted; the learned
+  state is read per engine prefix (two engines on one host never mix their files).
+---
+ tests/model_executor/test_b70_hotcold_v032.py | 112 ++++++++++++++++++
+ .../layers/fused_moe/b70_hotcold.py           |  40 ++++++-
+ .../layers/fused_moe/experts/xpu_moe.py       |   9 +-
+ 3 files changed, 153 insertions(+), 8 deletions(-)
+ create mode 100644 tests/model_executor/test_b70_hotcold_v032.py
+
+diff --git a/tests/model_executor/test_b70_hotcold_v032.py b/tests/model_executor/test_b70_hotcold_v032.py
+new file mode 100644
+index 0000000000..5e5fd74a73
+--- /dev/null
++++ b/tests/model_executor/test_b70_hotcold_v032.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-V32-HC1: the 0.32 port's additions to the hot/cold plan (CPU only).
++
++Qwen3.8-Flash-Next shapes: 512 routed experts, linear EP placement, TP4 (128 per rank) and TP2 (256 per rank)."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.fused_moe import b70_hotcold
++
++E = 512
++
++
++class _Linear:
++    def __init__(self, rank: int, ep: int):
++        self.rank, self.per = rank, E // ep
++
++    def map_global_to_local(self, g: int) -> int:
++        lo = self.rank * self.per
++        return g - lo if lo <= g < lo + self.per else -1
++
++
++@pytest.fixture
++def xpu(monkeypatch):
++    for var in ("B70_MOE_HOT_EXPERTS", "B70_MOE_COLD_EXPERTS", "B70_MOE_HOTCOLD_RANKINGS",
++                "B70_MOE_HOTCOLD_STATE"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("B70_MOE_HOTCOLD", "1")
++    monkeypatch.setattr("vllm.platforms.current_platform", SimpleNamespace(is_xpu=lambda: True))
++    b70_hotcold._rankings.cache_clear()
++    b70_hotcold._learned_state.cache_clear()
++    yield monkeypatch
++    b70_hotcold._rankings.cache_clear()
++    b70_hotcold._learned_state.cache_clear()
++
++
++def _plan(rank: int, ep: int, layer: int = 5):
++    return b70_hotcold.maybe_plan(f"model.language_model.layers.{layer}.mlp.experts",
++                                  SimpleNamespace(num_experts=E), _Linear(rank, ep), quant_config=object())
++
++
++def test_off_unless_switched(xpu):
++    xpu.delenv("B70_MOE_HOTCOLD")
++    xpu.setenv("B70_MOE_COLD_EXPERTS", "16")
++    assert _plan(0, 4) is None
++
++
++def test_no_count_means_all_resident(xpu):
++    # B70_MOE_HOTCOLD=1 alone keeps every expert in VRAM: the 4-card layout is unchanged
++    assert _plan(0, 4) is None and _plan(1, 2) is None
++
++
++@pytest.mark.parametrize("ep,cold", [(4, 8), (4, 16), (2, 138)])
++def test_cold_count_is_per_rank(xpu, ep, cold):
++    xpu.setenv("B70_MOE_COLD_EXPERTS", str(cold))
++    for rank in range(ep):
++        p = _plan(rank, ep)
++        assert p.num_cold == cold and p.num_hot == E // ep - cold
++        assert sorted(p.hot_local + p.cold_local) == list(range(E // ep))
++
++
++def test_cold_wins_over_hot(xpu):
++    xpu.setenv("B70_MOE_HOT_EXPERTS", "100")
++    xpu.setenv("B70_MOE_COLD_EXPERTS", "16")
++    assert _plan(0, 4).num_cold == 16
++
++
++def test_cold_zero_is_no_plan_and_clamps(xpu):
++    xpu.setenv("B70_MOE_COLD_EXPERTS", "0")
++    assert _plan(0, 4) is None
++    xpu.setenv("B70_MOE_COLD_EXPERTS", "1000")
++    assert _plan(0, 4).num_hot == 1  # never zero hot
++
++
++def test_hot_set_follows_rankings_at_ep4(xpu, tmp_path):
++    # rank 2 owns 256..383; the ranking lists other ranks' experts too (they are ignored)
++    order = [300, 5, 383, 256, 470, 257]
++    path = tmp_path / "r.json"
++    path.write_text(json.dumps({"5": order}))
++    xpu.setenv("B70_MOE_HOTCOLD_RANKINGS", str(path))
++    xpu.setenv("B70_MOE_COLD_EXPERTS", str(128 - 3))
++    p = _plan(2, 4)
++    assert p.hot_local == sorted([300 - 256, 383 - 256, 0])
++
++
++def test_remap_unrouted():
++    ids = torch.tensor([[3, -1], [-1, 7]], dtype=torch.int32)
++    r0 = b70_hotcold.remap_unrouted(ids, 512, 0)
++    r1 = b70_hotcold.remap_unrouted(ids, 512, 3)
++    assert r0.dtype == ids.dtype and r0.tolist() == [[3, 511], [511, 7]]
++    assert r1.tolist() == [[3, 0], [0, 7]]
++    # the sentinel is never owned by the remapping rank (linear placement), so it is -1 in both maps
++    assert _Linear(0, 4).map_global_to_local(511) == -1 and _Linear(3, 4).map_global_to_local(0) == -1
++
++
++def test_learned_state_is_per_engine(xpu, tmp_path):
++    # two engines on one host: each def sets its own B70_MOE_HOTCOLD_STATE prefix; files never mix
++    for eng, score in (("tp2a", 9.0), ("tp2b", 1.0)):
++        for rank in range(2):
++            (tmp_path / f"{eng}-rank{rank}.json").write_text(
++                json.dumps({"periods": 20, "layers": {"5": {str(rank * 256 + 1): score}}}))
++    xpu.setenv("B70_MOE_HOTCOLD_STATE", str(tmp_path / "tp2a"))
++    a = b70_hotcold._learned_state()
++    b70_hotcold._learned_state.cache_clear()
++    xpu.setenv("B70_MOE_HOTCOLD_STATE", str(tmp_path / "tp2b"))
++    b = b70_hotcold._learned_state()
++    assert a["layers"][5] == {1: 9.0, 257: 9.0}
++    assert b["layers"][5] == {1: 1.0, 257: 1.0}
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index 4b6689f8d0..4280b37807 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -21,7 +21,8 @@ Load path (no full-size host or device copy of a layer ever exists):
+     pinned memory and dropped (the host only copies: an all-core CPU repack on
+     both ranks at once was the heaviest burst of the whole boot).
+ 
+-Switches: B70_MOE_HOTCOLD=1, B70_MOE_HOT_EXPERTS=<per layer per rank>,
++Switches: B70_MOE_HOTCOLD=1, B70_MOE_HOT_EXPERTS=<per layer per rank> (or, 0.32 port,
++B70_MOE_COLD_EXPERTS=<cold per layer per rank>, which wins),
+ B70_MOE_HOTCOLD_RANKINGS=<json: layer -> global expert ids, hottest first>.
+ Off (default): nothing here runs.
+ """
+@@ -829,6 +830,40 @@ class HotColdPlan:
+         return self._impls
+ 
+ 
++def hot_count_for(num_local: int) -> int:
++    """B70-V32-HC1: how many of a rank's ``num_local`` experts per layer stay in VRAM.
++
++    B70_MOE_COLD_EXPERTS=N (cold per layer per rank) wins over B70_MOE_HOT_EXPERTS (hot per layer per rank),
++    so one number means the same VRAM saving whatever the EP size: N = 16 is 16 of 128 at TP4 and 16 of
++    256 at TP2. Neither set: everything hot (no plan). Clamped to [1, num_local]."""
++    cold = os.environ.get("B70_MOE_COLD_EXPERTS", "").strip()
++    if cold:
++        hot = num_local - int(cold)
++        if os.environ.get("B70_MOE_HOT_EXPERTS", "").strip():
++            _warn_once("B70 hot/cold: B70_MOE_COLD_EXPERTS=%s wins over B70_MOE_HOT_EXPERTS=%s",
++                       cold, os.environ["B70_MOE_HOT_EXPERTS"])
++    else:
++        hot = int(os.environ.get("B70_MOE_HOT_EXPERTS", str(num_local)))
++    return max(1, min(hot, num_local))
++
++
++_WARNED: set = set()
++
++
++def _warn_once(msg: str, *args) -> None:
++    if msg not in _WARNED:
++        _WARNED.add(msg)
++        logger.warning(msg, *args)
++
++
++def remap_unrouted(topk_ids: torch.Tensor, num_global: int, ep_rank: int) -> torch.Tensor:
++    """B70-V32-HC1: 0.32's stock XPU path sends topk_ids == -1 to an expert this rank does not own (the last
++    expert on rank 0, expert 0 elsewhere: linear EP placement). That expert is -1 in both the hot and the
++    cold map, so both kernel calls skip the row, as the stock call does."""
++    sentinel = num_global - 1 if ep_rank == 0 else 0
++    return torch.where(topk_ids < 0, topk_ids.new_full((), sentinel), topk_ids)
++
++
+ def maybe_plan(layer_name: str, moe_config, expert_map_manager,
+                quant_config) -> HotColdPlan | None:
+     """A plan for this RoutedExperts layer, or None (switch off / not applicable)."""
+@@ -847,8 +882,7 @@ def maybe_plan(layer_name: str, moe_config, expert_map_manager,
+     pairs = sorted((loc, g) for g, loc in local_of.items() if loc >= 0)
+     local_ids = [loc for loc, _ in pairs]
+     global_ids = [g for _, g in pairs]
+-    hot_count = int(os.environ.get("B70_MOE_HOT_EXPERTS", str(len(local_ids))))
+-    hot_count = max(1, min(hot_count, len(local_ids)))
++    hot_count = hot_count_for(len(local_ids))
+     if hot_count >= len(local_ids):
+         return None
+     ranked = [g for g in _rankings().get(layer_idx, []) if local_of.get(g, -1) >= 0]
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index 6f7a1fb47d..fe8e72494f 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -423,11 +423,10 @@ class XPUExpertsWNA16(XPUExperts):
+             activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
+         )
+         if self.moe_config.ep_size > 1:
+-            # 0.32: the stock path remaps topk_ids == -1 to an expert this rank does not own;
+-            # it is -1 in both the hot and the cold map, so both calls skip it.
+-            sentinel = topk_ids.new_tensor(
+-                self.b70_hotcold.num_global - 1 if self.moe_config.ep_rank == 0 else 0)
+-            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
++            # 0.32: the stock remap of topk_ids == -1 (b70_hotcold.remap_unrouted).
++            from vllm.model_executor.layers.fused_moe.b70_hotcold import remap_unrouted
++
++            topk_ids = remap_unrouted(topk_ids, self.b70_hotcold.num_global, self.moe_config.ep_rank)
+         if not (activation.value == "silu" and self.gemm1_clamp_limit is None
+                 and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
+             hot.apply(output=output, hidden_states=hidden_states,

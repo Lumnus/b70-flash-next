@@ -1,7 +1,7 @@
-From ef20c88670f49bc73010ab4be7159c3619279e14 Mon Sep 17 00:00:00 2001
+From f9c14ccf078a9d15df62b940f43bdbba247a4e3c Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 4/7] W032-12: wu1ff astra500-beyond.patch (vllm_xpu_kernels/
+Subject: [PATCH 4/9] W032-12: wu1ff astra500-beyond.patch (vllm_xpu_kernels/
  hunks)
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-beyond.patch. MIT.
@@ -10,7 +10,7 @@ Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model
  1 file changed, 9 insertions(+)
 
 diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
-index 7676e55..7c07034 100644
+index 7676e55225..7c0703447f 100644
 --- a/vllm_xpu_kernels/astra_ownership.py
 +++ b/vllm_xpu_kernels/astra_ownership.py
 @@ -13,6 +13,7 @@ import torch.distributed as dist
@@ -36,6 +36,3 @@ index 7676e55..7c07034 100644
      # Each selected expert has one group here, plus a second for one rank.
      # Expand to at most 20 local routes, not 50 global virtual-expert routes.
      first = (module.ep_rank - ids.remainder(4)).remainder(4)
--- 
-2.43.0
-

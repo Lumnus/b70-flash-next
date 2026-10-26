@@ -1,0 +1,205 @@
+From 451fd842286179bb19bf3dd1841c5ac6b20787ef Mon Sep 17 00:00:00 2001
+From: Niluthon <37350260+Niluthon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:48:10 +0000
+Subject: [PATCH 08/13] B70-0048: fused hot+cold decode MoE op and an FP8 draft
+ head
+
+B70_MOE_DECODE_OP=<path to libb70_moe_decode.so> (kernels/b70-moe-decode in the repository; 1 = next to
+b70_hotcold.py) runs batches of at most B70_MOE_DECODE_OP_MAX_ROWS (16) tokens through one SYCL op that does the
+hot (VRAM) and cold (pinned host, UVA) experts together in three kernels, reading each expert once per layer,
+instead of two XpuFusedMoe calls (~56 us fixed cost each before any weight byte). Only for silu without a clamp;
+anything else, or a library that does not load, keeps the stock path. Per layer on one B70 (cold share 0.08):
+1 row 150 -> 66 us, 4 rows 391 -> 241 us, 8 rows 603 -> 397 us, 16 rows 1030 -> 740 us; rel L2 vs stock ~8e-3.
+
+B70_DRAFT_HEAD_FP8=1: the MTP draft passes use an FP8 (E4M3, per vocab row scale) copy of the lm_head shard via
+fp8_gemm_w8a16 (1.08 -> 0.56 ms per pass); the target still verifies with its BF16 head. Built on the first eager
+compute_logits call (the memory profile), so KV accounts for it (279,001 -> 271,647 tokens).
+
+Measured on 2x B70, one boot each (op up to 8 rows): 1 stream 61.4 -> 73.1 tok/s (op) -> 76.6 (op + FP8 draft
+head), ms/step 45.5 -> 39.3 -> 36.6; code agents at 2 concurrent 90.1 -> 106.5 -> 113.3 tok/s; acceptance unchanged.
+
+Port to 0.32 (from Niluthon/qwen38-flash-tp2@e536e33, Apache-2.0, via our 0.30 carry): conflict in b70_apply_hotcold resolved as: 0.32 sentinel remap of topk_ids, then the fused op or the two stock calls. The op library is the one B70-V32-0054 already loads (same env B70_MOE_DECODE_OP, same b70moe.moe_decode signature; V32-0054 passes the hot weights twice, here the cold arguments are the UVA views). B70_DRAFT_HEAD_FP8 (MTP draft only) finds no BF16 head when B70_HEAD_FP8=1 released it and logs off.
+---
+ .../layers/fused_moe/b70_hotcold.py           | 47 ++++++++++++++
+ .../layers/fused_moe/experts/xpu_moe.py       | 12 ++--
+ vllm/models/qwen4_exp/nvidia/mtp.py           | 65 +++++++++++++++++++
+ 3 files changed, 119 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index e2628c6941..8e1d4d001f 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -223,6 +223,29 @@ def route_count_enabled() -> bool:
+     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
+ 
+ 
++_DECODE_OP = {"max_rows": None}
++
++
++def decode_op_max_rows() -> int:
++    """B70 0048: B70_MOE_DECODE_OP=<path to libb70_moe_decode.so> (or 1 = the image's copy) runs batches of at most
++    B70_MOE_DECODE_OP_MAX_ROWS (default 16) tokens through one fused hot+cold kernel set instead of two stock
++    XpuFusedMoe calls; 0 = off (no library loaded)."""
++    rows = _DECODE_OP["max_rows"]
++    if rows is None:
++        rows, lib = 0, os.environ.get("B70_MOE_DECODE_OP", "0")
++        if lib not in ("", "0"):
++            if lib == "1":
++                lib = os.path.join(os.path.dirname(__file__), "libb70_moe_decode.so")
++            try:
++                torch.ops.load_library(lib)
++                rows = min(16, int(os.environ.get("B70_MOE_DECODE_OP_MAX_ROWS", "16")))
++                logger.info("B70 decode op: %s, batches of <= %d tokens", lib, rows)
++            except (OSError, RuntimeError) as e:
++                logger.warning("B70 decode op: cannot load %s (%s); stock path", lib, e)
++        _DECODE_OP["max_rows"] = rows
++    return rows
++
++
+ _ONES: dict = {}  # device -> static int64 ones for the route counter (allocated at load time)
+ _ONES_N = 1 << 16
+ 
+@@ -587,6 +610,7 @@ class HotColdPlan:
+         self.hot_map: torch.Tensor | None = None
+         self.cold_map: torch.Tensor | None = None
+         self._impls = None
++        self._decode_args = None
+ 
+     @property
+     def num_hot(self) -> int:
+@@ -709,6 +733,29 @@ class HotColdPlan:
+                      topk_weights=topk_weights, topk_ids=topk_ids)
+         _PREFETCH.release_and_prefetch(self)
+ 
++    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:
++        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken."""
++        if hidden_states.shape[0] > decode_op_max_rows() or hidden_states.dtype != torch.bfloat16:
++            return False
++        args = self._decode_args
++        if args is False:
++            return False
++        if args is None:
++            hot, cold = self._impls
++            args = (self.hot_map, self.cold_map,
++                    hot.w13, hot.gemm1_wei_scales, hot.w2, hot.gemm2_wei_scales,
++                    cold.w13, cold.gemm1_wei_scales, cold.w2, cold.gemm2_wei_scales)
++            if any(t is None or not t.is_contiguous() for t in args) or any(
++                    t.dtype != torch.bfloat16 for t in args[3::2]):
++                logger.warning("B70 decode op: %s: unexpected weight layout; stock path", self.layer_name)
++                self._decode_args = False
++                return False
++            self._decode_args = args
++        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
++        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
++                                    ids.contiguous(), *args)
++        return True
++
+     def impls(self, w1, w1_scale, w2, w2_scale, topk, activation, extra):
+         """(hot, cold) XpuFusedMoe, built on first use like the stock path."""
+         if self._impls is None:
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index b58b6adc33..6f7a1fb47d 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -428,11 +428,13 @@ class XPUExpertsWNA16(XPUExperts):
+             sentinel = topk_ids.new_tensor(
+                 self.b70_hotcold.num_global - 1 if self.moe_config.ep_rank == 0 else 0)
+             topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+-        hot.apply(output=output, hidden_states=hidden_states,
+-                  topk_weights=topk_weights, topk_ids=topk_ids)
+-        cold_out = torch.empty_like(output)
+-        self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
+-        output.add_(cold_out)
++        if not (activation.value == "silu" and self.gemm1_clamp_limit is None
++                and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
++            hot.apply(output=output, hidden_states=hidden_states,
++                      topk_weights=topk_weights, topk_ids=topk_ids)
++            cold_out = torch.empty_like(output)
++            self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
++            output.add_(cold_out)
+         counts = self.b70_hotcold.route_counts
+         if counts is not None:
+             # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 100d97c1c3..e6521ba6a5 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -469,8 +469,51 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
++        head8 = getattr(self, "_b70_head8", None)
++        if head8 is None and not getattr(self, "_b70_head8_done", False):
++            # Lazily, on the first (eager: profile / warm-up) call: by then the proposer has shared the target's head.
++            self._b70_head8_done = True
++            self._b70_prepare_draft_head()
++            head8 = getattr(self, "_b70_head8", None)
++        if head8 is not None:
++            return self.logits_processor(head8.bind(self.lm_head), hidden_states)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def _b70_prepare_draft_head(self) -> None:
++        """B70 0048: an FP8 (E4M3, one scale per vocab row) copy of this rank's lm_head shard for the draft passes.
++
++        The draft head only proposes tokens; the target verifies every one with its own BF16 head, so outputs are
++        unchanged and only the acceptance rate can move. At decode the head is a pure weight stream (635 MB per card
++        and pass in BF16); fp8_gemm_w8a16 reads half of it at ~93 % of the B70's bandwidth (1.08 -> 0.56 ms per pass).
++        Built on the first compute_logits call, which is the eager memory-profile run (after the proposer shared the
++        target's head), so the KV size accounts for the extra ~320 MB per card."""
++        import os
++
++        from vllm.logger import init_logger
++        from vllm.platforms import current_platform
++
++        logger = init_logger(__name__)
++
++        if os.environ.get("B70_DRAFT_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
++            return
++        weight = getattr(getattr(self, "lm_head", None), "weight", None)
++        if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
++            logger.warning("B70 draft head FP8: no BF16 lm_head weight on the draft; off")
++            return
++        rows, k = weight.shape
++        w8 = torch.empty((k, rows), dtype=torch.float8_e4m3fn, device=weight.device)
++        scale = torch.empty((1, rows), dtype=torch.float32, device=weight.device)
++        step = 8192
++        for i in range(0, rows, step):
++            chunk = weight[i : i + step].float()
++            s = chunk.abs().amax(dim=1).clamp(min=1e-12) / 448.0
++            w8[:, i : i + step] = (chunk / s[:, None]).t().to(torch.float8_e4m3fn)
++            scale[0, i : i + step] = s
++            del chunk
++        self._b70_head8 = _B70Fp8Head(w8, scale)
++        logger.info("B70 draft head FP8: %d x %d vocab shard as FP8 W8A16 for the draft passes (%.0f MB)",
++                    rows, k, w8.numel() / 1e6)
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names():
+             for name, weight in weights:
+@@ -490,4 +533,26 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+         return loader.load_weights(remap_weight_names(), mapper=mapper)
+ 
+ 
++class _B70Fp8Head:
++    """B70 0048: what LogitsProcessor needs of an lm_head (tp_size, shard_indices, quant_method.apply), backed by
++    an FP8 W8A16 copy of the vocab shard."""
++
++    def __init__(self, w8: torch.Tensor, scale: torch.Tensor) -> None:
++        self.w8, self.scale = w8, scale
++        self.quant_method = self
++        self.tp_size = 1
++        self.shard_indices = None
++
++    def bind(self, head) -> "_B70Fp8Head":
++        self.tp_size, self.shard_indices = head.tp_size, head.shard_indices
++        return self
++
++    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
++        shape = x.shape
++        out = torch.ops._xpu_C.fp8_gemm_w8a16(x.reshape(-1, shape[-1]), self.w8, self.scale, None)
++        if bias is not None:
++            out = out + bias
++        return out.reshape(*shape[:-1], -1)
++
++
+ __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

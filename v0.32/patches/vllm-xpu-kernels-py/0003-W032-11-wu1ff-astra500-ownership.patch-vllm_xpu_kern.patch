@@ -1,7 +1,7 @@
-From fa0de497210f957f9e73e6a50f014c45a8d106e6 Mon Sep 17 00:00:00 2001
+From 614cf461ec357cc0e6cc0e7e8a5ee10f30704f4a Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 3/7] W032-11: wu1ff astra500-ownership.patch
+Subject: [PATCH 3/9] W032-11: wu1ff astra500-ownership.patch
  (vllm_xpu_kernels/ hunks)
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-ownership.patch. MIT.
@@ -13,7 +13,7 @@ Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model
 
 diff --git a/vllm_xpu_kernels/astra_ownership.py b/vllm_xpu_kernels/astra_ownership.py
 new file mode 100644
-index 0000000..7676e55
+index 0000000000..7676e55225
 --- /dev/null
 +++ b/vllm_xpu_kernels/astra_ownership.py
 @@ -0,0 +1,148 @@
@@ -166,7 +166,7 @@ index 0000000..7676e55
 +    gemm(act, local.w2, local.gemm2_wei_scales, down, 2560, 128)
 +    torch.ops.astra_groups_v2.gather(output, down, weights, inverse, 640)
 diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
-index a74739a..765d277 100644
+index 5bcfcf5b28..99a4f079fd 100644
 --- a/vllm_xpu_kernels/fused_moe_interface.py
 +++ b/vllm_xpu_kernels/fused_moe_interface.py
 @@ -6,6 +6,7 @@ import torch
@@ -195,6 +195,3 @@ index a74739a..765d277 100644
          if direct_moe(self, output, hidden_states, topk_weights, topk_ids,
                        expert_map, a1q_scale):
              return
--- 
-2.43.0
-

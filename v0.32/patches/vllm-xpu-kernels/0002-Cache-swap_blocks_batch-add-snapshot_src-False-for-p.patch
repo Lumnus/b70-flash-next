@@ -1,0 +1,411 @@
+From cd24fc53779f33103a413a03f79a092220a39030 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 24 Oct 2026 10:25:38 +0000
+Subject: [PATCH 2/2] [Cache] swap_blocks_batch: add snapshot_src=False for
+ pinned and registered H2D sources
+
+swap_blocks_batch stages every H2D batch through a pinned buffer from the
+caching host allocator, plus a host memcpy of every byte, so the caller may
+reuse the source as soon as the call returns. That stays the default.
+
+When the source is already pinned and the caller keeps it unchanged until
+the copies complete, as vLLM's KV offload worker does, the snapshot only
+costs: every byte is copied twice, the staging blocks stay cached in the
+host allocator, and the source is read at call time instead of in stream
+order.
+
+Add a snapshot_src argument, default true. With snapshot_src=False and
+every non-empty source pinned, the copies are submitted directly from the
+sources. A source counts as pinned if it is USM host memory or lies inside
+a range registered with xpu_host_register; SYCL reports such ranges as
+usm::alloc::unknown, so hostRegister now records the ranges it registers.
+Pageable sources are always staged.
+
+Upstream: vllm-project/vllm-xpu-kernels#662
+---
+ csrc/cache.cpp               |   6 +-
+ csrc/ops.h                   |   3 +-
+ csrc/torch_bindings.cpp      |   2 +-
+ csrc/utils/host_register.cpp |  33 +++++++++++
+ csrc/utils/mem_cpy.cpp       |  24 +++++++-
+ csrc/utils/mem_cpy.h         |  14 ++++-
+ tests/register_ops.py        |  10 +++-
+ tests/test_cache.py          | 111 +++++++++++++++++++++++++++++++++++
+ 8 files changed, 193 insertions(+), 10 deletions(-)
+
+diff --git a/csrc/cache.cpp b/csrc/cache.cpp
+index d6de3ab502..1b6cb4231b 100644
+--- a/csrc/cache.cpp
++++ b/csrc/cache.cpp
+@@ -1373,7 +1373,8 @@ void swap_blocks(
+ void swap_blocks_batch(
+     const torch::Tensor& src_ptrs,
+     const torch::Tensor& dst_ptrs,
+-    const torch::Tensor& sizes) {
++    const torch::Tensor& sizes,
++    bool snapshot_src) {
+   TORCH_CHECK(src_ptrs.device().is_cpu(), "src_ptrs must be on CPU");
+   TORCH_CHECK(dst_ptrs.device().is_cpu(), "dst_ptrs must be on CPU");
+   TORCH_CHECK(sizes.device().is_cpu(), "sizes must be on CPU");
+@@ -1391,7 +1392,8 @@ void swap_blocks_batch(
+       src_ptrs.data_ptr<uint64_t>(),
+       dst_ptrs.data_ptr<uint64_t>(),
+       sizes.data_ptr<uint64_t>(),
+-      n);
++      n,
++      snapshot_src);
+ }
+ 
+ namespace vllm {
+diff --git a/csrc/ops.h b/csrc/ops.h
+index e65a9343cd..5d3770d39c 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -290,7 +290,8 @@ void swap_blocks(
+ void swap_blocks_batch(
+     const torch::Tensor& src_ptrs,
+     const torch::Tensor& dst_ptrs,
+-    const torch::Tensor& sizes);
++    const torch::Tensor& sizes,
++    bool snapshot_src);
+ 
+ void top_k_per_row_decode(
+     const torch::Tensor& logits,
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 491d4b012b..33f4ed4876 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -360,7 +360,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
+   // The target XPU device is auto-inferred from the device pointer.
+   cache_ops.def(
+       "swap_blocks_batch(Tensor src_ptrs, Tensor dst_ptrs,"
+-      "                  Tensor sizes) -> ()");
++      "                  Tensor sizes, bool snapshot_src=True) -> ()");
+   cache_ops.impl("swap_blocks_batch", torch::kCPU, &swap_blocks_batch);
+   cache_ops.def(
+       "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache,"
+diff --git a/csrc/utils/host_register.cpp b/csrc/utils/host_register.cpp
+index 10c3aad3f0..1149613ddd 100644
+--- a/csrc/utils/host_register.cpp
++++ b/csrc/utils/host_register.cpp
+@@ -2,15 +2,30 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <map>
++#include <mutex>
+ 
+ #include "ops.h"
+ #include "utils.h"
++#include "utils/mem_cpy.h"
+ 
+ namespace vllm {
+ namespace xpu {
+ 
+ namespace {
+ 
++// Ranges registered through hostRegister. SYCL reports an imported range as
++// usm::alloc::unknown, so callers that must tell a registered (DMA-capable)
++// range from pageable memory look it up here.
++std::mutex& registeredMutex() {
++  static std::mutex m;
++  return m;
++}
++std::map<uintptr_t, size_t>& registeredRanges() {
++  static std::map<uintptr_t, size_t> r;
++  return r;
++}
++
+ // Page-locks an existing host allocation and imports it into the current
+ // device's SYCL context, the SYCL counterpart of cudaHostRegister. Host
+ // memory that cannot be obtained from the caching host allocator -- notably
+@@ -32,6 +47,10 @@ bool hostRegister(void* ptr, size_t n_bytes) {
+         "); transfers stay correct but fall back to pageable host memory");
+     return false;
+   }
++  {
++    std::lock_guard<std::mutex> g(registeredMutex());
++    registeredRanges()[reinterpret_cast<uintptr_t>(ptr)] = n_bytes;
++  }
+   return true;
+ }
+ 
+@@ -39,6 +58,10 @@ bool hostRegister(void* ptr, size_t n_bytes) {
+ bool hostUnregister(void* ptr) {
+   if (ptr == nullptr) return false;
+ 
++  {
++    std::lock_guard<std::mutex> g(registeredMutex());
++    registeredRanges().erase(reinterpret_cast<uintptr_t>(ptr));
++  }
+   auto ctx = vllm::xpu::vllmGetQueue().get_context();
+   try {
+     syclex::release_from_device_copy(ptr, ctx);
+@@ -51,6 +74,16 @@ bool hostUnregister(void* ptr) {
+ 
+ }  // namespace
+ 
++bool isHostRegistered(const void* ptr, size_t n_bytes) {
++  const auto p = reinterpret_cast<uintptr_t>(ptr);
++  std::lock_guard<std::mutex> g(registeredMutex());
++  auto& ranges = registeredRanges();
++  auto it = ranges.upper_bound(p);
++  if (it == ranges.begin()) return false;
++  --it;
++  return p >= it->first && p + n_bytes <= it->first + it->second;
++}
++
+ }  // namespace xpu
+ }  // namespace vllm
+ 
+diff --git a/csrc/utils/mem_cpy.cpp b/csrc/utils/mem_cpy.cpp
+index b49a4828ae..8c56610005 100644
+--- a/csrc/utils/mem_cpy.cpp
++++ b/csrc/utils/mem_cpy.cpp
+@@ -183,7 +183,8 @@ void xpuAsyncMemcpyBatch(
+     const uint64_t* src_ptrs,
+     const uint64_t* dst_ptrs,
+     const uint64_t* sizes,
+-    int64_t n) {
++    int64_t n,
++    bool snapshot_src) {
+   if (n == 0) return;
+ 
+   // Scan the first non-zero entry to determine copy direction.
+@@ -231,6 +232,22 @@ void xpuAsyncMemcpyBatch(
+     total_bytes += sizes[i];
+   }
+ 
++  // Without a snapshot, pinned sources (USM host, or registered with
++  // xpu_host_register) are copied directly.
++  if (needs_staging && !snapshot_src) {
++    auto ctx = vllm::xpu::vllmGetQueue(0).get_context();
++    bool all_pinned = true;
++    for (int64_t i = 0; i < n && all_pinned; i++) {
++      if (sizes[i] == 0) continue;
++      const void* src = reinterpret_cast<const void*>(src_ptrs[i]);
++      const auto type = sycl::get_pointer_type(src, ctx);
++      all_pinned = type == sycl::usm::alloc::host ||
++                   (type == sycl::usm::alloc::unknown &&
++                    isHostRegistered(src, static_cast<size_t>(sizes[i])));
++    }
++    needs_staging = !all_pinned;
++  }
++
+   if (needs_staging) {
+     // H2D: allocate one contiguous pinned staging buffer, snapshot all source
+     // blocks, then submit all async DMAs.  This avoids N separate allocator
+@@ -273,8 +290,9 @@ void xpuAsyncMemcpyBatch(
+           at::xpu::getCurrentXPUStream());
+     }
+   } else {
+-    // D2H or D2D: dst_is_pageable was probed once from the first non-zero
+-    // entry (all entries share the same direction and memory class).
++    // Unstaged H2D, D2H or D2D: dst_is_pageable was probed once from the
++    // first non-zero entry (all entries share the same direction and memory
++    // class).
+     // Pageable D2H is unsafe with async DMA; fall back to sync copy.
+     for (int64_t i = 0; i < n; i++) {
+       size_t sz = static_cast<size_t>(sizes[i]);
+diff --git a/csrc/utils/mem_cpy.h b/csrc/utils/mem_cpy.h
+index 465ef4c1d7..ca0f8dd7b8 100644
+--- a/csrc/utils/mem_cpy.h
++++ b/csrc/utils/mem_cpy.h
+@@ -33,6 +33,11 @@ void xpuAsyncMemcpy(
+     const void* hctx,
+     bool is_pinned);
+ 
++// True if [ptr, ptr + n_bytes) lies inside one range registered with
++// xpu_host_register (prepare_for_device_copy): DMA-capable host memory that
++// sycl::get_pointer_type() reports as usm::alloc::unknown.
++bool isHostRegistered(const void* ptr, size_t n_bytes);
++
+ /**
+  * @brief Batch async memcpy: copies N independent (src, dst, size) triples
+  *        in a single call, amortising per-copy overhead.
+@@ -42,18 +47,25 @@ void xpuAsyncMemcpy(
+  *
+  * For H2D: snapshots all source blocks through a single contiguous pinned
+  *   staging buffer so the caller may safely mutate host memory immediately.
++ *   With snapshot_src=false and every source in pinned memory (USM host, or
++ *   a range registered with xpu_host_register), copies directly from the
++ *   sources instead, in stream order; the caller must then not modify the
++ *   sources until the copies have completed.
+  * For D2H / D2D: direct async DMA without staging.
+  *
+  * @param src_ptrs   Array of N raw source addresses
+  * @param dst_ptrs   Array of N raw destination addresses
+  * @param sizes      Array of N byte counts
+  * @param n          Number of entries
++ * @param snapshot_src  For H2D from pinned sources: stage (true) or copy
++ *                      directly (false). Pageable sources are always staged.
+  */
+ void xpuAsyncMemcpyBatch(
+     const uint64_t* src_ptrs,
+     const uint64_t* dst_ptrs,
+     const uint64_t* sizes,
+-    int64_t n);
++    int64_t n,
++    bool snapshot_src = true);
+ 
+ }  // namespace xpu
+ }  // namespace vllm
+diff --git a/tests/register_ops.py b/tests/register_ops.py
+index a4466d4e78..2a3917aff4 100644
+--- a/tests/register_ops.py
++++ b/tests/register_ops.py
+@@ -659,11 +659,17 @@ def swap_blocks_batch(
+     src_ptrs: torch.Tensor,
+     dst_ptrs: torch.Tensor,
+     sizes: torch.Tensor,
++    snapshot_src: bool = True,
+ ) -> None:
+     """Batch version of swap_blocks: copies N independent (src, dst, size)
+     triples in a single call. The target XPU device is auto-inferred from the
+-    device-side pointers in src_ptrs/dst_ptrs."""
+-    torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
++    device-side pointers in src_ptrs/dst_ptrs.
++
++    H2D sources are snapshotted at call time by default. With
++    snapshot_src=False, pinned sources are copied directly in stream order
++    and must not be modified until the copies have completed."""
++    torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes,
++                                             snapshot_src)
+ 
+ 
+ def xpu_host_register(ptr: int, n_bytes: int) -> bool:
+diff --git a/tests/test_cache.py b/tests/test_cache.py
+index ebcec30b73..b010b1b80f 100644
+--- a/tests/test_cache.py
++++ b/tests/test_cache.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import mmap
+ import random
+ 
+ import numpy as np
+@@ -112,6 +113,12 @@ MINI_PYTEST_PARAMS = {
+     "test_swap_blocks_batch_h2d_mutation_race": {
+         "device": ["xpu:0"],
+     },
++    "test_swap_blocks_batch_h2d_pinned_no_snapshot": {
++        "device": ["xpu:0"],
++    },
++    "test_swap_blocks_batch_h2d_registered_no_snapshot": {
++        "device": ["xpu:0"],
++    },
+     "test_gather_and_maybe_dequant_cache_mla": {
+         "block_size": [8],
+         "num_blocks": [8],
+@@ -1116,6 +1123,110 @@ def test_swap_blocks_batch_h2d_mutation_race(device: str) -> None:
+         )
+ 
+ 
++@pytest.mark.parametrize("device", DEVICES)
++@torch.inference_mode()
++def test_swap_blocks_batch_h2d_pinned_no_snapshot(device: str) -> None:
++    """With snapshot_src=False, H2D from pinned memory reads the source in
++    stream order: it must see a non-blocking D2H copy into the same pinned
++    buffer that was queued just before it."""
++    torch.xpu.set_device(device)
++
++    n_blocks = 32
++    block_elems = 1 << 12
++    mm = 2048
++    trials = 8
++    poison, value = -7.0, 3.0
++
++    src = torch.empty(n_blocks * block_elems,
++                      device=device,
++                      dtype=torch.float32)
++    host = torch.full(src.shape, poison, dtype=src.dtype, pin_memory=True)
++    assert host.is_pinned()
++    dst = torch.empty_like(src)
++    stride_bytes = block_elems * src.element_size()
++    block_mapping = [(i, i) for i in range(n_blocks)]
++    sp, dp, sz = _build_batch_args(host.view(n_blocks, block_elems),
++                                   dst.view(n_blocks, block_elems),
++                                   block_mapping, stride_bytes)
++
++    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
++    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
++
++    for t in range(trials):
++        host.fill_(poison)
++        dst.fill_(poison)
++        torch.xpu.synchronize(device)
++        # Keep the stream busy so the D2H copy is still pending when
++        # swap_blocks_batch is called.
++        c = a
++        for _ in range(6):
++            c = torch.mm(c, b)
++        src.fill_(value + t)
++        host.copy_(src, non_blocking=True)
++        ops.swap_blocks_batch(sp, dp, sz, snapshot_src=False)
++        torch.xpu.synchronize(device)
++        assert torch.all(dst == value + t), (
++            f"trial {t}: H2D copy did not see the preceding D2H copy")
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@torch.inference_mode()
++def test_swap_blocks_batch_h2d_registered_no_snapshot(device: str) -> None:
++    """Host memory registered with xpu_host_register is reported by SYCL as
++    usm::alloc::unknown, not USM host. With snapshot_src=False it must still
++    be copied directly, reading the source in stream order rather than being
++    snapshotted at call time: a CPU write to the source made after the call,
++    while the copy is still queued behind other work, must be what arrives."""
++    torch.xpu.set_device(device)
++
++    n_blocks = 32
++    block_elems = 1 << 12
++    block_bytes = block_elems * 4
++    total = n_blocks * block_bytes
++    mm = 4096
++    trials = 8
++    old, new = 3.0, -7.0
++
++    dst = torch.empty(n_blocks * block_elems,
++                      device=device,
++                      dtype=torch.float32)
++    a = torch.randn(mm, mm, device=device, dtype=torch.float32)
++    b = torch.randn(mm, mm, device=device, dtype=torch.float32)
++
++    with mmap.mmap(-1, total) as region:
++        host = torch.frombuffer(memoryview(region), dtype=torch.float32)
++        assert ops.xpu_host_register(host.data_ptr(), total)
++        try:
++            h2d = _build_batch_args(host.view(n_blocks, block_elems),
++                                    dst.view(n_blocks, block_elems),
++                                    [(i, i) for i in range(n_blocks)],
++                                    block_bytes)
++            failed_trial = None
++            for t in range(trials):
++                host.fill_(old)
++                dst.fill_(0.0)
++                torch.xpu.synchronize(device)
++                # Keep the stream busy so the H2D copy is still pending when
++                # the CPU rewrites the source.
++                c = a
++                for _ in range(12):
++                    c = torch.mm(c, b)
++                ops.swap_blocks_batch(*h2d, snapshot_src=False)
++                host.fill_(new)
++                torch.xpu.synchronize(device)
++                # A staged copy would hold `old` (snapshot at call time).
++                if not torch.all(dst == new):
++                    failed_trial = t
++                    break
++        finally:
++            assert ops.xpu_host_unregister(host.data_ptr())
++            del host
++
++    assert failed_trial is None, (
++        f"trial {failed_trial}: registered source was staged, not read in "
++        "stream order")
++
++
+ @pytest.mark.skipif(torch.xpu.device_count() < 2,
+                     reason="device-inference bug only manifests on a "
+                     "non-zero XPU device (needs >= 2 devices)")

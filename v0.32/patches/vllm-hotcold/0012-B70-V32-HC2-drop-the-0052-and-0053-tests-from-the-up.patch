@@ -1,0 +1,207 @@
+From 2a64d3ec9efeea78ca03cd331c2c87e6463dd88e Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:28:56 +0000
+Subject: [PATCH 12/13] B70-V32-HC2: drop the 0052 and 0053 tests from the
+ upstream test set (n/a on 0.32)
+
+test_b70_hc_ksplit_views.py tests GatedResidual._prepare_kdown_ksplit (0052), which the 0.32 HC path does not
+have (no K-split copies). test_b70_head_fp8.py imports b70_fp8_head_of from mtp.py (0.30 0048/0053); 0.32
+carries its own target head in vllm/models/qwen4_exp/nvidia/b70_fp8_head.py (B70-V32-0053).
+---
+ .../test_b70_hc_ksplit_views.py               |  73 ------------
+ tests/model_executor/test_b70_head_fp8.py     | 106 ------------------
+ 2 files changed, 179 deletions(-)
+ delete mode 100644 tests/model_executor/test_b70_hc_ksplit_views.py
+ delete mode 100644 tests/model_executor/test_b70_head_fp8.py
+
+diff --git a/tests/model_executor/test_b70_hc_ksplit_views.py b/tests/model_executor/test_b70_hc_ksplit_views.py
+deleted file mode 100644
+index bf6978d80d..0000000000
+--- a/tests/model_executor/test_b70_hc_ksplit_views.py
++++ /dev/null
+@@ -1,73 +0,0 @@
+-"""B70-0052: the HC down GEMM K-halves are views of the one weight (no second copy) unless B70_HC_KSPLIT_VIEWS=0."""
+-
+-from types import SimpleNamespace
+-
+-import pytest
+-import torch
+-
+-from vllm.models.qwen4_exp.nvidia.hyperconnection import GatedResidual
+-
+-
+-def _fake(use_combine: bool, n: int = 336, k2: int = 10240):
+-    weight = torch.nn.Parameter(torch.randn(n, k2).to(torch.bfloat16), requires_grad=False)
+-    linear = SimpleNamespace(weight=weight)
+-    return SimpleNamespace(
+-        _kdown_lo=None,
+-        _kdown_hi=None,
+-        _kdown_k=0,
+-        use_combine=use_combine,
+-        input_mix_weight_down_block_inject=linear,
+-        input_mix_weight_down=linear,
+-    )
+-
+-
+-def _prepare(fake):
+-    GatedResidual._prepare_kdown_ksplit(fake)
+-    return fake
+-
+-
+-@pytest.mark.parametrize("use_combine,n", [(True, 336), (False, 320)])
+-def test_views_by_default(monkeypatch, use_combine, n):
+-    monkeypatch.setenv("B70_HC_KSPLIT_VIEWS", "1")
+-    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS")
+-    f = _prepare(_fake(use_combine, n))
+-    w = f.input_mix_weight_down.weight.data
+-    k = w.shape[1] // 2
+-    assert f._kdown_k == k
+-    assert f._kdown_lo.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+-    assert f._kdown_hi.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+-    assert f._kdown_lo.data_ptr() == w.data_ptr()
+-    assert f._kdown_hi.data_ptr() == w[:, k:].data_ptr()
+-    assert f._kdown_lo.stride() == (2 * k, 1) and f._kdown_hi.stride() == (2 * k, 1)
+-    assert torch.equal(f._kdown_lo, w[:, :k]) and torch.equal(f._kdown_hi, w[:, k:])
+-
+-
+-def test_copies_when_off(monkeypatch):
+-    monkeypatch.setenv("B70_HC_KSPLIT_VIEWS", "0")
+-    f = _prepare(_fake(True))
+-    w = f.input_mix_weight_down.weight.data
+-    k = w.shape[1] // 2
+-    assert f._kdown_lo.is_contiguous() and f._kdown_hi.is_contiguous()
+-    assert f._kdown_lo.untyped_storage().data_ptr() != w.untyped_storage().data_ptr()
+-    assert torch.equal(f._kdown_lo, w[:, :k]) and torch.equal(f._kdown_hi, w[:, k:])
+-
+-
+-def test_split_matches_full_gemm_shape(monkeypatch):
+-    """The two half GEMMs over the views add up to the full GEMM (fp32 on CPU, tolerance for the summation order)."""
+-    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS", raising=False)
+-    f = _prepare(_fake(True, 336, 1024))
+-    w = f.input_mix_weight_down.weight.data.float()
+-    x = torch.randn(80, 1024)
+-    k = f._kdown_k
+-    split = torch.nn.functional.linear(x[:, :k], f._kdown_lo.float()) + torch.nn.functional.linear(
+-        x[:, k:], f._kdown_hi.float()
+-    )
+-    torch.testing.assert_close(split, torch.nn.functional.linear(x, w), rtol=1e-4, atol=1e-3)
+-
+-
+-def test_prepare_is_idempotent(monkeypatch):
+-    monkeypatch.delenv("B70_HC_KSPLIT_VIEWS", raising=False)
+-    f = _prepare(_fake(True))
+-    lo = f._kdown_lo
+-    _prepare(f)
+-    assert f._kdown_lo is lo
+diff --git a/tests/model_executor/test_b70_head_fp8.py b/tests/model_executor/test_b70_head_fp8.py
+deleted file mode 100644
+index f146777e32..0000000000
+--- a/tests/model_executor/test_b70_head_fp8.py
++++ /dev/null
+@@ -1,106 +0,0 @@
+-"""B70-0053: the target's lm_head as FP8 W8A16, one FP8 copy shared with the draft (0048), BF16 shard released."""
+-
+-from types import SimpleNamespace
+-
+-import pytest
+-import torch
+-
+-from vllm.models.qwen4_exp.nvidia import mtp as mtp_mod
+-from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
+-from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP, _B70Fp8Head, b70_fp8_head_of
+-
+-
+-class _Head(torch.nn.Module):
+-    def __init__(self, rows=1000, k=256):
+-        super().__init__()
+-        self.weight = torch.nn.Parameter((torch.randn(rows, k) * 0.02).to(torch.bfloat16), requires_grad=False)
+-        self.quant_method = object()
+-        self.tp_size, self.shard_indices = 2, None
+-
+-
+-@pytest.fixture
+-def xpu(monkeypatch):
+-    from vllm.platforms import current_platform
+-
+-    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+-
+-
+-def _dequant(head8):
+-    return (head8.w8.float() * head8.scale).t()
+-
+-
+-def test_builder_caches_and_is_accurate():
+-    head = _Head()
+-    h1 = b70_fp8_head_of(head)
+-    assert isinstance(h1, _B70Fp8Head) and b70_fp8_head_of(head) is h1
+-    assert h1.w8.shape == (256, 1000) and h1.scale.shape == (1, 1000)
+-    w = head.weight.float()
+-    assert ((_dequant(h1) - w).norm() / w.norm()).item() < 0.04
+-
+-
+-def test_builder_none_without_bf16_weight():
+-    head = _Head()
+-    head.weight.data = torch.empty((0, 256), dtype=torch.bfloat16)
+-    assert b70_fp8_head_of(head) is None
+-
+-
+-def _target(head):
+-    t = SimpleNamespace(lm_head=head)
+-    t._b70_prepare_head_fp8 = lambda: Qwen4ExpForCausalLM._b70_prepare_head_fp8(t)
+-    return t
+-
+-
+-def test_target_off_by_default(monkeypatch, xpu):
+-    monkeypatch.delenv("B70_HEAD_FP8", raising=False)
+-    head = _Head()
+-    qm = head.quant_method
+-    _target(head)._b70_prepare_head_fp8()
+-    assert head.quant_method is qm and head.weight.shape == (1000, 256)
+-
+-
+-def test_target_on_releases_bf16_and_shares_with_draft(monkeypatch, xpu):
+-    monkeypatch.setenv("B70_HEAD_FP8", "1")
+-    monkeypatch.setenv("B70_DRAFT_HEAD_FP8", "1")
+-    head = _Head()
+-    w = head.weight.detach().float().clone()
+-    _target(head)._b70_prepare_head_fp8()
+-    head8 = head._b70_fp8_head
+-    assert head.quant_method is head8
+-    assert head.weight.numel() == 0 and head.weight.shape[1] == 256
+-    assert ((_dequant(head8) - w).norm() / w.norm()).item() < 0.04
+-    draft = SimpleNamespace(lm_head=head)
+-    Qwen4ExpMTP._b70_prepare_draft_head(draft)
+-    assert draft._b70_head8 is head8
+-
+-
+-def test_draft_first_then_target_reuses(monkeypatch, xpu):
+-    monkeypatch.setenv("B70_HEAD_FP8", "1")
+-    monkeypatch.setenv("B70_DRAFT_HEAD_FP8", "1")
+-    head = _Head()
+-    draft = SimpleNamespace(lm_head=head)
+-    Qwen4ExpMTP._b70_prepare_draft_head(draft)
+-    _target(head)._b70_prepare_head_fp8()
+-    assert head.quant_method is draft._b70_head8 and head.weight.numel() == 0
+-
+-
+-def test_draft_alone_unchanged(monkeypatch, xpu):
+-    """0048 without 0053: the draft gets its FP8 copy, the BF16 head stays for the target."""
+-    monkeypatch.delenv("B70_HEAD_FP8", raising=False)
+-    monkeypatch.setenv("B70_DRAFT_HEAD_FP8", "1")
+-    head = _Head()
+-    qm = head.quant_method
+-    draft = SimpleNamespace(lm_head=head)
+-    Qwen4ExpMTP._b70_prepare_draft_head(draft)
+-    assert isinstance(draft._b70_head8, _B70Fp8Head)
+-    assert head.quant_method is qm and head.weight.shape == (1000, 256)
+-    assert mtp_mod.b70_fp8_head_of(head) is draft._b70_head8
+-
+-
+-def test_once_runs_prepare_a_single_time(monkeypatch, xpu):
+-    monkeypatch.setenv("B70_HEAD_FP8", "1")
+-    calls = []
+-    t = SimpleNamespace()
+-    t._b70_prepare_head_fp8 = lambda: calls.append(1)
+-    Qwen4ExpForCausalLM._b70_head_fp8_once(t)
+-    Qwen4ExpForCausalLM._b70_head_fp8_once(t)
+-    assert calls == [1]

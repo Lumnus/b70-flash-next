@@ -1,7 +1,7 @@
-From 60464f7ebc7eef6c7c13918a74a6b4c59d5d8751 Mon Sep 17 00:00:00 2001
+From c29abc7e27d4a9a2f26d5270d227a795c65a1d36 Mon Sep 17 00:00:00 2001
 From: wu1ff <wu1ff@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 08:28:25 +0000
-Subject: [PATCH 1/7] W032-08: wu1ff astra500-v032.patch (vllm_xpu_kernels/
+Subject: [PATCH 1/9] W032-08: wu1ff astra500-v032.patch (vllm_xpu_kernels/
  hunks)
 
 Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model pack qwen3.8-flash-next v1.0.5, patches/production/patch-chain/astra500-v032.patch. MIT.
@@ -13,7 +13,7 @@ Source: wu1ff/B70-LLM-Controller@5e5cf43f048d9b32146bb22925d4a2cf198400b0, model
 
 diff --git a/vllm_xpu_kernels/astra500_moe.py b/vllm_xpu_kernels/astra500_moe.py
 new file mode 100644
-index 0000000..2ad1058
+index 0000000000..2ad1058252
 --- /dev/null
 +++ b/vllm_xpu_kernels/astra500_moe.py
 @@ -0,0 +1,31 @@
@@ -49,7 +49,7 @@ index 0000000..2ad1058
 +        return out
 +    return torch.ops._xpu_C.cutlass_grouped_gemm_interface(**kwargs)
 diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
-index 629cef3..810b6f4 100644
+index 32a957662e..e761195e10 100644
 --- a/vllm_xpu_kernels/fused_moe_interface.py
 +++ b/vllm_xpu_kernels/fused_moe_interface.py
 @@ -4,6 +4,8 @@ from typing import Optional
@@ -61,7 +61,7 @@ index 629cef3..810b6f4 100644
  try:
      from . import _C  # noqa: F401
      from . import _moe_C  # noqa: F401
-@@ -421,7 +423,7 @@ class XpuFusedMoe:
+@@ -431,7 +433,7 @@ class XpuFusedMoe:
          gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
                                  dtype=output.dtype,
                                  device=output.device)
@@ -70,7 +70,7 @@ index 629cef3..810b6f4 100644
              ptr_A=remapped_hidden_states,
              ptr_A_scale=remapped_scales,
              ptr_B=self.w13,
-@@ -475,7 +477,7 @@ class XpuFusedMoe:
+@@ -485,7 +487,7 @@ class XpuFusedMoe:
                  gemm2_act_scale = None
          else:
              gemm2_act_scale = None
@@ -79,6 +79,3 @@ index 629cef3..810b6f4 100644
              ptr_A=act_output,
              ptr_A_scale=gemm2_act_scale,
              ptr_B=self.w2,
--- 
-2.43.0
-

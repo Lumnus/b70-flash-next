@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# check-series.sh — fail unless v0.32/patches/vllm/ equals a fresh export of the fork tag.
+# check-series.sh — fail unless a v0.32 patch directory equals a fresh export of the fork.
 #
-#   v0.32/scripts/check-series.sh [--git-dir DIR] [--ref REF]
-#   v0.32/scripts/check-series.sh --qsa [--git-dir DIR] [--qsa-ref REF]
+#   v0.32/scripts/check-series.sh [--git-dir DIR]             dense:    patches/vllm         = v0.32.0..v0.32.0-b70.4-dense
+#   v0.32/scripts/check-series.sh --qsa [--git-dir DIR]       sparse:   patches/vllm-qsa     = v0.32.0-b70.4-dense..v0.32.0-b70.4-qsa
+#   v0.32/scripts/check-series.sh --hotcold [--git-dir DIR]   hot/cold: patches/vllm-hotcold = v0.32.0-b70.4-qsa..v0.32.0-b70.4
+#   v0.32/scripts/check-series.sh --all [--git-dir DIR]       all three
 #
 #   --git-dir  a vLLM clone (default: ./vllm-src-032, cloned on demand from https://github.com/Lumnus/vllm.git)
-#   --ref      default v0.32.0-b70.4-dense (tag: the dense series, 50 commits; v0.32.0-b70.1 is the same series without the last one)
 #
-# The export is `git format-patch` of v0.32.0..REF, one file per commit, abbrev 10, no signature.
-#
-#   --qsa      check the sparse add-on instead: v0.32/patches/vllm-qsa/ against the export of REF..QSA-REF
-#   --qsa-ref  default v0.32.0-b70.4 (tag of the same fork: dense series plus the 38 sparse commits)
+# The engine is fork tag v0.32.0-b70.4 (101 commits on v0.32.0); the two other tags mark where each layer ends.
+# The export is `git format-patch` of the range, one file per commit, abbrev 10, no signature.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
 REPO_URL=https://github.com/Lumnus/vllm.git
-gd="$PWD/vllm-src-032"; ref=v0.32.0-b70.4-dense; qsa=0; qref=v0.32.0-b70.4
+DENSE=v0.32.0-b70.4-dense; QSA=v0.32.0-b70.4-qsa; ENGINE=v0.32.0-b70.4
+gd="$PWD/vllm-src-032"; which=(dense)
 while [ $# -gt 0 ]; do
   case "$1" in
     --git-dir) gd=$2; shift 2 ;;
-    --ref) ref=$2; shift 2 ;;
-    --qsa) qsa=1; shift ;;
-    --qsa-ref) qref=$2; qsa=1; shift 2 ;;
+    --qsa) which=(qsa); shift ;;
+    --hotcold) which=(hotcold); shift ;;
+    --all) which=(dense qsa hotcold); shift ;;
     -h|--help) sed -n 2,13p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -29,24 +29,27 @@ done
 if [ ! -e "$gd/.git" ] && [ ! -e "$gd/HEAD" ]; then
   git clone -q --filter=blob:none --no-checkout "$REPO_URL" "$gd"
 fi
-git -C "$gd" rev-parse -q --verify "$ref^{commit}" >/dev/null || git -C "$gd" fetch -q --tags origin
-if [ "$qsa" = 1 ]; then
-  git -C "$gd" fetch -q origin "$qref" 2>/dev/null || git -C "$gd" fetch -q origin "refs/tags/$qref:refs/tags/$qref"
-  qcommit=$(git -C "$gd" rev-parse "FETCH_HEAD^{commit}" 2>/dev/null || git -C "$gd" rev-parse "refs/tags/$qref^{commit}")
-  git -C "$gd" merge-base --is-ancestor "$ref^{commit}" "$qcommit" || { echo "$qref does not descend from $ref" >&2; exit 1; }
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-  git -C "$gd" -c core.abbrev=10 format-patch -q --no-signature -o "$tmp" "$ref..$qcommit"
-  if diff -r "$here/patches/vllm-qsa" "$tmp" >"$tmp.diff"; then
-    echo "OK — v0.32/patches/vllm-qsa equals the export of $ref..$qref ($qcommit, $(ls "$tmp" | wc -l) commits)"; exit 0
+for t in "$DENSE" "$QSA" "$ENGINE"; do
+  git -C "$gd" rev-parse -q --verify "refs/tags/$t^{commit}" >/dev/null || git -C "$gd" fetch -q origin "refs/tags/$t:refs/tags/$t"
+done
+check() {  # dir from to
+  local dir=$1 from=$2 to=$3 tmp rc=0
+  git -C "$gd" merge-base --is-ancestor "$from^{commit}" "$to^{commit}" || { echo "$to does not descend from $from" >&2; return 1; }
+  tmp=$(mktemp -d)
+  git -C "$gd" -c core.abbrev=10 format-patch -q --no-signature -o "$tmp" "$from..$to"
+  if diff -r "$here/patches/$dir" "$tmp" >"$tmp.diff"; then
+    echo "OK — v0.32/patches/$dir equals the export of $from..$to ($(git -C "$gd" rev-parse "$to^{commit}"), $(ls "$tmp" | wc -l) commits)"
   else
-    echo "MISMATCH:" >&2; sed -n 1,40p "$tmp.diff" >&2; exit 1
+    echo "MISMATCH in v0.32/patches/$dir:" >&2; sed -n 1,40p "$tmp.diff" >&2; rc=1
   fi
-fi
-git -C "$gd" merge-base --is-ancestor "$BASE" "$ref" || { echo "$ref does not descend from v0.32.0 ($BASE)" >&2; exit 1; }
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-git -C "$gd" -c core.abbrev=10 format-patch -q --no-signature -o "$tmp" "$BASE..$ref"
-if diff -r "$here/patches/vllm" "$tmp" >"$tmp.diff"; then
-  echo "OK — v0.32/patches/vllm equals the export of $ref ($(git -C "$gd" rev-parse "$ref^{commit}"), $(ls "$tmp" | wc -l) commits)"
-else
-  echo "MISMATCH:" >&2; sed -n 1,40p "$tmp.diff" >&2; exit 1
-fi
+  rm -rf "$tmp" "$tmp.diff"; return $rc
+}
+rc=0
+for w in "${which[@]}"; do
+  case $w in
+    dense) check vllm "$BASE" "$DENSE" || rc=1 ;;
+    qsa) check vllm-qsa "$DENSE" "$QSA" || rc=1 ;;
+    hotcold) check vllm-hotcold "$QSA" "$ENGINE" || rc=1 ;;
+  esac
+done
+exit $rc

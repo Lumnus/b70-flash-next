@@ -1,70 +1,98 @@
-# 0.32.0-b70.4 — Qwen3.8-Flash-Next on vLLM 0.32, 4× Intel Arc Pro B70
+# 0.32.0-b70.4 — Qwen3.8-Flash-Next on vLLM 0.32, Intel Arc Pro B70
 
-The current line (configuration validated on 2026-10-24): vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers ported
-from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM fixes cherry-picked. Speculative
-decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 12 sequences (8 up to b70.3),
-4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. There is
-**one engine** (the trunk code plus vllm-xpu-kernels 0.1.16.2 and our `libgdn_index64.so`) and **two tuned presets**: the
-4-card preset ([`engines/preset-4card.args`](engines/preset-4card.args) / [`.env`](engines/preset-4card.env): sparse
-attention, 12 slots) and the 2-card preset ([`engines/preset-2card.args`](engines/preset-2card.args) / [`.env`](engines/preset-2card.env),
-which frees the other two cards for any other model; **a placeholder in this tree until its measured values are filled in**).
-Everything else is a parameter ([Parameters](#parameters)). This page describes both attention variants, **both working**: **dense** (the checkpoint's QSA indexer is dropped) and **sparse**
-([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2, near dense speed from 0.32.0-b70.3, split KV groups
-from 0.32.0-b70.4: working, experimental).
+The current line (configuration first validated on 2026-10-24): vLLM **v0.32.0** with wu1ff's 1.0.5 B70 chain, our B70 layers
+ported from the 0.30 line, the 0.32-specific fixes below, two of our upstream vLLM fixes cherry-picked, sparse attention (QSA)
+and hot/cold expert offload. Speculative decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter)
+with async scheduling, 4096-token prefill chunks, a host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe.
+
+**One engine, one environment, two presets.** The engine is fork tag `v0.32.0-b70.4` (vLLM v0.32.0 + 101 commits, exported as
+three patch directories, [The series](#the-series)). The environment is torch 2.14 + vllm-xpu-kernels 0.1.16.2 rebuilt with our
+two kernel PRs + our `libgdn_index64.so` ([Software](#software)). On top of them:
+
+1. **4-card preset** ([`engines/preset-4card.args`](engines/preset-4card.args) / [`.env`](engines/preset-4card.env)): the
+   performance configuration. Tensor parallel 4, sparse attention, 12 slots, 128 GiB KV tier.
+2. **2-card preset** ([`engines/preset-2card.args`](engines/preset-2card.args) / [`.env`](engines/preset-2card.env)): tensor
+   parallel 2 on two cards, so the other pair is free for any other model. Sparse attention, 4 slots, the full 262,144-token
+   context, hot/cold expert offload, 16 GiB KV tier.
+
+Everything else is a parameter of the same engine ([Parameters](#parameters)), dense attention included.
 
 | | |
 |---|---|
-| code | dense: fork tag [`v0.32.0-b70.4-dense`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4-dense) (branch `b70/v0.32.0-dense-b70.4`), 50 commits on vLLM v0.32.0 (`5df63a7203`), exported to [`patches/vllm/`](patches/vllm/); commits 1–49 are the b70.1 series (tag `v0.32.0-b70.1`, `103f2f2eb9`), 50 is the #54163 backport. Sparse: fork tag [`v0.32.0-b70.4`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4) (branch `b70/v0.32.0-qsa-b70.4`), 38 more commits, exported to [`patches/vllm-qsa/`](patches/vllm-qsa/) |
+| code | fork tag [`v0.32.0-b70.4`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.4) (branch `b70/v0.32.0-b70.4`), 101 commits on vLLM v0.32.0 (`5df63a7203`): [`patches/vllm/`](patches/vllm/) (50, the dense base, tag `v0.32.0-b70.4-dense`) + [`patches/vllm-qsa/`](patches/vllm-qsa/) (38, sparse attention, ends at tag `v0.32.0-b70.4-qsa`) + [`patches/vllm-hotcold/`](patches/vllm-hotcold/) (13, hot/cold expert offload) |
 | weights | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (the only build measured on 0.32) + drafter `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` |
-| GPUs | 4× Arc Pro B70 (32 GB each), tensor parallel 4 + expert parallel |
-| attention | the target model on vLLM's XPU default backend (FlashAttention); the drafter on `TRITON_ATTN` (`preset-4card.args`) |
-| KV | 4-card preset (sparse, 12 slots): 344,706 GPU KV tokens at memory fraction 0.89 (b70.4 build; 345,392 on the 0.1.16.2 gate); dense: 388,872 with the stock oneCCL plugin, 397,309 with the patched one (8 slots) + 128 GiB CPU tier (32 GiB pinned per rank, private pool, no `/dev/shm` requirement) |
-| software | [Software](#software) below; pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 |
+| GPUs | 4× Arc Pro B70 (32 GB each); the 4-card preset uses all four, the 2-card preset two |
+| attention | the target model on vLLM's XPU default backend (FlashAttention) plus the QSA Triton kernels for sparse; the drafter on `TRITON_ATTN` |
+| software | [Software](#software); pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 |
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| engine files | [`engines/preset-4card.args`](engines/preset-4card.args) + [`.env`](engines/preset-4card.env); [`engines/preset-2card.args`](engines/preset-2card.args) + [`.env`](engines/preset-2card.env) (placeholder: every `TODO-2CARD` line is not final); serve configs: [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json) (sparse), [`../engines/serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) (dense) |
-| status | the configuration validated on 2026-10-24; gates, quality, speed and an agent-session replay measured (below). No multi-day endurance run on 0.32 yet. No container image. |
+| status | gates, quality, speed and an agent-session replay measured ([Presets](#presets), [Parameters](#parameters)). No multi-day endurance run on 0.32 yet. No container image. |
 
 The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable fallback line.
 
-## Which build the numbers were taken on
+## Presets
 
-The speed and replay numbers on this page and in [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md) were
-**measured on the 0.1.15.4 kernel build with the identical trunk** (b70.1–b70.3 tables: the b70.1 / b70.3 code; b70.4
-sparse and replay rows: the trunk at `b2ed0bad27`). The release engine runs **vllm-xpu-kernels 0.1.16.2 plus our
-`libgdn_index64.so`**, which passed the gate on the final trunk (`a68ab313fe`) with det2 identical: GPU KV 345,392 tokens, gate
-PASS, `torch.ops._gdn_index64` tests 3/3. Speed and the agent replay were not re-measured on 0.1.16.2.
-[Known issue 8](#known-issues-032) lists what the 0.1.16.2 wheel does not carry.
+Measured on 2026-10-26 with the released engine and environment, Intel AutoRound, single runs, greedy (temperature 0,
+thinking off), with the harness of the earlier 12-slot measurements on the 0.1.15.4 build (`bench_det` for 1 and 4 streams,
+8 parallel generations):
+
+| | 4-card preset | 2-card preset |
+|---|---|---|
+| cards, tensor parallel | 4, TP 4 (draft TP 4) | 2, TP 2 (draft TP 2); measured on cards 0 and 3 |
+| attention, slots, context | sparse, 12, 262,144 | sparse, 4, 262,144 |
+| expert offload | off (all experts in VRAM) | hot/cold, 145 of 256 experts per layer per rank in host RAM |
+| KV tier (host RAM) | 128 GiB | 16 GiB |
+| GPU KV cache (tokens) | 344,021 (344,145 on a second boot) | 273,169 |
+| decode, 1 stream (tok/s; ms per step) | 156.4 (23.9) | 58.2 (61.5) |
+| decode, 4 concurrent (total tok/s; ms per step) | 287.4 (46.4) | 69.4 (187.9) |
+| decode, 8 streams (total tok/s, two runs) | 580.9 / 577.8 | 109.2 / 119.7 |
+| prefill 32K (tok/s) | not re-measured (5,475 on the b70.3 build, 8 slots) | 2,768 (2,753 / 2,769 / 2,782) |
+| host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB |
+| gates | burst 0/150; token compare (det2) against the 0.1.15.4 build: PASS (c=1 3/8 identical + 5 near-tie; c=8 0/8 + 8 near-tie) | completion correct, journal clean; burst 0/150, structured output, mix probe and a 128K needle passed on the pre-release environment (below) |
+
+How to read it:
+
+1. **4-card per-step time is the clean signal.** 23.9 ms per step equals the 12-slot measurement on the 0.1.15.4 build (162.7 tok/s at
+   one stream there); the one-stream difference is draft acceptance on four prompts (3.8 against 3.9 tokens per step), not
+   kernel speed. 4 concurrent matches (287.4 against 287.1).
+2. **The 2-card preset trades speed for the free pair.** Two cards carry the whole model: 145 experts per layer per rank live in
+   host RAM, and every routed cold expert is read over PCIe. One-stream decode is 0.37× the 4-card preset.
+3. **2-card fidelity** (pre-release environment with the same engine code, 48 GiB tier): teacher-forced on 8 prompts, TP2
+   against TP4 KL 0.00132 / top-1 99.32 %, at the floors (TP2 against itself 0.00114 / 99.46 %, TP4 against itself
+   0.00117 / 99.07 %). On a 12K-token document beyond 2K tokens it is at the TP4 floor; below 2K it is at its own TP2 floor
+   (1.6× the TP4 floor).
+4. **Not measured on the released environment:** the agent-session replay and long prefill (131K, 260K) for either preset,
+   and the dense attention value at 12 slots. Those numbers come from the 0.1.15.4 build with the identical engine code and
+   are labelled so where they appear ([Parameters](#parameters), [Sparse attention](#sparse-attention-qsa)).
 
 ## Parameters
 
-One engine; everything below is a parameter of it, set in the two preset files (a `PARAMETER` comment marks each line).
-No combination matrix: the defaults are the 4-card preset, the other values are listed as working values with what each
-was measured at. Numbers are single runs on the b70.x builds named in the last column (see the section above for the
-kernel build).
+One engine; everything below is a parameter of it, set in the preset files (a `PARAMETER` comment marks each line). No
+combination matrix: each row gives the default (the 4-card preset's value unless noted), the other working values and what
+each was measured at.
 
-| parameter | where | default (4-card preset) | other values | measured at |
+| parameter | where | default | other values | measured at |
 |---|---|---|---|---|
-| **attention** | the serve dir's `config.json`, plus three `B70_QSA_*` keys in the env | **sparse (QSA)**: [`serve-config-qsa.json`](engines/serve-config-qsa.json) with `B70_QSA_ATTN_IMPL=attn2`, `B70_QSA_TOPK=native_det`, `B70_QSA_TOPK_SELECT_IMPL=triton` | **dense**: [`serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) in the serve dir and the three keys removed | sparse (b70.4): agent replay ≈ 205 s, one-stream decode 162.7 tok/s, 4 / 8 streams 287 / 577 tok/s, GPU KV 344,706, short context 0.90–0.97× dense, 131K prefill 1.06×. Dense (b70.3 table, 8 slots): 169.3 tok/s, 306.2 / 605.5, prefill 6,305 / 6,114 / 4,641, KV 397,309, replay ≈ 232 s. Dense at 12 slots (K3 window, trunk, 0.1.15.4): KV 385,685, 169.9 tok/s, 4 streams 297 (against 311 at 8 slots), 8 streams 639, replay 232 s. **Dense at 12 slots not re-measured on 0.1.16.2.** |
-| **cards** | `--tensor-parallel-size`, `draft_tensor_parallel_size`, `ZE_AFFINITY_MASK` | 4 | 2 (`preset-2card.*`, placeholder: TP2, 4 slots, KV offload 64 GiB, attention per the 2-card measurement) | 4 cards: all numbers on this page. 2 cards: TP2 boots to KV sizing in development (77,885 tokens per rank at 64K before the draft page fit, patch 0038, which models ≈ 221K); no 2-card speed number in this tree |
-| **drafter** | `--speculative-config` | DFlash2, K = 7 (incoai's drafter) | MTP (`"method":"mtp"`, k = 3; the MTP draft-prefill patch 0021 and the uniform-drafts guard 0026 are in the series) | DFlash K = 7: every 0.32 number. MTP: only on the 0.30.0-b70.2 line (107.5 tok/s at one stream, 16 slots); not part of the validated 0.32 set |
-| **expert offload (hot/cold)** | `B70_MOE_HOTCOLD=1`, `B70_MOE_COLD_EXPERTS=N` (cold experts per layer per rank, of 128 at TP4 and 256 at TP2) | off (all experts resident) | on with N cold experts. B70-V32-HC3 makes it capture-safe: cold prefetch never runs inside graph capture, and raises if it does. **The hot/cold code (from Niluthon/qwen38-flash-tp2 plus our B70-V32-HC1..HC3) is trunk code that this kit's exported series does not carry**; the parameter is documented for the trunk engine | off: all numbers. On: TP4 with 16 cold of 128 booted at KV 471,821 tokens with cold prefetch off (before HC3); the capture-time hang of hot/cold (TP2 and TP4) is what HC3 fixes, and a bisect probe that skipped the prefetch under capture passed 8 of 8. No speed or fidelity number for it |
-| **KV offload size** | `--kv-offloading-size` (GiB of host RAM, split evenly over the ranks; keep it a power of two times 4) | 128 | 64 (the 2-card placeholder); lower it with less host RAM | 128 GiB: every replay number. 64: not measured |
-| **slots** | `--max-num-seqs` and the capture list (every multiple of 8 up to slots × 8, then 256 / 512 / 1024) | 12 | 8 (within noise of 12 on the sparse engine); 4 (the 2-card placeholder; 2 as the fallback); 16 was dropped (it overloads: one preemption under 12-session load, −6 % at 4 streams) | sparse 8 vs 12: 4 streams 280 vs 287 tok/s, replay 204.5 vs 206.6 s (K3 window) |
-| **GPU memory** | `--gpu-memory-utilization` | 0.89 | lower for more headroom; 0.88 leaves too little KV for one 262,144-token request | 0.89: all numbers; 0.89 is the highest vLLM's start-up check accepts on compute-runtime 26.35 |
-| **oneCCL plugin** | `CCL_PLUGIN`, the five `CCL_SYCL_*_TMP_BUF` keys and the `expandable_segments` part of `PYTORCH_ALLOC_CONF` | patched legacy plugin (build step 6; +~2 % KV) | the stock plugin: remove those three groups of lines (this was `serve.env` in b70.1–b70.3); never enable expandable segments with the shipped plugin | dense at 8 slots: KV 388,872 (stock) against 397,309 (patched), speed within noise; stock plugin with sparse: not run |
-| **opt-out `B70_KV_SPLIT_GROUPS=0`** | env | on (66 groups of 905,216 B blocks) | 0: the old 7-group packing | KV 344,706 with the split; output unchanged (KL against unsplit sparse at its own floor); replay GPU prefix hit rate 0.37 → 0.46 |
-| **opt-out `B70_KV_DRAFT_PAGE_FIT=0`** | env | on (patch 0038) | 0: the draft page sets every KV block as before | TP4: no effect (KV 344,706 unchanged, gate PASS); TP2: the reason for the patch (77,885 → modelled ≈ 221K tokens) |
+| **attention** | the serve dir's `config.json`, plus three `B70_QSA_*` keys in the env | **sparse (QSA)**: [`serve-config-qsa.json`](engines/serve-config-qsa.json) with `B70_QSA_ATTN_IMPL=attn2`, `B70_QSA_TOPK=native_det`, `B70_QSA_TOPK_SELECT_IMPL=triton` (both presets) | **dense**: [`serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) in the serve dir and the three keys removed. Working, measured below | sparse: [Presets](#presets). Dense, b70.3 build (0.1.15.4 environment, 8 slots, patched plugin): one stream 169.3 tok/s, 4 / 8 streams 306.2 / 605.5, prefill 8K / 32K / 131K 6,305 / 6,114 / 4,641, KV 397,309. Dense, 12 slots (0.1.15.4 environment): KV 385,685, one stream 169.9, 4 streams 297, 8 streams 639, agent replay 232 s. **Dense at 12 slots not re-measured on 0.1.16.2.** Sparse against dense on the same engine code: [Sparse attention](#sparse-attention-qsa) |
+| **cards** | `--tensor-parallel-size`, `draft_tensor_parallel_size`, `ZE_AFFINITY_MASK` | 4 | 2 (the 2-card preset) | both: [Presets](#presets) |
+| **drafter** | `--speculative-config` | DFlash2, K = 7 (incoai's drafter), both presets | MTP (`"method":"mtp"`, k = 3; the MTP draft-prefill patch 0021 and the uniform-drafts guard 0026 are in the series) | DFlash K = 7: every 0.32 number. MTP: only on the 0.30.0-b70.2 line (107.5 tok/s at one stream, 16 slots); not measured on 0.32 |
+| **expert offload (hot/cold)** | `B70_MOE_HOTCOLD=1`, `B70_MOE_COLD_EXPERTS=N` (cold experts per layer per rank, of 128 at TP4 and 256 at TP2) and the keys of the hot/cold block in `preset-2card.env` | off (4-card) | on with N = 145 (2-card) | off: the 4-card preset. On, N = 145 at TP2: the 2-card preset. At TP4 (N = 16, before the capture fix, prefetch off): booted at KV 471,821 tokens; no speed or fidelity number |
+| **KV offload size** | `--kv-offloading-size` (GiB of host RAM, split evenly over the ranks; keep it a power of two times the card count) | 128 (4-card) | 16 (2-card); lower it with less host RAM | 128: the 4-card preset and every replay number. 16: the 2-card preset. 48 at TP2 (pre-release environment): KV 274,069, host MemAvailable ~119 GiB, so 16 frees ~35 GiB more |
+| **slots** | `--max-num-seqs` and the capture list (every multiple of 8 up to slots × 8, then 256 / 512 / 1024) | 12 (4-card) | 8 (within noise of 12 on the sparse engine); 4 (2-card); 16 was dropped (one preemption under 12-session load, −6 % at 4 streams) | sparse at 4 cards, 0.1.15.4 environment: 8 against 12 slots 280 against 287 tok/s at 4 streams, replay 204.5 against 206.6 s. 4: the 2-card preset |
+| **GPU memory** | `--gpu-memory-utilization` | 0.89, both presets | lower for more headroom; 0.88 leaves too little KV for one 262,144-token request at TP4 | 0.89: every 0.32 number; the highest value vLLM's start-up check accepts on compute-runtime 26.35 |
+| **oneCCL plugin** | `CCL_PLUGIN`, the five `CCL_SYCL_*_TMP_BUF` keys and the `expandable_segments` part of `PYTORCH_ALLOC_CONF` | patched legacy plugin (build step 6; +~2 % KV), both presets | the stock plugin: remove those three groups of lines; never enable expandable segments with the shipped plugin | dense, 8 slots, b70.1 build: KV 388,872 (stock) against 397,309 (patched), speed within noise. Stock plugin with sparse: not run |
+| **opt-out `B70_KV_SPLIT_GROUPS=0`** | env | on (66 KV groups of 905,216 B blocks) | 0: the old 7-group packing | sparse, 4 cards, 12 slots, 0.1.15.4 environment: KV 344,706 with the split; output unchanged (KL against unsplit sparse at its own floor); replay GPU prefix hit rate 0.37 → 0.46 |
+| **opt-out `B70_KV_DRAFT_PAGE_FIT=0`** | env | on (patch 0038) | 0: the draft page sets every KV block as before | TP4: no effect (gate PASS, KV unchanged). TP2: needed for the 2-card preset's KV (before it: 77,885 tokens at a 64K context) |
 
 Launch-time changes that are not parameters: the kernels, the patches and the oneAPI runtime are fixed per release.
 
-## Numbers
+## Numbers, 0.32.0-b70.1 (how the line was validated)
 
 Three configurations measured with the same harness on the same host, one after another, on an idle engine (each
 timed cell waits for 20 s with no running or waiting requests). Single runs unless noted; read differences under
 ~5 % as noise: 0.32 matches the 0.30 perf line, and the gain over 0.30.0-b70.2 is the DFlash2/async/bundle stack, which
 runs on both. These are **not** comparable with the per-build tables in [docs/line-0.30.md](../docs/line-0.30.md#models), which use a different
 harness (the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching
-configuration). The headline table on the main README cover is taken from this one.
+configuration). The 0.32 column is dense attention at 8 slots on the 0.1.15.4 kernel build (the b70.1 code). The current presets' numbers are in [Presets](#presets).
 
 | | 0.30.0-b70.2 (as released: MTP k=3, 16 slots) | 0.30 perf line (DFlash2 K=7, 8 slots) | **0.32.0-b70.1** |
 |---|---|---|---|
@@ -150,22 +178,31 @@ Upstream fixes folded in (all six are our posted PRs; #658 merged on main on 202
 
 | fix | upstream | here |
 |---|---|---|
-| GDN conv-state offset in 64 bits (an int32 wrap at block id ≥ 5,042 killed engines) | vllm-xpu-kernels #658 (fixes #657; merged on main 2026-10-26, not in a release; the 0.1.16.2 wheel lacks it) | our `libgdn_index64.so` (the engine's GDN op; all conv-state sites 64-bit) |
-| GDN kernels skip rows whose state index is the null block (graph padding rows wrote state into the shared null page) | vllm-xpu-kernels #660 (fixes #659; open) | `patches/libgdn-index64/` (in our library) |
-| `swap_blocks_batch`: copy pinned (and registered) host sources directly, `snapshot_src=False` | vllm-xpu-kernels #662 (fixes #661; open) | caller B70-V32-PR2; **the 0.1.16.2 wheel lacks the kernel half, so the caller falls back to the snapshot copy** |
+| GDN conv-state offset in 64 bits (an int32 wrap at block id ≥ 5,042 killed engines) | vllm-xpu-kernels #658 (fixes #657; merged on main 2026-10-26, in no release, so not in 0.1.16.2) | our `libgdn_index64.so` (the engine's GDN op; all conv-state sites 64-bit) |
+| GDN kernels skip rows whose state index is the null block (graph padding rows wrote state into the shared null page) | vllm-xpu-kernels #660 (fixes #659; open) | our kernel build ([`patches/vllm-xpu-kernels/`](patches/vllm-xpu-kernels/) 0001) and `patches/libgdn-index64/` (our library) |
+| `swap_blocks_batch`: copy pinned (and registered) host sources directly, `snapshot_src=False` | vllm-xpu-kernels #662 (fixes #661; open) | our kernel build ([`patches/vllm-xpu-kernels/`](patches/vllm-xpu-kernels/) 0002) + the caller, B70-V32-PR2 |
 | Model Runner V2 prompt-logprobs chunks bounded by `max_num_reqs` (a 1024-row chunk spilled VRAM into host RAM) | vLLM #63564 (fixes #63563) | cherry-picked; replaces our 0029b |
 | KV offload: pin a shared-prefix junction when a hybrid model's sparse group cuts the offload hit | vLLM #63566 (fixes #63565) | cherry-picked; replaces our 0014b |
 | oneCCL legacy plugin: device USM that `msync()` sees as host takes the GPU path | oneCCL #229 (fixes #228) | plugin build, step 6 |
 
+
 ## The series
 
-[`patches/vllm/`](patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.4-dense` of the fork; `scripts/check-series.sh`
-fails if it differs from a fresh export.
-`tools/check-trunk-tree.sh` is the tree-level counterpart for maintainers: it applies both series (dense and sparse) to
-vanilla v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere except the hot/cold
-commits (`--hotcold-count N`, with `--hotcold-tip` when later commits sit on top of them and `--hotcold-extra` for a single hot/cold commit outside that range); see the header of the script.
+The engine is fork tag `v0.32.0-b70.4`, exported as three directories that apply in order on vLLM v0.32.0 (`git am`, or
+`git apply` one after the other); `scripts/check-series.sh --all` fails if any of them differs from a fresh export of the
+fork:
 
-| patches | what | author |
+| directory | export of | commits |
+|---|---|---|
+| [`patches/vllm/`](patches/vllm/) | `v0.32.0..v0.32.0-b70.4-dense` | 50: the dense base (below) |
+| [`patches/vllm-qsa/`](patches/vllm-qsa/) | `v0.32.0-b70.4-dense..v0.32.0-b70.4-qsa` | 38: sparse attention ([Sparse attention](#sparse-attention-qsa)) |
+| [`patches/vllm-hotcold/`](patches/vllm-hotcold/) | `v0.32.0-b70.4-qsa..v0.32.0-b70.4` | 13: hot/cold expert offload ([below](#hotcold-expert-offload)) |
+
+`tools/check-trunk-tree.sh` is the tree-level counterpart for maintainers: it applies the three directories to vanilla
+v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere; see the header of the
+script.
+
+| patches (`patches/vllm/`) | what | author |
 |---|---|---|
 | 0001 | wu1ff's MIT license and pack notice, under `b70/third_party/wu1ff/` | Lumnus |
 | 0002–0016 | wu1ff's 1.0.5 chain for vLLM 0.32 (target port, DFlash2, C1 verify/target graphs, astra500 MoE/HC/prefill paths, serving fixes), the `vllm/` hunks of his patch-chain taken unchanged, one commit per patch | wu1ff |
@@ -174,16 +211,29 @@ commits (`--hotcold-count N`, with `--hotcold-tip` when later commits sit on top
 | 0038–0049 | 0.32-specific: B70-V32-PR2, -01, -0053, -02/-02b (diagnostic), -03/-03b, -04, -07, -0054 (off), -08, -RC1 | Lumnus |
 | 0050 | b70.4: backport of vllm-project/vllm#54163 (merged upstream 2026-10-23): `needs_eagle_block_drop()` excludes DFlash/DSpark, so the trailing prefix-cache block is no longer dropped for them and `disable_eagle_block_drop` is not needed. Applied by hand where the 0.32 line lacks `is_xpress`; its tests ported | Lumnus |
 
-Off by default and not used in the served configuration: B70-V32-01 (`B70_C1_EAGER_ROUTE`), -02/-02b
-(`B70_PHASE_TIMING`), -04 (`B70_HC_PARALLEL_MAX_ROWS`, superseded by -07), -0054 (`B70_MOE_DECODE_OP_RESIDENT`; the
-astra 8-row path is faster at decode, and it needs a separate library built from Niluthon's `b70-moe-decode`).
+Off by default and not used in either preset: B70-V32-01 (`B70_C1_EAGER_ROUTE`), -02/-02b (`B70_PHASE_TIMING`), -04
+(`B70_HC_PARALLEL_MAX_ROWS`, superseded by -07), -0054 (`B70_MOE_DECODE_OP_RESIDENT`; the astra 8-row path is faster at
+decode; it loads the same library as the hot/cold decode op, build step 5).
 
-[`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/): the Python side next to vllm-xpu-kernels —
-wu1ff's `vllm_xpu_kernels/` hunks (0001–0007: the astra500 wrapper modules and hooks in the fused-MoE interface) plus
-B70-V32-05 (`B70_ASTRA_MID`, rejected, off) and B70-V32-06 (`B70_ASTRA_OWNERSHIP=0`, the EP layout we serve). They create
-`astra500_moe.py`, `astra_structural.py` and `astra_ownership.py`, which the trunk imports; their `fused_moe_interface.py`
-hunks are written against 0.1.15.4 and **do not apply to the 0.1.16.2 wheel's file**, so on 0.1.16.2 apply them with
-`--exclude=vllm_xpu_kernels/fused_moe_interface.py` (build step 4). That is the venv we validated.
+### Hot/cold expert offload
+
+[`patches/vllm-hotcold/`](patches/vllm-hotcold/), 13 commits: 0001–0010 are Niluthon's hot/cold patches from
+[qwen38-flash-tp2](https://github.com/Niluthon/qwen38-flash-tp2) @ `e536e33` (Apache-2.0), ported to 0.32 through our 0.30
+carry and kept with his authorship; 0011–0013 are ours.
+
+| patches | what |
+|---|---|
+| 0001 | B70-0040: routed experts split between VRAM (hot) and pinned host RAM (cold); the cold ones are read by the same int4 grouped GEMM through a UVA view, and the two outputs are summed (bit-exact against all experts in VRAM) |
+| 0002, 0004, 0006, 0007 | B70-0041 route counter, B70-0043 swapping (the VRAM hot set follows the traffic), B70-0046 route trace (diagnostic), B70-0047 decode-aware ranking and a learned hot set that survives restarts |
+| 0003 | B70-0042: cold-expert prefetch for prefill (double-buffered DMA into two VRAM slots, eager batches of ≥ 512 tokens) |
+| 0005 | B70-0044: input embedding table in pinned host RAM (`B70_EMBED_UVA`, off in both presets) |
+| 0008, 0009 | B70-0048 fused hot+cold decode MoE op (`B70_MOE_DECODE_OP`, the library from build step 5) and an FP8 MTP draft head (off; the presets use DFlash); B70-0049 the op's CPU pool switch (`B70_MOE_CPU=0` in the 2-card preset) |
+| 0010 | their CPU tests |
+| 0011 | B70-V32-HC1: `B70_MOE_COLD_EXPERTS=N` (cold per layer per rank, so N means the same VRAM saving at TP4 and TP2), the 0.32 remap of unrouted ids as a helper, CPU tests |
+| 0012 | B70-V32-HC2: drop two upstream tests that do not apply to 0.32 |
+| 0013 | B70-V32-HC3: cold prefetch never runs under graph capture. It hung the 512/1024-token captures; capture now reads the cold experts over UVA at any size, and the prefetcher raises if it is called while the stream is capturing |
+
+Off unless `B70_MOE_HOTCOLD=1`: with it unset nothing changes, which is how the 4-card preset runs.
 
 ## Software
 
@@ -195,32 +245,40 @@ hunks are written against 0.1.15.4 and **do not apply to the 0.1.16.2 wheel's fi
 | Python | 3.12 |
 | torch / triton | 2.14.0+xpu / 3.8.0+xpu |
 | Intel runtime wheels | intel-sycl-rt, dpcpp-cpp-rt, intel-opencl-rt 2026.1.1; onemkl-sycl 2026.1.0 |
-| oneCCL | 2022.1.2 (pip `oneccl`) core and loader; the presets use the legacy plugin rebuilt with oneCCL#229 (build step 6); the stock plugin is a parameter |
-| vllm-xpu-kernels | **0.1.16.2** (PyPI wheel, sha256 `86bfa26abbb6…`; 0.1.15.4 is retired) + our `libgdn_index64.so` ([`patches/libgdn-index64/`](patches/libgdn-index64/), build step 5) + the astra Python modules from [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/) |
+| oneCCL | 2022.1.2 (pip `oneccl`) core and loader; both presets use the legacy plugin rebuilt with oneCCL#229 (build step 6); the stock plugin is a parameter |
+| vllm-xpu-kernels | **0.1.16.2 + our #660 and #662** (build step 3): the compiled libraries are built from upstream `6b30c9b` + [`patches/vllm-xpu-kernels/`](patches/vllm-xpu-kernels/) with FlashAttention-2, MQA-logits and Xe3P off; the attention libraries and the Python files come from the PyPI 0.1.16.2 wheel; the astra Python modules and hooks from [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/) (step 4). Plus our `libgdn_index64.so` (step 5): the engine's GDN op, with 64-bit conv-state offsets at every site. Upstream #658 (the same 64-bit fix) is merged on main on 2026-10-26 and in no release |
+| native libraries | wu1ff's B70-LLM-Controller 1.0.5 libraries, the Level Zero peer-residency shim, `libgdn_index64.so`, and Niluthon's `libb70_moe_decode.so` (2-card preset), all built in step 5 |
 | other pins | transformers 5.17.0, auto-round-lib 0.16.0 |
-| vLLM | v0.32.0 + this series |
+| vLLM | v0.32.0 + the three directories above (fork tag `v0.32.0-b70.4`) |
 
-`/dev/shm`: no requirement any more (B70-V32-RC1). Without RC1, vLLM 0.32 maps the whole CPU KV tier into `/dev/shm`,
-so a container needs `/dev/shm` ≥ 140 GiB for a 128 GiB tier.
+**Which upstream commit 0.1.16.2 is.** There is no GitHub tag for 0.1.16.2. The PyPI wheel's seven `.py` files match upstream
+byte for byte at `8b95ea6`, `6b30c9b` and `19c6ddc` and at nothing later; its paged-decode table has the rows that #566
+(`6b30c9b`) adds, which rules out `8b95ea6`; `19c6ddc` changes only a CI file. So the source tree is `6b30c9b` (high
+certainty for the tree, medium for the exact commit: upstream may have built from an untagged copy of it).
+
+`/dev/shm`: no requirement (B70-V32-RC1). Without RC1, vLLM 0.32 maps the whole CPU KV tier into `/dev/shm`, so a
+container would need `/dev/shm` ≥ 140 GiB for a 128 GiB tier.
 
 ## Host RAM
 
-On our 256 GB host the engine takes ~164 GiB after start: the CPU KV tier is 128 GiB of pinned memory (32 GiB per
+The 4-card preset takes ~164 GiB after start on our 256 GB host: the CPU KV tier is 128 GiB of pinned memory (32 GiB per
 rank, which is why `AllowUnrestrictedSize=1` is needed), the PLE row cache 8 GiB, and the rest is the four workers.
-MemAvailable stays at 35–39 GiB with ~20 GiB of other work on the host. Pinned memory does not count against a
-container memory limit, so watch the host's MemAvailable, not the container's. With less RAM, lower
-`--kv-offloading-size` (keep it a power of two times 4: 64 frees 64 GiB) or move the PLE table into RAM only if you
-have the 49 GiB it then needs.
+MemAvailable was 35–39 GiB with ~20 GiB of other work on the host (b70.1) and 60.4 GiB with the released preset up
+(2026-10-26). The 2-card preset leaves 154.9 GiB available: it holds a 16 GiB tier, a 4 GiB PLE row cache and the cold
+experts (145 per layer per rank, pinned). Pinned memory does not count against a container memory limit, so watch the
+host's MemAvailable, not the container's. With less RAM, lower `--kv-offloading-size` (keep it a power of two times the
+card count) or move the PLE table into RAM only if you have the 49 GiB it then needs.
 
 ## Build and run
 
-The commands we ran, with our paths replaced by placeholders. Not run end to end in this form.
+The commands we ran, with our paths replaced by placeholders. The engine and environment were built and checked file by
+file against these steps; the sequence has not been run end to end in this form from a clean clone.
 
 1. **Base.** compute-runtime 26.35.39758.10 on the host, the xe driver, and oneAPI DPC++ 2026.1.1 for the builds.
 
-2. **Python environment.**
+2. **vLLM and the Python environment.**
    ```bash
-   git clone -b v0.32.0-b70.4 https://github.com/Lumnus/vllm.git vllm-b70-0.32   # dense series + sparse add-on; v0.32.0-b70.4-dense is the dense series alone
+   git clone -b v0.32.0-b70.4 https://github.com/Lumnus/vllm.git vllm-b70-0.32   # the engine: dense base + sparse + hot/cold
    uv venv --python 3.12 /opt/b70/venv
    uv pip install --python /opt/b70/venv/bin/python --index-strategy unsafe-best-match \
        --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/xpu/ \
@@ -229,38 +287,60 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
    # triton's XPU launcher needs CL/cl.h; intel-sycl-rt ships only include/sycl. Check:
    printf '#include <sycl/detail/cl.h>\nint main(){}\n' | g++ -std=c++17 -I/opt/b70/venv/include -x c++ -fsyntax-only -
    ```
+   Instead of cloning the tag you can apply the three patch directories to a v0.32.0 checkout in order
+   (`git am v0.32/patches/vllm/*.patch v0.32/patches/vllm-qsa/*.patch v0.32/patches/vllm-hotcold/*.patch`).
 
-3. **vllm-xpu-kernels 0.1.16.2.** The PyPI wheel, nothing to build (uploaded 2026-10-26, no GitHub tag; sha256 starts
-   `86bfa26abbb6`):
+3. **vllm-xpu-kernels 0.1.16.2 with #660 and #662.** Install the PyPI wheel (it brings the Python files and the attention
+   libraries), then build the compiled libraries from source with our two PRs and lay them over the installed ones:
    ```bash
-   uv pip install --python /opt/b70/venv/bin/python vllm-xpu-kernels==0.1.16.2
+   uv pip install --python /opt/b70/venv/bin/python vllm-xpu-kernels==0.1.16.2      # PyPI wheel, sha256 starts 86bfa26abbb6
+   git clone https://github.com/vllm-project/vllm-xpu-kernels.git && cd vllm-xpu-kernels
+   git checkout 6b30c9b92cc525c32729df988b5f918e7c5661a5 && git am <kit>/v0.32/patches/vllm-xpu-kernels/*.patch
+   source /opt/intel/oneapi/2026.1/oneapi-vars.sh   # plus gcc-toolset-13 on our builder
+   VLLM_XPU_ENABLE_XE3P=OFF FA2_KERNELS_ENABLED=OFF MQA_LOGITS_KERNELS_ENABLED=OFF VLLM_XPU_ENABLE_ONEDNN=ON MAX_JOBS=6 \
+     VLLM_VERSION_OVERRIDE=0.1.16.2+b70 /opt/b70/venv/bin/python setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
+   # take only the eight compiled libraries; keep the wheel's attention libraries (not built here) and everything else
+   K=/opt/b70/venv/lib/python3.12/site-packages/vllm_xpu_kernels; mkdir -p w && python3 -I -m zipfile -e dist/*.whl w
+   for f in _C.abi3.so _moe_C.abi3.so _xpu_C.abi3.so xpumem_allocator.abi3.so libgdn_attn_kernels_xe_2.so \
+            libgrouped_gemm_xe_2.so libgrouped_gemm_xe_default.so libmhc_kernels_xe_2.so; do install -m 0755 w/vllm_xpu_kernels/$f $K/$f; done
    ```
-   Our validated venv is this wheel laid over the previous 0.1.15.4-based venv (the wheel's files replace same-named
-   ones; the astra and wu1ff libraries stay). It carries the paged-decode row `16,256,64,false,false,false` that a 2-card
-   layout needs. It does **not** carry upstream #658 (merged on main on 2026-10-26, not in a release), #660 or #662: the
-   engine does not need #658 because its GDN op is `torch.ops._gdn_index64` from our `libgdn_index64.so` (step 5, built
-   with the null-block skip of #660 and 64-bit conv-state offsets at every site). The stock `_xpu_C` op in this wheel still
-   fails `tests/gdn_attn/test_causal_conv1d.py -k large_state_offset` 3 of 3 on a card; the trunk never calls it, and the
-   same three tests pass 3 of 3 through `_gdn_index64`. 0.1.15.4 (built from source with our PRs) is retired.
+   Do not `pip install` the built wheel: with FlashAttention-2 and MQA-logits off it has no attention libraries
+   (`libattn_kernels_xe_2/_xe_3`, `_vllm_fa2_C`, `libmqa_logits_kernels_xe_2`), and installing it would remove the PyPI
+   ones. MAX_JOBS above 6 ran out of memory on a 64 GiB builder; the build takes ~36 min there. The kernel table must keep
+   the paged-decode row `16,256,64,false,false,false` (a TP2 layout needs it; 0.1.16.2 has it).
 
-4. **Kernels, Python side.** The astra modules the trunk imports (`astra500_moe.py`, `astra_structural.py`,
-   `astra_ownership.py`), from [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/), into the installed package.
-   The patches' `fused_moe_interface.py` hunks are written against 0.1.15.4 and do not apply to the 0.1.16.2 file, so leave
-   that file out (our validated venv has the wheel's own, see known issue 8):
-   `for p in patches/vllm-xpu-kernels-py/*.patch; do (cd /opt/b70/venv/lib/python3.12/site-packages && git apply -p1 --exclude=vllm_xpu_kernels/fused_moe_interface.py) < $p; done`
-   (checked: the three modules come out byte-identical to the ones in our venv).
+4. **Kernels, Python side.** The astra modules the engine imports (`astra500_moe.py`, `astra_structural.py`,
+   `astra_ownership.py`) and the astra hooks in `fused_moe_interface.py`, from
+   [`patches/vllm-xpu-kernels-py/`](patches/vllm-xpu-kernels-py/), written against the 0.1.16.2 Python files:
+   ```bash
+   cd /opt/b70/venv/lib/python3.12/site-packages && for p in <kit>/v0.32/patches/vllm-xpu-kernels-py/*.patch; do git apply -p1 < "$p"; done
+   ```
+   The result is byte-identical to the validated environment (`fused_moe_interface.py` sha256 starts `3ef25b12`). It keeps
+   0.1.16.2's own DP-padding mask, which sits after the astra early returns; both presets run DP = 1, so there are no padding
+   rows.
 
-5. **wu1ff's native libraries.** From [wu1ff/B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller) @
-   `5e5cf43` (release `qwen3.8-flash-next-v1.0.5`, MIT), `model-packs/Qwen3.8-Flash-Next/patches/production/native`:
-   build the libraries with the pack's own build scripts (icpx 2026.1.1, torch 2.14 headers from the venv) and install
-   `libastra_*.so`, `libbeyond_prefill.so`, `libdominant_w4_layout.so`, `liblong_hc.so`, `liblong_prefill_v3.so`,
-   `libserving_prefill.so` into `site-packages/vllm_xpu_kernels/`. Build `libgdn_index64.so` the same way after applying
-   [`patches/libgdn-index64/`](patches/libgdn-index64/) to the pack's `dependencies/gdn-headers` (vLLM 0.32 runs the GDN
-   op from this library, `sha256 aabd7ae6…` in our venv; it imports `chunk_gated_delta_rule_xe2` and `l2norm` from the wheel's own
-   `libgdn_attn_kernels_xe_2.so`, whose sources are identical in 0.1.15.4 and 0.1.16.2). Put the Level Zero peer-residency shim at `/opt/b70/libl0_peer_residency_shim.so`. Our builds
-   are not byte-identical to wu1ff's accepted hashes (different build paths); the shim is.
+5. **Native libraries.**
+   1. **wu1ff's.** From [wu1ff/B70-LLM-Controller](https://github.com/wu1ff/B70-LLM-Controller) @ `5e5cf43` (release
+      `qwen3.8-flash-next-v1.0.5`, MIT), `model-packs/Qwen3.8-Flash-Next/patches/production/native`: build the libraries with
+      the pack's own build scripts (icpx 2026.1.1, torch 2.14 headers from the venv) and install `libastra_*.so`,
+      `libbeyond_prefill.so`, `libdominant_w4_layout.so`, `liblong_hc.so`, `liblong_prefill_v3.so`, `libserving_prefill.so`
+      into `site-packages/vllm_xpu_kernels/`. Put the Level Zero peer-residency shim at `/opt/b70/libl0_peer_residency_shim.so`.
+      Our builds are not byte-identical to wu1ff's accepted hashes (different build paths); the shim is.
+   2. **`libgdn_index64.so`.** Build it the same way after applying [`patches/libgdn-index64/`](patches/libgdn-index64/)
+      to the pack's `dependencies/gdn-headers`, into `site-packages/vllm_xpu_kernels/`. vLLM 0.32 runs the GDN op from this
+      library (`torch.ops._gdn_index64`; sha256 starts `aabd7ae6` in our environment). It imports `chunk_gated_delta_rule_xe2`
+      and `l2norm` from the step-3 `libgdn_attn_kernels_xe_2.so`.
+   3. **`libb70_moe_decode.so`** (the 2-card preset's hot/cold decode op). From
+      [Niluthon/qwen38-flash-tp2](https://github.com/Niluthon/qwen38-flash-tp2) @ `e536e33`, `kernels/b70-moe-decode`:
+      ```bash
+      T=$(/opt/b70/venv/bin/python -I -c "import torch, os; print(os.path.dirname(torch.__file__))")
+      icpx -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen "-device bmg" -O3 -std=c++20 -shared -fPIC -ffast-math \
+        -D_GLIBCXX_USE_CXX11_ABI=1 -I$T/include -I$T/include/torch/csrc/api/include -x c++ kernels/b70-moe-decode/b70_moe_decode.sycl \
+        -o /opt/b70/libb70_moe_decode.so -L$T/lib -lc10 -lc10_xpu -ltorch -ltorch_cpu -ltorch_xpu -Wl,-rpath,$T/lib
+      ```
 
-6. **oneCCL legacy plugin** (used by both presets; skip it for the stock-plugin parameter value). One file, built against the venv's shipped oneCCL 2022.1.2:
+6. **oneCCL legacy plugin** (used by both presets; skip it for the stock-plugin parameter value). One file, built against
+   the venv's shipped oneCCL 2022.1.2:
    ```bash
    git clone -b master-v2 https://github.com/uxlfoundation/oneCCL.git && cd oneCCL
    git fetch -q origin pull/229/head && git checkout FETCH_HEAD   # caeb329, on master-v2 c5108e7
@@ -270,42 +350,60 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
        plugins/legacy/ccl_legacy.cpp src/debug.cpp -o /opt/b70/oneccl-legacy/libccl_legacy.so \
        -L$V/lib -lccl -l:libccl.so.2 -ldl -Wl,--no-undefined -Wl,-soname,libccl_legacy.so
    ```
-   `CCL_PLUGIN` in `preset-4card.env` points the shipped loader at it; the venv stays untouched.
+   `CCL_PLUGIN` in the preset `.env` points the shipped loader at it; the venv stays untouched.
 
 7. **Weights.** Intel AutoRound @ `4c67bf68` without the 102.4 GB PLE shard, devan's `ple_table_qwen4exp.pt`, the INT8
    table from `tools/build_int8_ple.py`, and the snapshot from `tools/intel_snapshot.py` (as for 0.30, see
    [engines/README.md](../engines/README.md)). Make a serve dir: symlink every snapshot file into it and copy
-   [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json) (sparse attention, the preset's default) over its
+   [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json) (sparse attention, both presets' default) over its
    `config.json` (the dense config plus `indexer_n_heads`, `indexer_kv_heads`, `indexer_head_dim`, `indexer_budget`,
    `indexer_compress_ratio` in `text_config`, so the 39 indexer tensors load), or, for dense attention,
    [`engines/serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) (byte-identical to the one we
-   serve). The drafter: `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` into
-   `/models/qwen3.8-flash-next/DFlash2`.
+   serve). The drafter: `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` into `/models/qwen3.8-flash-next/DFlash2`. For the
+   2-card preset, the hot/cold rankings seed: `configs/static_hot_cache_rankings.json` from
+   [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090) @ `4dca58f` (Apache-2.0;
+   sha256 starts `1230c61a`; an order of experts per layer, not counts) into `/models/qwen3.8-flash-next/`.
 
-8. **Run.**
+8. **Run.** One preset at a time per card set; the 2-card preset needs only its two cards.
    ```bash
-   set -a; . v0.32/engines/preset-4card.env; set +a   # the 4-card preset; preset-2card.* is a placeholder
-   mapfile -t args < <(grep -v '^#' v0.32/engines/preset-4card.args | sed '/^$/d' | sed 's/^\(--[^ ]*\) \(.*\)$/\1\n\2/')
+   P=preset-4card   # or preset-2card
+   set -a; . v0.32/engines/$P.env; set +a
+   mapfile -t args < <(grep -v '^#' v0.32/engines/$P.args | sed '/^$/d' | sed 's/^\(--[^ ]*\) \(.*\)$/\1\n\2/')
    LD_LIBRARY_PATH=/opt/b70/venv/lib /opt/b70/venv/bin/vllm serve /models/qwen3.8-flash-next/serve-dir "${args[@]}"
    ```
-   The venv's own oneAPI 2026.1.1 runtime (`$VENV/lib`) must come first on `LD_LIBRARY_PATH`; a mixed runtime
-   segfaults at exit. First start compiles cold (minutes); our boots take ~4 min.
+   The venv's own oneAPI 2026.1.1 runtime (`$VENV/lib`) must come first on `LD_LIBRARY_PATH`; a mixed runtime segfaults at
+   exit. The first start compiles cold, the QSA Triton kernels included (7 min in our first boot); later boots take ~4–5 min.
 
 Chat template: the examples use the checkpoint's own template. We serve a lightly modified one (thinking switches off
 on `enable_thinking=false` or a "none/off" effort); it is not included.
 
 ## Sparse attention (QSA)
 
-**Status: working, experimental; on par with or ahead of dense on agent sessions and long context, a few percent behind on short
-context.** Release 0.32.0-b70.2 added a second attention variant on top of the dense one; 0.32.0-b70.3 brought it near
-dense speed; 0.32.0-b70.4 fixed its KV packing. The checkpoint's QSA indexer is kept and the full-attention layers
-attend over the indexer's selection (a 2,048-token budget) with Triton kernels, instead of over the whole context. It boots
-on 4× B70, answers correctly, passes the gates and the long-context needles, and its output matches dense up to the
-selection budget. Against dense on the same harness it is 0.90× on one-stream decode and prefill, 1.00× at 4 concurrent
-streams, 0.94× at 8, and faster than dense at 131K prefill, with 14 % less GPU KV (342K against 397K tokens). The dense
-series ([`patches/vllm/`](patches/vllm/), the release above) stays the default.
+**Status: working, experimental; the default attention of both presets.** Release 0.32.0-b70.2 added sparse attention on
+top of the dense line; 0.32.0-b70.3 brought it near dense speed; 0.32.0-b70.4 fixed its KV packing and made it the preset
+default. The checkpoint's QSA indexer is kept and the full-attention layers attend over the indexer's selection (a
+2,048-token budget) with Triton kernels, instead of over the whole context. It boots on 4 and on 2 cards, answers correctly,
+passes the gates and the long-context needles, and its output matches dense up to the selection budget. Dense attention (the
+indexer dropped, full attention) is the other value of the attention parameter and works on the same engine.
 
-| micro-benchmark, b70.3 build, dense at 8 slots | dense | sparse QSA (b70.3) | sparse / dense | sparse in b70.2 (superseded) |
+**Sparse against dense, same engine code.** Measured on the 0.1.15.4 build with identical engine code (the 0.1.16.2
+environment then passed the gate with the token compare identical, [Presets](#presets)); sparse and dense booted back to
+back, one engine at a time, 4 cards, Intel AutoRound, both with the patched oneCCL plugin. The single source for these
+numbers, with method, floors and caveats, is [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md) §0:
+
+1. **Agent-session replay** (recorded multi-turn, 243 requests): sparse 204.7 s (b70.4 build, 12 slots, 0 preemptions,
+   draft acceptance length 5.06) against 230–235 s for dense (8 slots); median decode 61–69 against 45–52 tok/s.
+2. **Short context** (comparison drill, b70.3 sparse code, 8 slots): one-stream decode 0.92× dense, 4 streams level,
+   8 streams 0.93×, prefill up to 32K 0.89×.
+3. **Long prefill:** 131K 1.06×, 260K 1.31× (4,480 against 3,420 tok/s).
+4. **Long-context tasks** (384 items, exact match): equal up to 8K; at 128K 80/78 % sparse against 72/72 % dense (two boots
+   each); real-document next-token loss at 32–128K 1.399 against 1.417 nats/token.
+5. **GPU KV:** 344,706 tokens sparse (12 slots, b70.4 build) against 397,309 dense (8 slots).
+
+The b70.3 build, measured with the same harness, host and window as dense, single runs (the table the b70.3 release
+published; the kernels did not change in b70.4, the KV packing and slot count did):
+
+| end to end, b70.3 build, both at 8 slots, 0.1.15.4 environment | dense | sparse QSA (b70.3) | sparse / dense | sparse in b70.2 (superseded) |
 |---|---|---|---|---|
 | decode, 1 stream (tok/s) | 169.3 | 153.1 | 0.90 | 125.0 (0.74) |
 | decode, 4 concurrent (total tok/s) | 306.2 | 306.1 | 1.00 | 161.2 (0.53) |
@@ -320,17 +418,6 @@ beyond that KL 0.0224 against dense on a 12K-token document, where dense's own r
 kernel-level comparison with Intel's SYCL kernel (labelled as kernel level), the gates, the stress stage, the levers that
 were tried and not shipped, and what is not measured are in [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md).
 
-**b70.4, end to end.** Same trunk code for both variants (the published series are tree-identical to it, checked by
-[`tools/check-trunk-tree.sh`](../tools/check-trunk-tree.sh)). Agent-style session replay (recorded multi-turn, 243 requests):
-sparse about 205 s (204.7 s, median decode 69.3 tok/s, 0 preemptions, draft acceptance length 5.06) against about 232 s
-for dense (median decode 45–52 tok/s; earlier back-to-back boots at 230–235 s). Short context, same window: one-stream
-decode 0.92× dense, 4 streams level, 8 streams 0.93×, prefill up to 32K 0.89×; long prefill: 131K 1.06×, 260K 1.31×
-(4,480 against 3,420 tok/s). Long-context task set (384 items, exact match): equal up to 8K, 128K 80/78 % sparse against
-72/72 % dense; real-document next-token loss at 32–128K 1.399 against 1.417 nats/token. GPU KV 344,706 tokens at 12
-slots against 397,309 for dense (both with the patched plugin). The multi-stream rows of the b70.3 table were not
-repeated on the b70.4 build. All of this was measured on the 0.1.15.4 kernel build with the identical trunk ([Which build the numbers were taken on](#which-build-the-numbers-were-taken-on)); dense at 12 slots ran in the K3 window (see [Parameters](#parameters)) and was not re-measured on 0.1.16.2. Method, floors and caveats (retrieval-type
-tasks and three documents; no generation or reasoning tasks): [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md) §0.
-
 **What b70.4 changed.** The sparse engine packed all 12 full-attention layers and their compressed-key caches into one KV
 group, so every block was 10.9 MB and every small per-request state group (GDN, PLE conv, QSA ring, DFlash SWA) paid whole
 fat blocks (about 425 MiB per running request against about 287 MiB on dense: 32 % less free KV at 6 running requests). Patches 0033 and 0036 split
@@ -338,8 +425,8 @@ that bucket into 66 groups of 905,216 B blocks (`B70_KV_SPLIT_GROUPS=0` restores
 sets the repeat explicitly and wins). Outputs are unchanged (teacher-forced KL against unsplit sparse at its own noise
 floor), the agent replay's GPU prefix hit rate goes from about 0.37 to about 0.46, and KV usage on it from 73 % to 62 %.
 Patch 0034 adds `B70_QSA_OPTIMER` (a per-op timer around the QSA ops, off by default; it replaces the XPU profiler,
-which hangs the engine on the first decode graph replay) and 0035 a cache-path lifecycle driver. The presets run
-12 sequences with a capture list of every multiple of 8 up to 96; 12 against 8 slots on the sparse engine is within
+which hangs the engine on the first decode graph replay) and 0035 a cache-path lifecycle driver. The 4-card preset
+runs 12 sequences with a capture list of every multiple of 8 up to 96; 12 against 8 slots on the sparse engine is within
 boot-to-boot noise.
 
 **What b70.3 fixed.** The b70.2 sparse build ran out of GPU memory on 131K prefills under load (about 800 MiB, inside the
@@ -348,10 +435,11 @@ synchronisation, no full-width sort), as a fused Triton select, and the faster s
 are the defaults. The build passed a stress stage of repeated 131K prefills plus 8-stream decode.
 
 **What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 38 patches, applied on top of
-[`patches/vllm/`](patches/vllm/) (that is, on fork tag `v0.32.0-b70.4-dense`); the fork tag is `v0.32.0-b70.4`, branch
-[`b70/v0.32.0-qsa-b70.4`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-b70.4). The b70.2/b70.3 branch `b70/v0.32.0-qsa-release` is the same 32 commits on the b70.1 base. `scripts/check-series.sh --qsa`
-fails if the directory differs from a fresh export of it. The first 32 patches are unchanged in content from b70.3 (0037 and 0038 are the last two trunk fixes; HC3, the hot/cold capture fix, is not in the series, see [Parameters](#parameters)); their
-headers (`From <sha>`, `[PATCH n/38]`) are regenerated because patch 0050 now sits below them. Every patch is authored `Lumnus`; 0001 is the upstream
+[`patches/vllm/`](patches/vllm/) (fork tag `v0.32.0-b70.4-dense`); they end at fork tag `v0.32.0-b70.4-qsa`, and the
+hot/cold directory follows them ([The series](#the-series)). The b70.2/b70.3 branch `b70/v0.32.0-qsa-release` carries the
+first 32 of them on the b70.1 base. `scripts/check-series.sh --qsa` fails if the directory differs from a fresh export. The
+first 32 patches are unchanged in content from b70.3; their headers (`From <sha>`, `[PATCH n/38]`) are regenerated because
+patch 0050 of the dense base now sits below them. Every patch is authored `Lumnus`; 0001 is the upstream
 vllm-project/vllm#60602 cherry-pick.
 
 | patches | what |
@@ -362,35 +450,25 @@ vllm-project/vllm#60602 cherry-pick.
 | 0017–0019, 0022 | qualification: off-by-default hooks for the QSA side caches, `B70_QSA_TOPK=native_det` (the native top-k with the torch selector's output), 148 side-cache state-contract tests and an engine lifecycle driver |
 | 0026 | a one-time log line naming the sparse attention implementation in use |
 | 0027–0032 | 0.32.0-b70.3: `native_det`'s tie repair without a host sync or a full-width sort (0027; `B70_QSA_TOPK=radix` as an alternative), top-k once per verify step and skip-when-fits (0028, both off by default), the scorer launch defaults from the sweeps (0029; `B70_QSA_SCORE_DEFAULTS=legacy` restores the old ones), CPU tests for them (0030), the fused Triton select and the radix schedule by width (0031; `B70_QSA_TOPK_SELECT_IMPL=triton`), profiler buckets for `attn2` and the select (0032) |
-| 0033–0036 | 0.32.0-b70.4: the split packed full-attention KV bucket (0033, env-gated), `B70_QSA_OPTIMER` per-op timer (0034, off by default) and its report script, `qsa_engine_lifecycle2` and its tests (0035), split groups on by default (0036) |
+| 0033–0036 | 0.32.0-b70.4: the split packed full-attention KV bucket (0033, env-gated, and 0036, on by default), the `B70_QSA_OPTIMER` per-op timer and its report script (0034, off by default), the `qsa_engine_lifecycle2` driver and its tests (0035) |
 | 0037–0038 | 0.32.0-b70.4, final trunk fixes: C1 target-graph capture snapshots kept in host RAM and accounted in the memory profile (0037; the TP2 warm-up ran out of memory without it; `VLLM_XPU_C1_TARGET_GRAPH=1` only), and the DFlash draft's sliding-window KV bucket split by the pool bytes a max-length request draws, so the draft page no longer sets every block at TP2 (0038; `B70_KV_DRAFT_PAGE_FIT=0` opts out; TP4 untouched) |
 
 Off by default: `attn2` (`B70_QSA_ATTN_IMPL`, default `splitk`, the first kernel), `native_det` (`B70_QSA_TOPK`, default
 `auto`), the Triton select (`B70_QSA_TOPK_SELECT_IMPL`, default `torch`), top-k once per verify step
 (`B70_QSA_TOPK_PER_STEP`) and skip-when-fits (`B70_QSA_TOPK_SKIP_FIT`) (approximate and neutral respectively, see the
 measurements), the tuning hook, the graph-capture arm (it degrades fidelity beyond 2K tokens: do not serve it), the debug
-and dump hooks. The engine file turns on `attn2`, `native_det` and the Triton select; the scorer defaults are in the code.
+and dump hooks. Both presets turn on `attn2`, `native_det` and the Triton select; the scorer defaults are in the code.
 
-**Run it.** Build as in [Build and run](#build-and-run), with the add-on applied after the dense series:
-
-```bash
-git clone -b v0.32.0-b70.4 https://github.com/Lumnus/vllm.git vllm-b70-0.32   # instead of the v0.32.0-b70.4-dense tag in step 2
-# or, in a clone of the dense tag:  git am v0.32/patches/vllm-qsa/*.patch
-```
-
-Make a second serve dir the same way as step 7, but copy [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json)
-over its `config.json` (the dense config plus `indexer_n_heads`, `indexer_kv_heads`, `indexer_head_dim`,
-`indexer_budget`, `indexer_compress_ratio` in `text_config`, so the 39 indexer tensors load; same JSON otherwise), then
-use [`engines/preset-4card.args`](engines/preset-4card.args) with
-[`engines/preset-4card.env`](engines/preset-4card.env) (the sparse variant is the preset's default). The first start compiles the QSA Triton kernels cold and takes
-longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
+**Run it.** The presets run sparse attention by default: build as in [Build and run](#build-and-run) and serve either
+preset with [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json) as the serve dir's `config.json` (step 7). The
+first start compiles the QSA Triton kernels cold (7 min in our first boot, ~5 min with a warm cache).
 
 **Known issues (sparse).**
 
 1. **Slower than dense on short context** by 3–11 % on one stream, at prefill up to 32K and at 8 streams (above); at 4 streams
    it matches, and at 131K+ prefill and on agent-style session replays it beats it. No in-engine profile exists (the torch profiler hangs the engine on XPU), so where
    the remaining time goes is inferred.
-2. **KV capacity about −13 %** (344,706 against 397,309 tokens) against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
+2. **KV capacity about −13 %** against dense (344,706 tokens sparse at 12 slots against 397,309 dense at 8 slots, 4 cards, 0.1.15.4 environment), from the QSA side caches and the raw-key ring (vLLM warns that the QSA state backend's
    `kernel_block_size=16` is not fully optimised).
 3. **Both variants are run-to-run nondeterministic from about token 512**, so bit-level comparison gates fail on either;
    fidelity was measured with KL against a same-engine floor instead.
@@ -400,7 +478,8 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    ([measurements, what this does not show](../docs/measurements/v0.32-qsa.md#5-what-this-does-not-show)).
 6. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); do not serve it.
    `native_det` is the qualified native mode.
-7. **Not run on the sparse engine:** the stock oneCCL plugin. DFlash's trailing-block drop is off in both variants since b70.4 through patch 0050 (the sparse engine ran without the flag in the b70.4 validation).
+7. **Not run on the sparse engine:** the stock oneCCL plugin.
+
 
 ## Known issues (0.32)
 
@@ -408,7 +487,7 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    there is no endurance number for it yet.
 2. **One hang in development.** Before the copy-through-lock fix, one boot with FULL graphs hung in `sample_tokens`
    (unit stopped, cards rebound). It did not recur in later boots or in the drill; the cause is not known.
-3. **KV is ~2 % below the 0.30 perf line with the patched plugin, ~4 % with the stock plugin.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not
+3. **Dense KV (8 slots) is ~2 % below the 0.30 perf line with the patched plugin, ~4 % with the stock plugin.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not
    allocator fragmentation (expandable segments bought only ~0.1 GiB). Not yet attributed.
 4. **GPU idles ~3 ms per step in the PLE sync at one stream.** A device→host probe takes 25 µs in isolation. Open.
 5. **Only Intel AutoRound weights were measured on 0.32.** The AWQ build should work (vLLM 0.32 accepts it natively), but
@@ -417,17 +496,17 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    item 1), liveness must generate, and pinned memory escapes container limits.
 7. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the burst gate and
    a token compare (garbage and divergence check, not an equivalence test) before serving.
-8. **Kernels are vllm-xpu-kernels 0.1.16.2 (PyPI) + our `libgdn_index64.so`; 0.1.15.4 is retired.** Upstream #658 (64-bit GDN
-   conv-state offsets) is merged on main (2026-10-26) but not in a release, and the 0.1.16.2 wheel lacks it: on one card,
-   `tests/gdn_attn/test_causal_conv1d.py -k large_state_offset` fails 3 of 3 on the wheel's stock `_xpu_C` op (float16
-   prefill, decode, spec: the guard line is overwritten). The engine never calls that op: its GDN op is
-   `torch.ops._gdn_index64` from our library, which passes the same three tests (3 of 3). The wheel does contain the
-   paged-decode row `16,256,64,false,false,false` that the 0.1.15.4 build lacks (a 2-card layout needs it). What the wheel does
-   **not** carry, compared with the 0.1.15.4 build the speed and replay numbers were taken on: (a) #660 (covered by our
-   library), (b) #662, the pinned-source `snapshot_src=False` copy, so KV-offload loads copy through a snapshot on call
-   (the trunk's caller detects this and falls back), and (c) the astra hooks in `fused_moe_interface.py`: the wheel's file
-   replaced the patched one, so the hooks of `patches/vllm-xpu-kernels-py/` 0001–0009 are not in that venv (the three
-   astra modules are). **Speed, the replay and host-RAM use were not re-measured on this build**; it passed the gate
-   (KV 345,392, det2 identical, `_gdn_index64` 3/3).
-9. **The 0.1.16.2 wheel has no GitHub tag** (tags stop at v0.1.16.1; the version string has read 0.1.16.2 on main since
-   2026-10-14), so pin it by the PyPI version and the file hash.
+8. **The released environment was measured for speed and gates, not for the replay and long prefill.** The agent-session
+   replay, 131K/260K prefill and the long-context task set ran on the 0.1.15.4 kernel build with identical engine code; on
+   the 0.1.16.2 environment the 4-card preset reproduces that build's per-step time (23.9 ms) and passes the token compare
+   against it ([Presets](#presets)). Upstream #658 (64-bit GDN conv-state offsets) is merged on main and in no release, so
+   the stock `_xpu_C` GDN op lacks it (the PyPI 0.1.16.2 build fails `tests/gdn_attn/test_causal_conv1d.py -k
+   large_state_offset` 3 of 3 on a card; our rebuild has the same GDN source); the engine never calls it (its GDN op is `torch.ops._gdn_index64` from `libgdn_index64.so`, which passes the same tests 3 of 3).
+9. **Our kernel build has no FlashAttention-2, MQA-logits or Xe3P code** (all off, as in every build we serve): the attention
+   libraries come from the PyPI wheel, the fp8 MQA-logits ops are not registered (the engine does not call them; a model that
+   needs them needs an MQA-on build, which ran out of memory on our 64 GiB builder), and B70 is Xe2.
+10. **2-card preset: hot/cold costs speed.** One stream 58.2 tok/s against 156.4 on 4 cards. The fused hot+cold decode op
+    with bf16 scales is not bit-exact against all experts in VRAM (relative L2 ≤ 2.9e-3; the two stock calls are); fidelity
+    of the preset was measured at the floors ([Presets](#presets)).
+11. **An occasional 4-card boot comes up at ~339K KV tokens** instead of ~344–345K (2 of 5 boots on 2026-10-26: one rank
+    shows +0.08 GiB of non-torch memory). Harmless; cause unknown.
