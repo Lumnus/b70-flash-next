@@ -160,7 +160,7 @@ The engine files in [`v0.32/engines/`](v0.32/engines/) explain each switch inlin
 2. **The agent replay, long prefill and the long-context task set were not re-run on the released environment**; they come
    from the 0.1.15.4 kernel build with identical engine code; at 4 cards the released environment matches that build's
    per-step decode time and passes the token compare against it.
-3. **The 2-card preset is 0.37× the 4-card preset at one stream**: the cold experts are read from host RAM every step.
+3. **The 2-card preset is 0.37× the 4-card preset at one stream.** It has half the cards and reads its cold experts from host RAM every step; how much each costs was not measured.
 4. **One hang in development**, before the copy-through-lock fix; it did not recur; cause unknown.
 5. **Dense GPU KV (8 slots) is below the 0.30 perf line**: ~2 % with the patched oneCCL plugin, ~4 % with the stock plugin; not yet attributed.
 6. **The GPU idles ~3 ms per step in the PLE sync at one stream.** Open.
