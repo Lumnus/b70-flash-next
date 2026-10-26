@@ -138,7 +138,7 @@ boots on the first pass (first token 363 s after start); the K1 load line appear
 1–10 streams has 0 bad outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok with the engine
 alive; host memory is flat under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB and ~355 GB of
 offload loads); 0 tracebacks, 0 `DEVICE_LOST`. It then ran **3 days 16 hours in one engine** (2026-10-04 to 2026-10-07,
-~52,500 requests, 0 errors, 0 aborts; README, Endurance), ended by a planned restart. Speeds and quality: README and
+~52,500 requests, 0 errors, 0 aborts; [line-0.30.md, Endurance](line-0.30.md#endurance)), ended by a planned restart. Speeds and quality: [line-0.30.md, Models](line-0.30.md#models) and
 [measurements](measurements/b70.2.md).
 
 That earlier branch (0001–0027 as here, and 0029b) differs from the release branch in code that **runs for AWQ** in
@@ -160,10 +160,10 @@ these places, listed plainly:
 We expect none of these to change AWQ's behaviour, but the release branch has not yet been run on AWQ.
 
 **Intel AutoRound** (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`) served on an earlier branch with the same series
-(up to 0031, without the path change above) on kernels b70.2 and b70.3, for hours at a time (README, Models). A
+(up to 0031, without the path change above) on kernels b70.2 and b70.3, for hours at a time ([line-0.30.md, Models](line-0.30.md#models)). A
 multi-day stability run of Intel followed from 2026-10-07, on that branch plus 0032, i.e. the release code except for
 the flag-file directory: about 15 days of serving, the longest engine 8 days 6 hours with 0 errors, and one crash (a
-GPU device-lost on 2026-10-13 under a long memory-store re-ingest, cause unknown; README, Endurance). **Intel is
+GPU device-lost on 2026-10-13 under a long memory-store re-ingest, cause unknown; [line-0.30.md, Endurance](line-0.30.md#endurance)). **Intel is
 validated** and is the build we serve and recommend.
 
 Also not measured: AWQ at 48K prompts on b70.3; token-level identity of the direct copy against staging on AWQ; the

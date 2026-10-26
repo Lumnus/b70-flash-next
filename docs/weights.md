@@ -5,7 +5,7 @@ on the 0.30 line 2026-10-02 to 04 and 2026-10-07 to 23 (about 15 days of serving
 and on the 0.32 line since 2026-10-24 (the only build measured there, [v0.32/README.md](../v0.32/README.md)). The
 AWQ build (served 2026-09-30 to 2026-10-07; 3 days 16 hours in one engine with MTP and kernels b70.3) is validated too
 and is the alternative; devan's W4A16 (from 2026-09-28) is the reference. Minachist's recalibrated experts, repacked
-into Intel's checkpoint (`tools/minachist_repack.py`), are a supported variant (README, Models). The README ranks them
+into Intel's checkpoint (`tools/minachist_repack.py`), are a supported variant ([README, Models](../README.md#models)). [line-0.30.md](line-0.30.md#models) ranks them
 and says why; the numbers are in [measurements/b70.2.md](measurements/b70.2.md).
 
 ## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)

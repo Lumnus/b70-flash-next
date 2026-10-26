@@ -26,7 +26,7 @@ The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable
 Three configurations measured with the same harness on the same host, one after another, on an idle engine (each
 timed cell waits for 20 s with no running or waiting requests). Single runs unless noted; read differences under
 ~5 % as noise: 0.32 matches the 0.30 perf line, and the gain over 0.30.0-b70.2 is the DFlash2/async/bundle stack, which
-runs on both. These are **not** comparable with the per-build tables in the main README's Models section, which use a different
+runs on both. These are **not** comparable with the per-build tables in [docs/line-0.30.md](../docs/line-0.30.md#models), which use a different
 harness (the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching
 configuration). The headline table on the main README cover is taken from this one.
 
@@ -72,7 +72,8 @@ How each row was taken:
 8. **Long context**, decode at one stream, two runs each: 8K / 64K / 128K prompts 209 / 200 / 172 tok/s on 0.32 vs
    217 / 220 / 169 on the 0.30 perf line (noise level at n = 2).
 
-What 0.32 costs: about 9K fewer GPU KV tokens than the 0.30 perf line, and less host-RAM headroom (35–39 vs 44–46 GiB
+What 0.32 costs: fewer GPU KV tokens than the 0.30 perf line (about 9K, ~2 %, with `serve-plugin.env`; about
+17.6K, ~4 %, with the default `serve.env`), and less host-RAM headroom (35–39 vs 44–46 GiB
 on our host).
 
 ## What changed against the 0.30 line, and why 0.32 was slower at first
@@ -98,8 +99,8 @@ Then two host-memory fixes:
 7. **B70-V32-RC1, `B70_OFFLOAD_PRIVATE_PINNED=1`.** vLLM 0.32 keeps the CPU KV tier in a shared `/dev/shm` region
    registered with the device. SYCL reports registered memory as `usm::alloc::unknown`, so every CPU→GPU load was
    staged through torch's caching host allocator, and those blocks stayed cached: ~3.25 GiB per rank, ~13 GiB of host
-   RAM. A private pinned pool per rank (as on 0.30) is copied directly. It also removes the need for a ≥128 GiB
-   `/dev/shm`. The upstream form of the kernel-side half is vllm-project/vllm-xpu-kernels#662.
+   RAM. A private pinned pool per rank (as on 0.30) is copied directly. It also removes the need for a `/dev/shm` larger than
+   the tier (≥ 140 GiB for 128 GiB). The upstream form of the kernel-side half is vllm-project/vllm-xpu-kernels#662.
 8. **Expandable segments with a patched oneCCL plugin.** torch's `expandable_segments` puts XPU tensors in Level Zero
    virtual memory, which compute-runtime 26.35 reserves with a CPU mapping on Battlemage. oneCCL's legacy plugin
    classifies a buffer as host memory when `msync()` succeeds on it, sends it to the CPU collective without a stream,
@@ -326,7 +327,7 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    there is no endurance number for it yet.
 2. **One hang in development.** Before the copy-through-lock fix, one boot with FULL graphs hung in `sample_tokens`
    (unit stopped, cards rebound). It did not recur in later boots or in the drill; the cause is not known.
-3. **KV is ~2 % below the 0.30 perf line.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not
+3. **KV is ~2 % below the 0.30 perf line with `serve-plugin.env`, ~4 % with the default `serve.env`.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not
    allocator fragmentation (expandable segments bought only ~0.1 GiB). Not yet attributed.
 4. **GPU idles ~3 ms per step in the PLE sync at one stream.** A device→host probe takes 25 µs in isolation. Open.
 5. **Only Intel AutoRound weights were measured on 0.32.** The AWQ build should work (vLLM 0.32 accepts it natively), but
