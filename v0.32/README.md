@@ -125,6 +125,9 @@ Upstream fixes folded in (all six are our posted PRs; none merged as of 2026-10-
 
 [`patches/vllm/`](patches/vllm/) is `git format-patch v0.32.0..v0.32.0-b70.1` of the fork; `scripts/check-series.sh`
 fails if it differs from a fresh export.
+`tools/check-trunk-tree.sh` is the tree-level counterpart for maintainers: it applies both series (dense and sparse) to
+vanilla v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere except the last
+N commits (the hot/cold set); see the header of the script.
 
 | patches | what | author |
 |---|---|---|
