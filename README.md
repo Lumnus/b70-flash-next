@@ -66,6 +66,10 @@ How to read it:
    not an equivalence bound, and differences of a few points would not be detected.
 6. **Not comparable with the 0.30 per-build tables** in [docs/line-0.30.md](docs/line-0.30.md#models): those use a
    different harness (Intel at one stream reads 90.4 tok/s there, 107.5 here for a closely matching configuration).
+7. **Since 2026-10-26 `serve.args` keeps DFlash's trailing KV block** (`"disable_eagle_block_drop": true`); the table
+   was taken before. Back to back on the dense configuration, one run each: the agent-session replay ran 232 s against
+   266 s, median decode 49.4 against 40.7 tok/s, gates and token compare pass, GPU KV −1.6K tokens
+   ([CHANGELOG](CHANGELOG.md)).
 
 Gates on 0.32: burst 0/150, structured output clean, a mixed long/short probe 7/7, and a greedy token compare with no
 garbage and first divergences at small baseline margins (not an equivalence check). How each row was taken, long

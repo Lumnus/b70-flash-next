@@ -4,6 +4,20 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 ## Unreleased
 
+- **Dense engine args: DFlash's trailing-block drop is off** (`"disable_eagle_block_drop": true` in
+  `v0.32/engines/serve.args`). On this tree the DFlash2 draft KV group is not recognised as the draft's, so vLLM's
+  EAGLE trailing-block drop applied to every group. Measured back to back on the dense configuration (one run each):
+  agent-session replay 232 s against 266 s, median decode 49.4 against 40.7 tok/s, TTFT p50 1.76 against 2.03 s,
+  0 preemptions against 1; gates and the greedy token compare pass; GPU KV −1.6K tokens; draft acceptance unchanged
+  (5.02 against 5.07). The numbers tables were taken before this change. Not yet applied to `qsa-serve.args`.
+
+## 0.32.0-b70.2 — 2026-10-26: sparse attention (QSA) variant, working and experimental
+
+Adds a second attention variant to the 0.32 line next to the dense release. The dense series (`v0.32/patches/vllm/`, 49
+patches, fork tag `v0.32.0-b70.1`) is unchanged.
+
+Repository change shipped in this release:
+
 - **The default recipe is now the stock-plugin configuration.** `v0.32/engines/serve.env` is the configuration without
   expandable segments and without the patched oneCCL plugin; the patched-plugin configuration moved to
   `v0.32/engines/serve-plugin.env` (formerly `serve.env`; the old `serve-no-plugin.env` is now `serve.env`). No variable
@@ -13,10 +27,7 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   torch/oneCCL bump.
 - The default flips back to `serve-plugin.env` once uxlfoundation/oneCCL#229 ships in a oneCCL release that torch pins.
 
-## 0.32.0-b70.2 — 2026-10-26: sparse attention (QSA) variant, working and experimental
-
-Adds a second attention variant to the 0.32 line next to the dense release. The dense series (`v0.32/patches/vllm/`, 49
-patches, fork tag `v0.32.0-b70.1`) is unchanged.
+The sparse variant:
 
 - **Code.** `v0.32/patches/vllm-qsa/`: 26 patches on top of the dense series, authored `Lumnus` (0001 is the
   vllm-project/vllm#60602 cherry-pick). Fork branch `b70/v0.32.0-qsa-release` (`4acd39891b`) on `Lumnus/vllm`.
