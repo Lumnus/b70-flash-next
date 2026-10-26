@@ -1,0 +1,278 @@
+From fd2a03a96844674e50a54792ba05bc6a7c99a40d Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 01:12:12 +0000
+Subject: [PATCH 27/32] B70-QSA-D01: native_det repair without host sync or
+ full-width sort; B70_QSA_TOPK=radix
+
+native_det used to fix the native top-k up with a host sync per layer
+(tied.nonzero()) and redo every boundary-tie row with the torch int64 sort
+over the full page-table width (engine log: "torch top-k processes rows in
+chunks of 25 (width 65728)"); under graph capture it ran the torch path.
+
+_qsa_topk_select returns _qsa_topk_torch's output element for element with
+device ops only:
+1. threshold T = the k-th largest score, from the native set (any correct
+   top-k set carries the true k-th score; a zero threshold is resolved to the
+   right signed zero, since the native op compares floats) or from an exact
+   MSB-first radix select (integer scatter_add histograms, 2x16 or 4x8 bits);
+2. keep every live column above T plus the lowest-column live entries equal
+   to T (cumsum rank) - the torch key breaks equal scores toward the lower
+   column, so this is exactly its top-k set;
+3. compact (cumsum + scatter) and sort only the k kept keys.
+
+B70_QSA_TOPK=native_det now uses it (native-anchored eager, radix under
+capture); B70_QSA_TOPK_DET_IMPL=legacy restores the Q repair.
+B70_QSA_TOPK=radix: radix select only, no native op.
+B70_QSA_TOPK_SELECT_CHECK=1 (debug, host sync) rejects a native set that is
+not a top-k set. CPU identity tests: tests/models/qwen4_exp/test_qsa_topk_levers.py.
+---
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       | 212 +++++++++++++++++-
+ 1 file changed, 205 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index e8f924ad61..428ca1d818 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -558,14 +558,19 @@ def _qsa_topk_mode() -> str:
+     ``native``: vllm-xpu-kernels ``torch.ops._C.top_k_per_row_decode`` (SYCL,
+     registered for kXPU). ``torch``: exact, deterministic torch path below.
+     ``auto`` (default): native when the op is registered, else torch.
+-    ``native_det`` (B70-QSA-Q): native, then made identical to ``torch``:
+-    rows whose boundary is an exact tie are redone on the torch path and every
+-    row is put in the torch order. Under graph capture it is the torch path.
++    ``native_det`` (B70-QSA-Q): native, then made identical to ``torch``.
++    B70-QSA-D01: by default the repair is ``_qsa_topk_select`` anchored on the
++    native k-th score (device ops only, no host sync, no full-width sort);
++    under graph capture it is ``_qsa_topk_select`` with a radix-select
++    threshold. ``B70_QSA_TOPK_DET_IMPL=legacy`` restores the Q repair (tie rows
++    redone on the torch path after a host sync; torch path under capture).
++    ``radix`` (B70-QSA-D01): ``_qsa_topk_select`` with the radix-select
++    threshold, no native op; identical output to ``torch``.
+     """
+     mode = os.environ.get("B70_QSA_TOPK", "auto")
+-    if mode not in ("auto", "native", "torch", "native_det"):
++    if mode not in ("auto", "native", "torch", "native_det", "radix"):
+         raise ValueError(
+-            f"B70_QSA_TOPK must be auto|native|torch|native_det, got {mode!r}"
++            f"B70_QSA_TOPK must be auto|native|torch|native_det|radix, got {mode!r}"
+         )
+     if mode == "auto":
+         has_native = hasattr(torch.ops._C, "top_k_per_row_decode")
+@@ -640,6 +645,183 @@ def _qsa_topk_torch_rows(
+         block_indices[:, k:].fill_(-1)
+ 
+ 
++def _qsa_det_impl() -> str:
++    """B70-QSA-D01: native_det repair, ``select`` (default) or ``legacy``."""
++    impl = os.environ.get("B70_QSA_TOPK_DET_IMPL", "select")
++    if impl not in ("select", "legacy"):
++        raise ValueError(f"B70_QSA_TOPK_DET_IMPL must be select|legacy, got {impl!r}")
++    return impl
++
++
++def _ordered_bits(logits: torch.Tensor) -> torch.Tensor:
++    """int32 view of fp32 scores whose signed order is the torch key's order.
++
++    Same transform as _qsa_topk_torch_rows (flip the magnitude bits of the
++    negatives), so -0.0 sorts below +0.0 there and here alike.
++    """
++    bits = logits.contiguous().view(torch.int32)
++    return torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
++
++
++def _radix_passes(rows: int) -> tuple[tuple[int, int], ...]:
++    """(shift, bits) per pass, MSB first; two 16-bit passes while the per-row
++    histograms stay under 32 MiB, else four 8-bit passes."""
++    if rows * (1 << 16) * 4 <= 32 << 20:
++        return ((16, 16), (0, 16))
++    return ((24, 8), (16, 8), (8, 8), (0, 8))
++
++
++def _radix_threshold(
++    ordered: torch.Tensor, live: torch.Tensor, want: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Exact k-th largest ``ordered`` value per row by MSB-first radix select.
++
++    Returns (threshold [rows] int64 holding an int32 value, remaining [rows]
++    int64): the ``want``-th largest live value, and how many live entries equal
++    to it belong to the top ``want``. Histograms are integer scatter_add, so
++    the result is exact and run-to-run identical. Rows with want == 0 return
++    garbage that the caller never uses (they have no live column).
++    """
++    rows = ordered.shape[0]
++    dev = ordered.device
++    match = live
++    remaining = want.clone()
++    threshold = torch.zeros(rows, dtype=torch.int64, device=dev)
++    row_base = torch.arange(rows, dtype=torch.int64, device=dev).unsqueeze(1)
++    for i, (shift, bits) in enumerate(_radix_passes(rows)):
++        bins = 1 << bits
++        if i == 0:
++            # arithmetic shift keeps the sign: [-bins/2, bins/2) -> [0, bins)
++            digit = (ordered >> shift).to(torch.int64) + bins // 2
++        else:
++            digit = ((ordered >> shift) & (bins - 1)).to(torch.int64)
++        hist = torch.zeros(rows * bins, dtype=torch.int32, device=dev)
++        hist.scatter_add_(
++            0, (digit + row_base * bins).reshape(-1), match.to(torch.int32).reshape(-1)
++        )
++        # at_least[:, d] = live matching entries whose digit is >= d
++        at_least = hist.view(rows, bins).flip(1).cumsum(1).flip(1)
++        chosen = (at_least >= remaining.unsqueeze(1)).sum(1) - 1
++        chosen = chosen.clamp(0, bins - 1)
++        above = at_least.gather(1, (chosen + 1).clamp(max=bins - 1).unsqueeze(1))
++        above = torch.where(chosen + 1 < bins, above.squeeze(1), 0)
++        remaining = remaining - above
++        match = match & (digit == chosen.unsqueeze(1))
++        value = chosen - bins // 2 if i == 0 else chosen
++        threshold = threshold + (value << shift)
++    return threshold, remaining
++
++
++def _qsa_topk_select(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_topk: int,
++    block_indices: torch.Tensor,
++    native_indices: torch.Tensor | None = None,
++) -> None:
++    """B70-QSA-D01: _qsa_topk_torch's exact output without a full-width sort.
++
++    Same contract and the same output, element for element: per row the
++    k_eff = min(block_topk, width, visible) largest (score, -column) keys over
++    the live columns, in descending key order, then -1.
++
++    1. Threshold T and r (how many live entries equal to T to keep): from the
++       native selection when given (T = its smallest selected score; any
++       correct top-k set has the true k-th score, whatever its tie choice), else
++       by exact radix select.
++    2. Keep every live column above T, plus the r lowest live columns equal
++       to T (cumsum rank). That is exactly the set of the k_eff largest keys,
++       since the key breaks equal scores toward the lower column.
++    3. Compact the kept columns (cumsum position + scatter) and sort only the
++       k_eff kept keys.
++
++    Device ops only: no host sync, graph-capturable without native_indices.
++    Rows are processed in chunks of B70_QSA_TOPK_SELECT_CHUNK_MB (default 256)
++    of transient memory.
++    """
++    rows, width = logits.shape
++    if rows == 0:
++        return
++    budget = int(os.environ.get("B70_QSA_TOPK_SELECT_CHUNK_MB", "256")) << 20
++    step = max(1, budget // max(1, width * 40))
++    for start in range(0, rows, step):
++        end = min(rows, start + step)
++        _qsa_topk_select_rows(
++            logits[start:end],
++            visible_blocks[start:end],
++            block_topk,
++            block_indices[start:end],
++            None if native_indices is None else native_indices[start:end],
++        )
++
++
++def _qsa_topk_select_rows(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_topk: int,
++    block_indices: torch.Tensor,
++    native_indices: torch.Tensor | None,
++) -> None:
++    """One chunk of _qsa_topk_select (same contract)."""
++    rows, width = logits.shape
++    dev = logits.device
++    k = min(block_topk, width)
++    ordered = _ordered_bits(logits)
++    columns = torch.arange(width, device=dev, dtype=torch.int64)
++    visible = visible_blocks[:rows].to(torch.int64).clamp(0, width)
++    live = columns.unsqueeze(0) < visible.unsqueeze(1)
++    want = visible.clamp(max=k)
++    if native_indices is None:
++        threshold, remaining = _radix_threshold(ordered, live, want)
++    else:
++        # The native op compares floats: its k-th score is the true k-th
++        # float value, but -0.0 == +0.0 there while the key orders -0.0
++        # below +0.0. Resolve a zero threshold to the right signed zero.
++        sel = native_indices[:rows, :k].long()
++        valid = (sel >= 0) & (sel < visible.unsqueeze(1))
++        picked = logits.gather(1, sel.clamp(0, width - 1))
++        kth = torch.where(valid, picked, float("inf")).min(dim=1).values
++        threshold = _ordered_bits(kth).to(torch.int64)
++        wide = ordered.to(torch.int64)
++        at_least_pos_zero = (live & (wide >= 0)).sum(1)
++        threshold = torch.where(
++            kth == 0,
++            torch.where(at_least_pos_zero >= want, 0, -1),  # +0.0 / -0.0 keys
++            threshold,
++        )
++        above = (live & (wide > threshold.unsqueeze(1))).sum(1)
++        remaining = want - above
++        if os.environ.get("B70_QSA_TOPK_SELECT_CHECK", "0") == "1":
++            equal = (live & (wide == threshold.unsqueeze(1))).sum(1)
++            bad = (want > 0) & ((remaining < 1) | (remaining > equal))
++            if bool(bad.any()):  # host sync: debug only
++                raise RuntimeError(
++                    "B70-QSA: native top-k set is not a top-k set in "
++                    f"{int(bad.sum())} rows (NaN scores?)"
++                )
++    wide = ordered.to(torch.int64)
++    above_mask = live & (wide > threshold.unsqueeze(1))
++    equal = live & (wide == threshold.unsqueeze(1))
++    equal_rank = equal.to(torch.int32).cumsum(1)
++    keep = above_mask | (equal & (equal_rank <= remaining.unsqueeze(1)))
++    # Compact: the j-th kept column (ascending) lands in slot j; the rest go
++    # to a scratch slot k that is dropped.
++    slot = torch.where(keep, keep.to(torch.int32).cumsum(1) - 1, k)
++    packed = torch.full((rows, k + 1), -1, dtype=torch.int64, device=dev)
++    packed.scatter_(1, slot.to(torch.int64), columns.unsqueeze(0).expand(rows, width))
++    chosen = packed[:, :k]
++    valid = chosen >= 0
++    col = chosen.clamp_min(0)
++    key = (ordered.gather(1, col).to(torch.int64) << 32) | (0xFFFFFFFF - col)
++    floor = torch.iinfo(torch.int64).min
++    key = torch.where(valid, key, floor)
++    key = torch.sort(key, dim=1, descending=True).values
++    top = torch.where(key == floor, -1, 0xFFFFFFFF - (key & 0xFFFFFFFF))
++    block_indices[:, :k].copy_(top.to(torch.int32))
++    if k < block_topk:
++        block_indices[:, k:].fill_(-1)
++
++
+ def _qsa_topk_native(
+     logits: torch.Tensor,
+     visible_blocks: torch.Tensor,
+@@ -718,7 +900,15 @@ def _topk(
+     if not current_platform.is_cuda():
+         # B70-QSA: cooperative/persistent_topk are CUDA-only csrc ops.
+         mode = _qsa_topk_mode()
+-        logger.info_once("B70-QSA: QSA block top-k backend = %s", mode)
++        det_impl = _qsa_det_impl() if mode == "native_det" else ""
++        logger.info_once(
++            "B70-QSA: QSA block top-k backend = %s%s",
++            mode,
++            f" (repair = {det_impl})" if det_impl else "",
++        )
++        if mode == "radix" or (det_impl == "select" and _qsa_debug.is_capturing()):
++            _qsa_topk_select(logits, visible_blocks, block_topk, block_indices)
++            return
+         if mode == "torch" or (mode == "native_det" and _qsa_debug.is_capturing()):
+             _qsa_topk_torch(logits, visible_blocks, block_topk, block_indices)
+             return
+@@ -727,7 +917,15 @@ def _topk(
+             _qsa_debug.count_boundary_ties(
+                 logits, visible_blocks, block_indices, block_topk
+             )
+-        if mode == "native_det":
++        if det_impl == "select":
++            _qsa_topk_select(
++                logits,
++                visible_blocks,
++                block_topk,
++                block_indices,
++                native_indices=block_indices,
++            )
++        elif det_impl == "legacy":
+             _qsa_topk_make_deterministic(
+                 logits, visible_blocks, block_topk, block_indices
+             )

@@ -1,7 +1,7 @@
 From 0051a2241882c90b618da2a060b8eca693a643be Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 23:44:35 +0000
-Subject: [PATCH 21/26] B70-QSA-B02: B70_QSA_TUNE no longer crashes the first
+Subject: [PATCH 21/32] B70-QSA-B02: B70_QSA_TUNE no longer crashes the first
  lookup (info_once got an unhashable dict)
 
 logger.info_once hashes its args; any non-empty B70_QSA_TUNE raised TypeError at the first get(), so the -tune engine def would have failed at warmup. Log the overrides as sorted JSON.

@@ -1,0 +1,500 @@
+From fc8a5527ba57e93411a8de90cceff981dd5fb072 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 01:13:39 +0000
+Subject: [PATCH 30/32] B70-QSA-D04: CPU tests for D01-D03
+
+test_qsa_topk_levers.py checks the following:
+- D01: select equals the torch selector element for element on tie-heavy
+  inputs (all zeros, few values, ReLU-shaped, signed zeros, quantised, +-inf,
+  randn) and across visible 0 / k-1 / k / k+1 / width; widths 1..65,728; with
+  adversarial native sets (ties to the highest or a random column, unsorted);
+  with the 8-bit radix schedule, with row chunks, in place over the native
+  buffer, and through _topk for native_det (select and legacy) and radix.
+  Under capture native_det never calls the native op. The debug check
+  rejects a wrong native set.
+- D02: per-step selection is set-exact when the anchor fits; past the budget
+  it is causal, equals the clipped anchor and has the expected count; it is
+  inert at decode_query_len 1; expand covers only the causal prefix plus its
+  tail. Skip-fit returns every visible block and only applies under the host
+  bound.
+- D03: the defaults, fp8 left alone, the legacy switch, the B70_QSA_TUNE
+  precedence, and CPU keeping the GB300 configs.
+---
+ .../models/qwen4_exp/test_qsa_topk_levers.py  | 468 ++++++++++++++++++
+ 1 file changed, 468 insertions(+)
+ create mode 100644 tests/models/qwen4_exp/test_qsa_topk_levers.py
+
+diff --git a/tests/models/qwen4_exp/test_qsa_topk_levers.py b/tests/models/qwen4_exp/test_qsa_topk_levers.py
+new file mode 100644
+index 0000000000..2c514ab50d
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_topk_levers.py
+@@ -0,0 +1,468 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA-D: top-k levers, checked on CPU.
++
++D01: ``_qsa_topk_select`` (native-anchored and radix thresholds) returns
++     ``_qsa_topk_torch``'s output element for element, ties included.
++D02: per-verify-step selection (anchor row) and skip-when-everything-fits.
++D03: the C2 scorer launch defaults and their overrides.
++"""
++
++import itertools
++import zlib
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++CR = 4
++
++
++# --------------------------------------------------------------------------
++# D01: deterministic select == torch selector
++# --------------------------------------------------------------------------
++
++
++def _torch_ref(logits, visible, k):
++    out = torch.empty(logits.shape[0], k, dtype=torch.int32)
++    qi._qsa_topk_torch(logits, visible, k, out)
++    return out
++
++
++def _select(logits, visible, k, native=None):
++    out = torch.empty(logits.shape[0], k, dtype=torch.int32)
++    qi._qsa_topk_select(logits, visible, k, out, native_indices=native)
++    return out
++
++
++def _adversarial_native(logits, visible, k, gen, high_col=True):
++    """A correct top-k SET with an arbitrary tie choice, in random order."""
++    rows, width = logits.shape
++    out = torch.full((rows, k), -1, dtype=torch.int32)
++    for r in range(rows):
++        v = min(int(visible[r]), width)
++        n = min(k, v)
++        if n == 0:
++            continue
++        vals = logits[r, :v].double()
++        # order ties by column (high or random), values first
++        if high_col:
++            tieb = torch.arange(v, dtype=torch.float64)
++        else:
++            tieb = torch.randperm(v, generator=gen).double()
++        order = sorted(range(v), key=lambda c: (float(vals[c]), float(tieb[c])))
++        pick = torch.tensor(order[::-1][:n])
++        pick = pick[torch.randperm(n, generator=gen)]
++        out[r, :n] = pick.to(torch.int32)
++    return out
++
++
++def _tie_heavy(rows, width, gen, kind):
++    if kind == "zeros":
++        return torch.zeros(rows, width)
++    if kind == "few_values":
++        vals = torch.tensor([0.0, -0.0, 0.5, 1.0, 1.0, 2.0, -1.0])
++        return vals[torch.randint(0, len(vals), (rows, width), generator=gen)]
++    if kind == "relu":
++        x = torch.randn(rows, width, generator=gen)
++        x = torch.where(torch.rand(rows, width, generator=gen) < 0.7, 0.0, x.abs())
++        return x
++    if kind == "signed_zero":
++        x = torch.zeros(rows, width)
++        x[:, ::2] = -0.0
++        x[:, ::7] = 3.0
++        return x
++    if kind == "quantized":
++        return torch.round(torch.randn(rows, width, generator=gen) * 4) / 4
++    if kind == "inf":
++        x = torch.randn(rows, width, generator=gen)
++        x[:, ::5] = float("inf")
++        x[:, 1::5] = float("-inf")
++        return x
++    return torch.randn(rows, width, generator=gen)
++
++
++KINDS = ["zeros", "few_values", "relu", "signed_zero", "quantized", "inf", "randn"]
++
++
++def _visible_set(rows, width, k, gen):
++    base = [0, 1, k - 1, k, k + 1, width, width - 1]
++    out = [min(max(b, 0), width) for b in base]
++    while len(out) < rows:
++        out.append(int(torch.randint(0, width + 1, (1,), generator=gen)))
++    return torch.tensor(out[:rows], dtype=torch.int32)
++
++
++@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize(
++    "width,k", [(1, 4), (7, 4), (64, 16), (700, 512), (1024, 512), (4100, 512)]
++)
++def test_select_matches_torch(kind, width, k):
++    gen = torch.Generator().manual_seed(zlib.crc32(f"{kind}{width}{k}".encode()))
++    rows = 9
++    logits = _tie_heavy(rows, width, gen, kind)
++    visible = _visible_set(rows, width, k, gen)
++    want = _torch_ref(logits, visible, k)
++    assert torch.equal(_select(logits, visible, k), want)
++    for high in (True, False):
++        native = _adversarial_native(logits, visible, k, gen, high_col=high)
++        assert torch.equal(_select(logits, visible, k, native), want)
++
++
++def test_select_full_page_table_width():
++    """Decode width of the engine log (65,728 columns), zeros-heavy."""
++    gen = torch.Generator().manual_seed(65728)
++    width, k = 65728, 512
++    logits = _tie_heavy(4, width, gen, "relu")
++    logits[1].zero_()
++    visible = torch.tensor([65728, 40000, 513, 300], dtype=torch.int32)
++    want = _torch_ref(logits, visible, k)
++    assert torch.equal(_select(logits, visible, k), want)
++    native = _adversarial_native(logits, visible, k, gen, high_col=True)
++    assert torch.equal(_select(logits, visible, k, native), want)
++
++
++@pytest.mark.parametrize("kind", ["few_values", "relu", "randn"])
++def test_select_eight_bit_passes_match(monkeypatch, kind):
++    """Force the 4 x 8-bit radix schedule (used for large row counts)."""
++    monkeypatch.setattr(
++        qi, "_radix_passes", lambda rows: ((24, 8), (16, 8), (8, 8), (0, 8))
++    )
++    gen = torch.Generator().manual_seed(8)
++    logits = _tie_heavy(12, 2000, gen, kind)
++    visible = _visible_set(12, 2000, 512, gen)
++    assert torch.equal(_select(logits, visible, 512), _torch_ref(logits, visible, 512))
++
++
++def test_select_row_chunks_match(monkeypatch):
++    monkeypatch.setenv("B70_QSA_TOPK_SELECT_CHUNK_MB", "0")  # one row per chunk
++    gen = torch.Generator().manual_seed(3)
++    logits = _tie_heavy(6, 1500, gen, "relu")
++    visible = _visible_set(6, 1500, 512, gen)
++    native = _adversarial_native(logits, visible, 512, gen)
++    want = _torch_ref(logits, visible, 512)
++    assert torch.equal(_select(logits, visible, 512), want)
++    assert torch.equal(_select(logits, visible, 512, native), want)
++
++
++def test_select_in_place_over_native_buffer():
++    """native_det passes the native output as both input and output."""
++    gen = torch.Generator().manual_seed(11)
++    logits = _tie_heavy(5, 1024, gen, "zeros")
++    visible = torch.tensor([700, 512, 300, 1000, 513], dtype=torch.int32)
++    buf = _adversarial_native(logits, visible, 512, gen)
++    qi._qsa_topk_select(logits, visible, 512, buf, native_indices=buf)
++    assert torch.equal(buf, _torch_ref(logits, visible, 512))
++
++
++@pytest.mark.parametrize(
++    "mode,impl",
++    [("native_det", "select"), ("native_det", "legacy"), ("radix", "select")],
++)
++def test_topk_dispatch_is_torch_exact(monkeypatch, mode, impl):
++    gen = torch.Generator().manual_seed(5)
++    logits = _tie_heavy(8, 1024, gen, "relu")
++    visible = _visible_set(8, 1024, 512, gen)
++
++    def native(logits, visible_blocks, block_topk, out):
++        out.copy_(_adversarial_native(logits, visible_blocks, block_topk, gen))
++
++    monkeypatch.setenv("B70_QSA_TOPK", mode)
++    monkeypatch.setenv("B70_QSA_TOPK_DET_IMPL", impl)
++    monkeypatch.setattr(qi, "_qsa_topk_native", native)
++    got = torch.empty(8, 512, dtype=torch.int32)
++    qi._topk(logits, visible, 4 * 512, 4, got, torch.empty(0, dtype=torch.uint8))
++    assert torch.equal(got, _torch_ref(logits, visible, 512))
++
++
++def test_native_det_select_under_capture_never_calls_native(monkeypatch):
++    from vllm.models.qwen4_exp.common import qsa_debug
++
++    gen = torch.Generator().manual_seed(6)
++    logits = _tie_heavy(4, 900, gen, "zeros")
++    visible = torch.tensor([900, 10, 600, 513], dtype=torch.int32)
++
++    def boom(*a, **k):
++        raise AssertionError("native op called under capture")
++
++    monkeypatch.setenv("B70_QSA_TOPK", "native_det")
++    monkeypatch.setattr(qi, "_qsa_topk_native", boom)
++    monkeypatch.setattr(qsa_debug, "is_capturing", lambda: True)
++    got = torch.empty(4, 512, dtype=torch.int32)
++    qi._topk(logits, visible, 2048, 4, got, torch.empty(0, dtype=torch.uint8))
++    assert torch.equal(got, _torch_ref(logits, visible, 512))
++
++
++def test_bad_det_impl_is_rejected(monkeypatch):
++    monkeypatch.setenv("B70_QSA_TOPK_DET_IMPL", "fast")
++    with pytest.raises(ValueError):
++        qi._qsa_det_impl()
++
++
++# --------------------------------------------------------------------------
++# D02: per-verify-step selection and skip-when-fits
++# --------------------------------------------------------------------------
++
++K1 = 8  # DFlash K=7 -> 8 verify rows
++PAGE = 16  # compressed rows per page
++
++
++def _decode_case(num_requests, seq_lens, gen, heads=4, dim=32, pages=None):
++    """Request-major verify batch: K1 rows per request ending at seq_len."""
++    max_blocks = max(seq_lens) // CR + 1
++    width_pages = (max_blocks + PAGE - 1) // PAGE
++    pages = pages or num_requests * width_pages + 1
++    k_cache = torch.randn(pages, PAGE, 1, dim, generator=gen)
++    perm = torch.randperm(pages, generator=gen)[: num_requests * width_pages]
++    page_table = perm.view(num_requests, width_pages).to(torch.int32)
++    positions = torch.cat([torch.arange(s - K1, s) for s in seq_lens])
++    seq = torch.tensor(seq_lens).repeat_interleave(K1)
++    visible = torch.minimum((positions + 1) // CR, seq // CR).to(torch.int32)
++    q = torch.randn(num_requests * K1, heads, dim, generator=gen)
++    return q, k_cache, page_table, visible, positions
++
++
++def _ref_select_rows(
++    q,
++    k_cache,
++    page_table,
++    visible,
++    token_topk,
++    compress_ratio,
++    decode_query_len,
++    block_indices,
++):
++    """Torch stand-in for the Triton scorer + the production _topk."""
++    rows = q.shape[0]
++    page = k_cache.shape[1]
++    columns = page_table.shape[1] * page
++    col = torch.arange(columns)
++    logits = torch.zeros(rows, columns)
++    for r in range(rows):
++        req = r // decode_query_len
++        phys = page_table[req, col // page].long()
++        keys = k_cache[phys, col % page, 0]  # [columns, dim]
++        s = torch.relu(keys @ q[r].T).sum(-1)
++        logits[r] = torch.where(col < visible[r], s, 0.0)
++    qi._topk(
++        logits,
++        visible,
++        token_topk,
++        compress_ratio,
++        block_indices,
++        torch.empty(0, dtype=torch.uint8),
++    )
++
++
++@pytest.fixture
++def ref_scorer(monkeypatch):
++    monkeypatch.setenv("B70_QSA_TOPK", "torch")
++    monkeypatch.setattr(qi, "_select_decode_rows", _ref_select_rows)
++
++
++def _run(q, k_cache, page_table, visible, token_topk, dql, max_seq_len=None):
++    out = torch.empty(q.shape[0], token_topk // CR, dtype=torch.int32)
++    qi.qsa_select_paged_decode(
++        q,
++        k_cache,
++        page_table,
++        visible,
++        token_topk,
++        CR,
++        dql,
++        out,
++        max_seq_len=max_seq_len,
++    )
++    return out
++
++
++def _sets(t):
++    return [set(x for x in row.tolist() if x >= 0) for row in t]
++
++
++@pytest.mark.parametrize("seq_lens", [[60, 33, 100], [70, 70]])
++def test_per_step_is_set_exact_when_the_anchor_fits(monkeypatch, ref_scorer, seq_lens):
++    token_topk = 128  # 32 blocks; every anchor here sees <= 25 blocks
++    gen = torch.Generator().manual_seed(sum(seq_lens))
++    q, kc, pt, vis, _ = _decode_case(len(seq_lens), seq_lens, gen)
++    per_row = _run(q, kc, pt, vis, token_topk, K1)
++    monkeypatch.setenv("B70_QSA_TOPK_PER_STEP", "1")
++    step = _run(q, kc, pt, vis, token_topk, K1)
++    assert _sets(step) == _sets(per_row)
++
++
++@pytest.mark.parametrize("seq_lens", [[300, 151], [257, 400, 260]])
++def test_per_step_beyond_budget_is_causal_and_anchor_derived(
++    monkeypatch, ref_scorer, seq_lens
++):
++    token_topk = 64  # 16 blocks, far fewer than visible
++    k = token_topk // CR
++    gen = torch.Generator().manual_seed(sum(seq_lens) + 1)
++    q, kc, pt, vis, _ = _decode_case(len(seq_lens), seq_lens, gen)
++    per_row = _run(q, kc, pt, vis, token_topk, K1)
++    monkeypatch.setenv("B70_QSA_TOPK_PER_STEP", "1")
++    step = _run(q, kc, pt, vis, token_topk, K1)
++    for req in range(len(seq_lens)):
++        anchor_row = req * K1 + K1 - 1
++        anchor = [x for x in step[anchor_row].tolist() if x >= 0]
++        # the anchor row is exactly the per-row selection, same order
++        assert step[anchor_row].tolist() == per_row[anchor_row].tolist()
++        for r in range(req * K1, (req + 1) * K1):
++            got = [x for x in step[r].tolist() if x >= 0]
++            v = int(vis[r])
++            assert all(x < v for x in got), "non-causal block"
++            assert got == [x for x in anchor if x < v], "not the clipped anchor"
++            assert step[r].tolist()[len(got) :] == [-1] * (k - len(got))
++            dropped = sum(1 for x in anchor if x >= v)
++            assert len(got) == k - dropped and dropped <= (K1 + CR - 1) // CR + 1
++
++
++def test_per_step_ignored_for_plain_decode(monkeypatch, ref_scorer):
++    gen = torch.Generator().manual_seed(9)
++    q, kc, pt, vis, _ = _decode_case(2, [300, 200], gen)
++    q, vis = q[K1 - 1 :: K1].contiguous(), vis[K1 - 1 :: K1].contiguous()
++    base = _run(q, kc, pt, vis, 64, 1)
++    monkeypatch.setenv("B70_QSA_TOPK_PER_STEP", "1")
++    assert torch.equal(_run(q, kc, pt, vis, 64, 1), base)
++
++
++def test_per_step_with_expand_attends_only_the_causal_prefix(monkeypatch, ref_scorer):
++    from tests.models.qwen4_exp.test_qsa_reference import (
++        _expand_qsa_indices_reference,
++    )
++
++    token_topk = 64
++    gen = torch.Generator().manual_seed(21)
++    seq_lens = [301, 158]
++    q, kc, pt, vis, pos = _decode_case(2, seq_lens, gen)
++    monkeypatch.setenv("B70_QSA_TOPK_PER_STEP", "1")
++    blocks = _run(q, kc, pt, vis, token_topk, K1)
++    seq = torch.tensor(seq_lens).repeat_interleave(K1)
++    tokens = _expand_qsa_indices_reference(blocks, pos, pos + 1, CR, token_topk)
++    for r, row in enumerate(tokens.tolist()):
++        p = int(pos[r])
++        sel = [t for t in row if t >= 0]
++        assert all(t <= p for t in sel)
++        assert len(sel) == len(set(sel))
++        tail = list(range(((p + 1) // CR) * CR, p + 1))
++        assert set(tail) <= set(sel)
++        assert int(seq[r]) >= p + 1
++
++
++@pytest.mark.parametrize("seq_lens,fits", [([60, 128], True), ([129, 20], False)])
++def test_skip_fit_returns_every_visible_block(monkeypatch, ref_scorer, seq_lens, fits):
++    token_topk = 128  # 32 blocks: seq 128 -> 32 blocks fits, 129 -> still 32 (floor)
++    gen = torch.Generator().manual_seed(len(seq_lens) + int(fits))
++    q, kc, pt, vis, _ = _decode_case(len(seq_lens), seq_lens, gen)
++    per_row = _run(q, kc, pt, vis, token_topk, K1)
++    monkeypatch.setenv("B70_QSA_TOPK_SKIP_FIT", "1")
++    called = []
++    monkeypatch.setattr(
++        qi, "_select_decode_rows", lambda *a: called.append(1) or _ref_select_rows(*a)
++    )
++    max_seq = max(seq_lens) if fits else max(seq_lens) + 4  # 133 // 4 = 33 > 32
++    got = _run(q, kc, pt, vis, token_topk, K1, max_seq_len=max_seq)
++    assert _sets(got) == _sets(per_row)
++    if fits:
++        assert not called
++        for r, row in enumerate(got.tolist()):
++            v = int(vis[r])
++            assert row == list(range(v)) + [-1] * (len(row) - v)
++    else:
++        assert called
++
++
++def test_skip_fit_needs_the_host_bound(monkeypatch, ref_scorer):
++    gen = torch.Generator().manual_seed(2)
++    q, kc, pt, vis, _ = _decode_case(1, [40], gen)
++    monkeypatch.setenv("B70_QSA_TOPK_SKIP_FIT", "1")
++    called = []
++    monkeypatch.setattr(
++        qi, "_select_decode_rows", lambda *a: called.append(1) or _ref_select_rows(*a)
++    )
++    _run(q, kc, pt, vis, 128, K1, max_seq_len=None)
++    assert called
++
++
++# --------------------------------------------------------------------------
++# D03: scorer defaults
++# --------------------------------------------------------------------------
++
++
++@pytest.fixture
++def on_xpu(monkeypatch):
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_xpu_tuning as xpu_tune
++
++    monkeypatch.delenv("B70_QSA_SCORE_DEFAULTS", raising=False)
++    monkeypatch.setattr(qi.current_platform, "is_xpu", lambda: True)
++    monkeypatch.setattr(xpu_tune.current_platform, "is_xpu", lambda: True)
++    xpu_tune.set_overrides({})
++    yield xpu_tune
++    xpu_tune.set_overrides(None)
++
++
++def test_c2_scorer_defaults_bf16(on_xpu):
++    bf16 = torch.bfloat16
++    assert qi._decode_launch_config(bf16) == (3, 4)
++    assert qi._decode_block_n(bf16) == 32
++    assert qi._decode_block_n() == 32
++    assert qi._decode_tiles_per_program(64, 65728, bf16) == 1
++    assert qi._prefill_launch_config(bf16) == (32, 128, 16, 1, 16)
++
++
++def test_c2_scorer_defaults_leave_fp8_alone(on_xpu):
++    fp8 = torch.float8_e4m3fn
++    assert qi._decode_launch_config(fp8) == (2, 1)
++    assert qi._decode_block_n(fp8) == 64
++    assert qi._prefill_launch_config(fp8) == (32, 64, 16, 2, 8)
++
++
++def test_c2_scorer_defaults_legacy_switch(on_xpu, monkeypatch):
++    monkeypatch.setenv("B70_QSA_SCORE_DEFAULTS", "legacy")
++    bf16 = torch.bfloat16
++    assert qi._decode_launch_config(bf16) == (2, 2)
++    assert qi._decode_block_n(bf16) == 64
++    assert qi._decode_tiles_per_program(1, 1024, bf16) == 1
++    assert qi._decode_tiles_per_program(64, 65728 * 4, bf16) > 1
++    assert qi._prefill_launch_config(bf16) == (64, 64, 16, 2, 4)
++
++
++def test_tune_overrides_beat_c2_defaults(on_xpu):
++    on_xpu.set_overrides(
++        {
++            "decode_score": {"num_warps": 8, "block_n": 16, "tiles_per_prog": 4},
++            "prefill_score": {"num_warps": 8},
++        }
++    )
++    bf16 = torch.bfloat16
++    assert qi._decode_launch_config(bf16) == (3, 8)
++    assert qi._decode_block_n(bf16) == 16
++    assert qi._decode_tiles_per_program(8, 4096, bf16) == 4
++    assert qi._prefill_launch_config(bf16) == (32, 128, 16, 1, 8)
++
++
++def test_cpu_platform_keeps_gb300_configs():
++    if qi.current_platform.is_xpu():
++        pytest.skip("XPU host")
++    assert qi._decode_launch_config(torch.bfloat16) == (2, 2)
++    assert qi._decode_block_n() == qi._DECODE_BLOCK_N
++    assert qi._prefill_launch_config(torch.bfloat16) == (64, 64, 16, 2, 4)
++
++
++def test_kinds_cover_every_combination():
++    # guard against a silent parametrize drop
++    assert len(list(itertools.product(KINDS, range(6)))) == 42
++
++
++def test_select_check_flags_a_wrong_native_set(monkeypatch):
++    monkeypatch.setenv("B70_QSA_TOPK_SELECT_CHECK", "1")
++    logits = torch.arange(40, dtype=torch.float32).view(1, 40)
++    visible = torch.tensor([40], dtype=torch.int32)
++    wrong = torch.arange(8, dtype=torch.int32).view(1, 8)  # the 8 smallest
++    with pytest.raises(RuntimeError):
++        _select(logits, visible, 8, wrong)
++    right = torch.arange(32, 40, dtype=torch.int32).flip(0).view(1, 8)
++    assert torch.equal(
++        _select(logits, visible, 8, right), _torch_ref(logits, visible, 8)
++    )

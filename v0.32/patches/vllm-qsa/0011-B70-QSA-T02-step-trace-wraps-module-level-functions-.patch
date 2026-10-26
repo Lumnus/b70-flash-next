@@ -1,7 +1,7 @@
 From 456a031c92cf86b2eeac5d6a4659b7ac70185163 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 21:30:46 +0000
-Subject: [PATCH 11/26] B70-QSA-T02: step trace wraps module-level functions
+Subject: [PATCH 11/32] B70-QSA-T02: step trace wraps module-level functions
  (B70_STEP_TRACE_FUNCS, preset "qsa")
 
 B70-0055 marks module boundaries and methods; the QSA work is module-level

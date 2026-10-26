@@ -5,7 +5,7 @@ from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM 
 decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 8 sequences,
 4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. This
 release is the **dense** attention variant (the checkpoint's QSA indexer is dropped); the sparse variant
-is described below ([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2: working, experimental, slower than dense).
+is described below ([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2, near dense speed from 0.32.0-b70.3: working, experimental).
 
 | | |
 |---|---|
@@ -252,29 +252,35 @@ on `enable_thinking=false` or a "none/off" effort); it is not included.
 
 ## Sparse attention (QSA)
 
-**Status: working, experimental, slower than dense on multi-stream.** Release 0.32.0-b70.2 adds a second attention
-variant on top of the dense one. The checkpoint's QSA indexer is kept and the full-attention layers attend over the
-indexer's selection (a 2,048-token budget) with Triton kernels, instead of over the whole context. It boots on 4× B70,
-answers correctly, passes the gates and the long-context needles, and its output matches dense up to the selection
-budget. It is slower than dense: 0.74–0.81× on prefill and one-stream decode, 0.46–0.53× at 4–8 concurrent streams, with
-17 % less GPU KV (329K against 397K tokens). The dense series ([`patches/vllm/`](patches/vllm/), the release above) is
-unchanged from 0.32.0-b70.1 and stays the recommended configuration when throughput matters.
+**Status: working, experimental, close to dense speed.** Release 0.32.0-b70.2 added a second attention variant on top of
+the dense one; 0.32.0-b70.3 brought it near dense speed. The checkpoint's QSA indexer is kept and the full-attention layers
+attend over the indexer's selection (a 2,048-token budget) with Triton kernels, instead of over the whole context. It boots
+on 4× B70, answers correctly, passes the gates and the long-context needles, and its output matches dense up to the
+selection budget. Against dense on the same harness it is 0.90× on one-stream decode and prefill, 1.00× at 4 concurrent
+streams, 0.94× at 8, and faster than dense at 131K prefill, with 14 % less GPU KV (342K against 397K tokens). The dense
+series ([`patches/vllm/`](patches/vllm/), the release above) is unchanged in its patches and stays the default.
 
-| | dense | sparse QSA | sparse / dense |
-|---|---|---|---|
-| decode, 1 stream (tok/s) | 169.3 | 125.0 | 0.74 |
-| decode, 4 concurrent (total tok/s) | 306.2 | 161.2 | 0.53 |
-| decode, 8 streams (total tok/s) | 605.5 | 281.4 / 279.7 | 0.46 |
-| prefill 8K / 32K / 131K (tok/s) | 6,305 / 6,114 / 4,641 | 5,096 / 4,635 / 3,456 | 0.81 / 0.76 / 0.74 |
-| GPU KV cache (tokens) | 397,309 | 329,287 | 0.83 |
+| | dense | sparse QSA (b70.3) | sparse / dense | sparse in b70.2 (superseded) |
+|---|---|---|---|---|
+| decode, 1 stream (tok/s) | 169.3 | 153.1 | 0.90 | 125.0 (0.74) |
+| decode, 4 concurrent (total tok/s) | 306.2 | 306.1 | 1.00 | 161.2 (0.53) |
+| decode, 8 streams (total tok/s) | 605.5 | 569.0 | 0.94 | 281.4 / 279.7 (0.46) |
+| prefill 8K / 32K / 131K (tok/s) | 6,305 / 6,114 / 4,641 | 5,659 / 5,475 / 4,916 | 0.90 / 0.90 / 1.06 | 5,096 / 4,635 / 3,456 |
+| GPU KV cache (tokens) | 397,309 | 342,144 | 0.86 | 329,287 |
 
-Same harness and host, one engine at a time, single runs, both with the patched oneCCL plugin
-([`serve-plugin.env`](engines/serve-plugin.env) / [`qsa-serve.env`](engines/qsa-serve.env)). Fidelity (identical to dense
-up to 2K tokens; beyond that about 1.7–2× dense's own run-to-run KL on a 12K-token document), the kernel-level
-comparison with Intel's SYCL kernel (labelled as kernel level), the gates, and what is not measured are in
-[docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md).
+Same harness and host, same window, one engine at a time, single runs, both with the patched oneCCL plugin
+([`serve-plugin.env`](engines/serve-plugin.env) / [`qsa-serve.env`](engines/qsa-serve.env); with the default stock plugin
+dense has 388,872 KV tokens; sparse with the stock plugin has not been run). Fidelity (identical to dense up to 2K tokens;
+beyond that KL 0.0224 against dense on a 12K-token document, where dense's own run-to-run floor is about 0.013–0.014), the
+kernel-level comparison with Intel's SYCL kernel (labelled as kernel level), the gates, the stress stage, the levers that
+were tried and not shipped, and what is not measured are in [docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md).
 
-**What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 26 patches, applied on top of
+**What b70.3 fixed.** The b70.2 sparse build ran out of GPU memory on 131K prefills under load (about 800 MiB, inside the
+deterministic top-k's tie repair) and was 0.46–0.53× dense at 4–8 streams. The tie repair is now device-only (no host
+synchronisation, no full-width sort), as a fused Triton select, and the faster scorer launch configurations from the sweeps
+are the defaults. The build passed a stress stage of repeated 131K prefills plus 8-stream decode.
+
+**What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 32 patches, applied on top of
 [`patches/vllm/`](patches/vllm/) (that is, on fork tag `v0.32.0-b70.1`, `103f2f2eb9`); the fork branch is
 [`b70/v0.32.0-qsa-release`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-release). `scripts/check-series.sh --qsa`
 fails if the directory differs from a fresh export of it. Every patch is authored `Lumnus`; 0001 is the upstream
@@ -287,9 +293,13 @@ vllm-project/vllm#60602 cherry-pick.
 | 0015, 0016, 0024 | `attn2` (`B70_QSA_ATTN_IMPL=attn2`): a sparse GQA kernel with no register spills on Xe2, its comparison bench, and its defaults from the sweep (tile 32 × 8 chunks, 256 GRF, one warp; the kernel refuses two warps at tile ≥ 32, where the IGC compiler crashes) |
 | 0017–0019, 0022 | qualification: off-by-default hooks for the QSA side caches, `B70_QSA_TOPK=native_det` (the native top-k with the torch selector's output), 148 side-cache state-contract tests and an engine lifecycle driver |
 | 0026 | a one-time log line naming the sparse attention implementation in use |
+| 0027–0032 | 0.32.0-b70.3: `native_det`'s tie repair without a host sync or a full-width sort (0027; `B70_QSA_TOPK=radix` as an alternative), top-k once per verify step and skip-when-fits (0028, both off by default), the scorer launch defaults from the sweeps (0029; `B70_QSA_SCORE_DEFAULTS=legacy` restores the old ones), CPU tests for them (0030), the fused Triton select and the radix schedule by width (0031; `B70_QSA_TOPK_SELECT_IMPL=triton`), profiler buckets for `attn2` and the select (0032) |
 
 Off by default: `attn2` (`B70_QSA_ATTN_IMPL`, default `splitk`, the first kernel), `native_det` (`B70_QSA_TOPK`, default
-`auto`), the tuning hook, the graph-capture arm, the debug and dump hooks. The engine file turns on `attn2` and `native_det`.
+`auto`), the Triton select (`B70_QSA_TOPK_SELECT_IMPL`, default `torch`), top-k once per verify step
+(`B70_QSA_TOPK_PER_STEP`) and skip-when-fits (`B70_QSA_TOPK_SKIP_FIT`) (approximate and neutral respectively, see the
+measurements), the tuning hook, the graph-capture arm (it degrades fidelity beyond 2K tokens: do not serve it), the debug
+and dump hooks. The engine file turns on `attn2`, `native_det` and the Triton select; the scorer defaults are in the code.
 
 **Run it.** Build as in [Build and run](#build-and-run), with the add-on applied after the dense series:
 
@@ -307,10 +317,10 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
 
 **Known issues (sparse).**
 
-1. **Slower than dense, most at multi-stream** (above). The cost sits in the indexer scorer and top-k, which grow with
-   rows × context; the tuned scorer configurations the sweeps found are not yet the defaults, and the deterministic
-   top-k falls back to a full-width torch sort at the full page-table width.
-2. **KV capacity −17 %** against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
+1. **Slower than dense** by about 10 % on one stream, at prefill up to 32K and at 8 streams (above); at 4 streams and at
+   131K prefill it matches or beats it. No in-engine profile exists (the torch profiler hangs the engine on XPU), so where
+   the remaining time goes is inferred.
+2. **KV capacity −14 %** against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
    `kernel_block_size=16` is not fully optimised).
 3. **Both variants are run-to-run nondeterministic from about token 512**, so bit-level comparison gates fail on either;
    fidelity was measured with KL against a same-engine floor instead.
@@ -320,6 +330,8 @@ longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
    ([measurements, what this does not show](../docs/measurements/v0.32-qsa.md#5-what-this-does-not-show)).
 6. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); do not serve it.
    `native_det` is the qualified native mode.
+7. **Not run on the sparse engine:** DFlash's trailing-block drop turned off (`disable_eagle_block_drop`, set in the dense
+   `serve.args`), and the stock oneCCL plugin.
 
 ## Known issues (0.32)
 

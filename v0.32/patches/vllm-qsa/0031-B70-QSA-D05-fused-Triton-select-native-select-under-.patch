@@ -1,0 +1,638 @@
+From 5efd1667db22594270a426eaba3140c15c074702 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 01:28:07 +0000
+Subject: [PATCH 31/32] B70-QSA-D05: fused Triton select, native + select under
+ capture, radix schedule by width, one-card bench
+
+- B70_QSA_TOPK_SELECT_IMPL=triton (default torch): the native-anchored
+  select in two launches instead of ~50 torch ops. _qsa_select_keep_kernel
+  uses one program per row: it counts above the native k-th score (and the
+  signed zeros), then makes a cumsum-ranked compaction pass in 1,024-column
+  tiles bounded by the row's visible blocks. _qsa_select_order_kernel does
+  tl.sort over the k kept int64 keys. Identical to the torch selector in the
+  Triton interpreter on the tie-heavy suite. It has not been compiled on XPU
+  yet; the next GPU window qualifies it.
+- native_det + select under graph capture now runs the native op plus select,
+  both device-only. Before, it took the radix threshold, ~60 small captured
+  kernels per layer. B70_QSA_TOPK_CAPTURE=radix keeps the radix path; legacy
+  still takes the torch path under capture.
+- The radix pass schedule follows width: 4x8 bits up to 4,096 columns, else
+  11/11/10, which matches persistent_topk's 2,048 decode bins.
+  B70_QSA_TOPK_RADIX=8|11|16 forces a schedule; every schedule is tested.
+- benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py checks per-backend
+  identity against torch and times each backend (wall time per call, launches
+  included). It also times per-row against per-step decode select, with
+  selection Jaccard, on one card.
+---
+ .../kernels/b70_qsa_tune/bench_topk_levers.py | 201 ++++++++++++++++++
+ .../models/qwen4_exp/test_qsa_topk_levers.py  | 111 +++++++++-
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       | 198 ++++++++++++++++-
+ 3 files changed, 490 insertions(+), 20 deletions(-)
+ create mode 100644 benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py
+
+diff --git a/benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py b/benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py
+new file mode 100644
+index 0000000000..c0b01bf5b6
+--- /dev/null
++++ b/benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA-D05: one-card identity + timing for the top-k levers (D01/D02).
++
++Per shape (rows x compressed columns), on ReLU-shaped scores with real ties:
++  identity: every top-k backend vs the torch selector, element for element
++            (native: set + order mismatch counted, it is not exact by design)
++  timing:   torch | native | native_det legacy | native_det select (torch ops)
++            | native_det select-triton | radix  (wall time per call incl. launches)
++  D02:      qsa_select_paged_decode per-row vs per-step (scorer + top-k), at
++            decode_query_len 8 (DFlash K=7)
++
++Usage (one card, engine stopped or another card):
++  python benchmarks/kernels/b70_qsa_tune/bench_topk_levers.py --device xpu:1 \
++      --rows 8,32,64 --ctx 4096,32768,131072,262144 --out topk.jsonl
++CPU smoke: --device cpu --rows 8 --ctx 4096 --reps 1 (native/scorer skipped).
++"""
++
++import argparse
++import json
++import os
++import time
++
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++CR, TOKEN_TOPK, IDX_HEADS, IDX_DIM, PAGE = 4, 2048, 4, 128, 64
++
++
++def sync(dev):
++    if dev.type == "xpu":
++        torch.xpu.synchronize()
++
++
++def timeit(fn, dev, reps, warm=2):
++    for _ in range(warm):
++        fn()
++    sync(dev)
++    t = []
++    for _ in range(reps):
++        t0 = time.perf_counter()
++        fn()
++        sync(dev)
++        t.append((time.perf_counter() - t0) * 1e6)
++    t.sort()
++    return t[len(t) // 2]
++
++
++def relu_logits(rows, width, positive_frac, gen, dev):
++    x = torch.rand(rows, width, generator=gen)
++    mask = torch.rand(rows, width, generator=gen) < positive_frac
++    return torch.where(mask, x, 0.0).to(dev)
++
++
++def run_topk(mode, impl, logits, visible, k):
++    os.environ["B70_QSA_TOPK"] = mode
++    os.environ["B70_QSA_TOPK_DET_IMPL"] = "legacy" if impl == "legacy" else "select"
++    os.environ["B70_QSA_TOPK_SELECT_IMPL"] = (
++        "triton" if impl == "select-triton" else "torch"
++    )
++    out = torch.empty(logits.shape[0], k, dtype=torch.int32, device=logits.device)
++    ws = torch.empty(1 << 20, dtype=torch.uint8, device=logits.device)
++    qi._topk(logits, visible, TOKEN_TOPK, CR, out, ws)
++    return out
++
++
++def bench_topk(args, dev, gen, rows, ctx, frac, emit):
++    width = ctx // CR
++    k = TOKEN_TOPK // CR
++    logits = relu_logits(rows, width, frac, gen, dev)
++    visible = torch.full((rows,), width, dtype=torch.int32, device=dev)
++    visible[0] = max(1, k - 1)  # one short row
++    want = run_topk("torch", "select", logits, visible, k)
++    has_native = dev.type != "cpu" and hasattr(torch.ops._C, "top_k_per_row_decode")
++    arms = [("torch", "select"), ("radix", "select")]
++    if has_native:
++        arms += [
++            ("native", "select"),
++            ("native_det", "legacy"),
++            ("native_det", "select"),
++            ("native_det", "select-triton"),
++        ]
++    for mode, impl in arms:
++        got = run_topk(mode, impl, logits, visible, k)
++        exact = bool(torch.equal(got, want))
++        same_set = bool(torch.equal(got.sort(dim=1).values, want.sort(dim=1).values))
++        us = timeit(
++            lambda m=mode, i=impl: run_topk(m, i, logits, visible, k), dev, args.reps
++        )
++        emit(
++            {
++                "op": "topk",
++                "mode": mode,
++                "impl": impl,
++                "rows": rows,
++                "ctx": ctx,
++                "positive_frac": frac,
++                "exact": exact,
++                "same_set": same_set,
++                "us": us,
++            }
++        )
++
++
++def bench_decode(args, dev, gen, num_requests, ctx, emit):
++    dql = 8
++    rows = num_requests * dql
++    blocks = ctx // CR
++    pages_per_req = -(-blocks // (PAGE // CR)) + 1
++    comp_page = PAGE // CR
++    pages = num_requests * pages_per_req + 1
++    k_cache = torch.randn(pages, comp_page, 1, IDX_DIM, generator=gen).to(
++        dev, torch.bfloat16
++    )
++    table = torch.randperm(pages, generator=gen)[: num_requests * pages_per_req]
++    table = table.view(num_requests, pages_per_req).to(dev, torch.int32)
++    pos = torch.cat([torch.arange(ctx - dql, ctx)] * num_requests)
++    visible = ((pos + 1) // CR).to(dev, torch.int32)
++    q = torch.randn(rows, IDX_HEADS, IDX_DIM, generator=gen).to(dev, torch.bfloat16)
++    os.environ["B70_QSA_TOPK"] = args.decode_topk
++    os.environ["B70_QSA_TOPK_DET_IMPL"] = "select"
++    os.environ["B70_QSA_TOPK_SELECT_IMPL"] = args.select_impl
++    res = {}
++    for name, per_step in (("per_row", "0"), ("per_step", "1")):
++        os.environ["B70_QSA_TOPK_PER_STEP"] = per_step
++        out = torch.empty(rows, TOKEN_TOPK // CR, dtype=torch.int32, device=dev)
++
++        def call(out=out):
++            qi.qsa_select_paged_decode(
++                q, k_cache, table, visible, TOKEN_TOPK, CR, dql, out
++            )
++
++        call()
++        res[name] = out.clone()
++        us = timeit(call, dev, args.reps)
++        emit(
++            {
++                "op": "select_decode",
++                "arm": name,
++                "requests": num_requests,
++                "rows": rows,
++                "ctx": ctx,
++                "topk": args.decode_topk,
++                "us": us,
++            }
++        )
++    os.environ["B70_QSA_TOPK_PER_STEP"] = "0"
++    a = res["per_row"].cpu()
++    b = res["per_step"].cpu()
++    jac = []
++    for r in range(rows):
++        sa = set(x for x in a[r].tolist() if x >= 0)
++        sb = set(x for x in b[r].tolist() if x >= 0)
++        jac.append(len(sa & sb) / max(1, len(sa | sb)))
++    emit(
++        {
++            "op": "per_step_overlap",
++            "requests": num_requests,
++            "ctx": ctx,
++            "jaccard_min": min(jac),
++            "jaccard_mean": sum(jac) / len(jac),
++        }
++    )
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--device", default="xpu")
++    p.add_argument("--rows", default="8,32,64")
++    p.add_argument("--ctx", default="4096,32768,131072,262144")
++    p.add_argument("--positive-frac", default="0.02,0.5")
++    p.add_argument("--reps", type=int, default=20)
++    p.add_argument("--decode-topk", default="native_det")
++    p.add_argument("--select-impl", default="triton", choices=["torch", "triton"])
++    p.add_argument("--no-decode", action="store_true")
++    p.add_argument("--out", default="")
++    args = p.parse_args()
++    dev = torch.device(args.device)
++    if dev.type == "xpu":
++        torch.xpu.set_device(dev)
++    gen = torch.Generator().manual_seed(0)
++    fh = open(args.out, "a") if args.out else None  # noqa: SIM115
++
++    def emit(row):
++        line = json.dumps(row)
++        print(line, flush=True)
++        if fh:
++            fh.write(line + "\n")
++            fh.flush()
++
++    for ctx in [int(x) for x in args.ctx.split(",")]:
++        for rows in [int(x) for x in args.rows.split(",")]:
++            for frac in [float(x) for x in args.positive_frac.split(",")]:
++                bench_topk(args, dev, gen, rows, ctx, frac, emit)
++            if not args.no_decode and dev.type != "cpu" and rows % 8 == 0:
++                bench_decode(args, dev, gen, rows // 8, ctx, emit)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/models/qwen4_exp/test_qsa_topk_levers.py b/tests/models/qwen4_exp/test_qsa_topk_levers.py
+index 2c514ab50d..d2ac9fe72a 100644
+--- a/tests/models/qwen4_exp/test_qsa_topk_levers.py
++++ b/tests/models/qwen4_exp/test_qsa_topk_levers.py
+@@ -9,6 +9,7 @@ D03: the C2 scorer launch defaults and their overrides.
+ """
+ 
+ import itertools
++import os
+ import zlib
+ 
+ import pytest
+@@ -123,12 +124,11 @@ def test_select_full_page_table_width():
+     assert torch.equal(_select(logits, visible, k, native), want)
+ 
+ 
+-@pytest.mark.parametrize("kind", ["few_values", "relu", "randn"])
+-def test_select_eight_bit_passes_match(monkeypatch, kind):
+-    """Force the 4 x 8-bit radix schedule (used for large row counts)."""
+-    monkeypatch.setattr(
+-        qi, "_radix_passes", lambda rows: ((24, 8), (16, 8), (8, 8), (0, 8))
+-    )
++@pytest.mark.parametrize("radix", ["8", "11", "16"])
++@pytest.mark.parametrize("kind", ["few_values", "relu", "randn", "signed_zero", "inf"])
++def test_select_every_radix_schedule_matches(monkeypatch, kind, radix):
++    """Every pass schedule (B70_QSA_TOPK_RADIX) gives the torch output."""
++    monkeypatch.setenv("B70_QSA_TOPK_RADIX", radix)
+     gen = torch.Generator().manual_seed(8)
+     logits = _tie_heavy(12, 2000, gen, kind)
+     visible = _visible_set(12, 2000, 512, gen)
+@@ -176,22 +176,34 @@ def test_topk_dispatch_is_torch_exact(monkeypatch, mode, impl):
+     assert torch.equal(got, _torch_ref(logits, visible, 512))
+ 
+ 
+-def test_native_det_select_under_capture_never_calls_native(monkeypatch):
++@pytest.mark.parametrize("capture", ["native", "radix"])
++def test_native_det_select_under_capture(monkeypatch, capture):
++    """Under capture: native + select (default) or radix (no native op);
++    the torch full-width path is never used."""
+     from vllm.models.qwen4_exp.common import qsa_debug
+ 
+     gen = torch.Generator().manual_seed(6)
+     logits = _tie_heavy(4, 900, gen, "zeros")
+     visible = torch.tensor([900, 10, 600, 513], dtype=torch.int32)
++    calls = []
++
++    def native(logits, visible_blocks, block_topk, out):
++        calls.append("native")
++        out.copy_(_adversarial_native(logits, visible_blocks, block_topk, gen))
+ 
+-    def boom(*a, **k):
+-        raise AssertionError("native op called under capture")
++    def no_torch(*a, **k):
++        raise AssertionError("torch top-k under capture")
+ 
+     monkeypatch.setenv("B70_QSA_TOPK", "native_det")
+-    monkeypatch.setattr(qi, "_qsa_topk_native", boom)
++    monkeypatch.setenv("B70_QSA_TOPK_CAPTURE", capture)
++    monkeypatch.setattr(qi, "_qsa_topk_native", native)
++    monkeypatch.setattr(qi, "_qsa_topk_torch", no_torch)
+     monkeypatch.setattr(qsa_debug, "is_capturing", lambda: True)
+     got = torch.empty(4, 512, dtype=torch.int32)
+     qi._topk(logits, visible, 2048, 4, got, torch.empty(0, dtype=torch.uint8))
++    monkeypatch.undo()
+     assert torch.equal(got, _torch_ref(logits, visible, 512))
++    assert calls == (["native"] if capture == "native" else [])
+ 
+ 
+ def test_bad_det_impl_is_rejected(monkeypatch):
+@@ -466,3 +478,82 @@ def test_select_check_flags_a_wrong_native_set(monkeypatch):
+     assert torch.equal(
+         _select(logits, visible, 8, right), _torch_ref(logits, visible, 8)
+     )
++
++
++# --------------------------------------------------------------------------
++# D06: fused Triton select (CPU needs TRITON_INTERPRET=1 at import)
++# --------------------------------------------------------------------------
++
++_TRITON_DEV = None
++if hasattr(torch, "xpu") and torch.xpu.is_available():
++    _TRITON_DEV = "xpu"
++elif os.environ.get("TRITON_INTERPRET") == "1":
++    _TRITON_DEV = "cpu"
++requires_triton = pytest.mark.skipif(
++    _TRITON_DEV is None, reason="needs an XPU or TRITON_INTERPRET=1"
++)
++
++
++def _interpretable(kernel):
++    """On a GPU-less host vllm.triton_utils hands out placeholder ``triton`` /
++    ``tl`` (no active driver), so the kernels are plain functions. Rebind them
++    to the real modules and jit them for the Triton interpreter."""
++    if _TRITON_DEV != "cpu" or hasattr(kernel, "__getitem__"):
++        return kernel
++    import types
++
++    import triton as real_triton
++    import triton.language as real_tl
++
++    fn = types.FunctionType(
++        kernel.__code__,
++        {**kernel.__globals__, "tl": real_tl, "triton": real_triton},
++        kernel.__name__,
++        kernel.__defaults__,
++        kernel.__closure__,
++    )
++    fn.__annotations__ = {
++        name: real_tl.constexpr if "constexpr" in repr(ann) else ann
++        for name, ann in kernel.__annotations__.items()
++    }
++    return real_triton.jit(fn)
++
++
++@pytest.fixture
++def triton_select(monkeypatch):
++    monkeypatch.setenv("B70_QSA_TOPK_SELECT_IMPL", "triton")
++    for name in ("_qsa_select_keep_kernel", "_qsa_select_order_kernel"):
++        monkeypatch.setattr(qi, name, _interpretable(getattr(qi, name)))
++
++
++@requires_triton
++@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize("width,k", [(7, 4), (64, 16), (700, 512), (3000, 512)])
++def test_triton_select_matches_torch(triton_select, kind, width, k):
++    gen = torch.Generator().manual_seed(zlib.crc32(f"t{kind}{width}{k}".encode()))
++    logits = _tie_heavy(9, width, gen, kind)
++    visible = _visible_set(9, width, k, gen)
++    want = _torch_ref(logits, visible, k)
++    for high in (True, False):
++        native = _adversarial_native(logits, visible, k, gen, high_col=high)
++        got = torch.empty(9, k, dtype=torch.int32, device=_TRITON_DEV)
++        qi._qsa_topk_select(
++            logits.to(_TRITON_DEV),
++            visible.to(_TRITON_DEV),
++            k,
++            got,
++            native_indices=native.to(_TRITON_DEV),
++        )
++        assert torch.equal(got.cpu(), want)
++
++
++@requires_triton
++def test_triton_select_in_place(triton_select):
++    gen = torch.Generator().manual_seed(12)
++    logits = _tie_heavy(5, 1024, gen, "zeros")
++    visible = torch.tensor([700, 512, 300, 1000, 513], dtype=torch.int32)
++    buf = _adversarial_native(logits, visible, 512, gen).to(_TRITON_DEV)
++    qi._qsa_topk_select(
++        logits.to(_TRITON_DEV), visible.to(_TRITON_DEV), 512, buf, native_indices=buf
++    )
++    assert torch.equal(buf.cpu(), _torch_ref(logits, visible, 512))
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 38e6613a33..d95b15075f 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -606,9 +606,11 @@ def _qsa_topk_mode() -> str:
+     ``auto`` (default): native when the op is registered, else torch.
+     ``native_det`` (B70-QSA-Q): native, then made identical to ``torch``.
+     B70-QSA-D01: by default the repair is ``_qsa_topk_select`` anchored on the
+-    native k-th score (device ops only, no host sync, no full-width sort);
+-    under graph capture it is ``_qsa_topk_select`` with a radix-select
+-    threshold. ``B70_QSA_TOPK_DET_IMPL=legacy`` restores the Q repair (tie rows
++    native k-th score (device ops only, no host sync, no full-width sort),
++    eager and under graph capture alike (B70-QSA-D06;
++    ``B70_QSA_TOPK_CAPTURE=radix`` uses the radix threshold under capture
++    instead of the native op). ``B70_QSA_TOPK_DET_IMPL=legacy`` restores the
++    Q repair (tie rows
+     redone on the torch path after a host sync; torch path under capture).
+     ``radix`` (B70-QSA-D01): ``_qsa_topk_select`` with the radix-select
+     threshold, no native op; identical output to ``torch``.
+@@ -709,11 +711,19 @@ def _ordered_bits(logits: torch.Tensor) -> torch.Tensor:
+     return torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+ 
+ 
+-def _radix_passes(rows: int) -> tuple[tuple[int, int], ...]:
+-    """(shift, bits) per pass, MSB first; two 16-bit passes while the per-row
+-    histograms stay under 32 MiB, else four 8-bit passes."""
+-    if rows * (1 << 16) * 4 <= 32 << 20:
++def _radix_passes(rows: int, width: int) -> tuple[tuple[int, int], ...]:
++    """(shift, bits) per pass, MSB first, covering all 32 bits.
++
++    Each pass costs one full-width sweep plus a scan over rows x bins: four
++    8-bit passes (256 bins) for narrow rows, three 11/11/10-bit passes (2,048
++    bins, the persistent_topk decode bin count) for wide ones.
++    B70_QSA_TOPK_RADIX=8|11|16 forces a schedule (16 = two 16-bit passes).
++    """
++    forced = os.environ.get("B70_QSA_TOPK_RADIX", "")
++    if forced == "16":
+         return ((16, 16), (0, 16))
++    if forced == "11" or (forced != "8" and width > 4096):
++        return ((21, 11), (10, 11), (0, 10))
+     return ((24, 8), (16, 8), (8, 8), (0, 8))
+ 
+ 
+@@ -734,7 +744,7 @@ def _radix_threshold(
+     remaining = want.clone()
+     threshold = torch.zeros(rows, dtype=torch.int64, device=dev)
+     row_base = torch.arange(rows, dtype=torch.int64, device=dev).unsqueeze(1)
+-    for i, (shift, bits) in enumerate(_radix_passes(rows)):
++    for i, (shift, bits) in enumerate(_radix_passes(rows, ordered.shape[1])):
+         bins = 1 << bits
+         if i == 0:
+             # arithmetic shift keeps the sign: [-bins/2, bins/2) -> [0, bins)
+@@ -788,6 +798,11 @@ def _qsa_topk_select(
+     rows, width = logits.shape
+     if rows == 0:
+         return
++    if native_indices is not None and _select_impl() == "triton":
++        _qsa_topk_select_triton(
++            logits, visible_blocks, block_topk, block_indices, native_indices
++        )
++        return
+     budget = int(os.environ.get("B70_QSA_TOPK_SELECT_CHUNK_MB", "256")) << 20
+     step = max(1, budget // max(1, width * 40))
+     for start in range(0, rows, step):
+@@ -868,6 +883,166 @@ def _qsa_topk_select_rows(
+         block_indices[:, k:].fill_(-1)
+ 
+ 
++def _select_impl() -> str:
++    """B70-QSA-D06: native-anchored select as ``torch`` ops (default, ~50
++    launches) or two fused Triton launches (``triton``),
++    B70_QSA_TOPK_SELECT_IMPL."""
++    impl = os.environ.get("B70_QSA_TOPK_SELECT_IMPL", "torch")
++    if impl not in ("torch", "triton"):
++        raise ValueError(f"B70_QSA_TOPK_SELECT_IMPL must be torch|triton, got {impl!r}")
++    return impl
++
++
++@triton.jit
++def _qsa_select_keep_kernel(
++    logits_ptr,
++    visible_ptr,
++    native_ptr,
++    keep_ptr,
++    stride_logits_row,
++    stride_native_row,
++    stride_keep_row,
++    width,
++    K: tl.constexpr,
++    K_PAD: tl.constexpr,
++    TILE: tl.constexpr,
++) -> None:
++    """One row per program: the kept columns of _qsa_topk_select_rows
++    (native-anchored), compacted in ascending column order, then -1."""
++    row = tl.program_id(0).to(tl.int64)
++    vis = tl.minimum(tl.maximum(tl.load(visible_ptr + row), 0), width)
++    want = tl.minimum(vis, K)
++    slots = tl.arange(0, K_PAD)
++    idx = tl.load(
++        native_ptr + row * stride_native_row + slots, mask=slots < K, other=-1
++    )
++    valid = (idx >= 0) & (idx < vis)
++    picked = tl.load(
++        logits_ptr + row * stride_logits_row + idx, mask=valid, other=float("inf")
++    )
++    kth = tl.min(picked, axis=0)
++    kth_bits = kth.to(tl.int32, bitcast=True)
++    t0 = tl.where(kth_bits < 0, kth_bits ^ 0x7FFFFFFF, kth_bits)
++    n_tiles = tl.cdiv(vis, TILE)
++    count_gt = 0
++    count_ge_zero = 0
++    count_gt_zero = 0
++    for tile in range(0, n_tiles):
++        cols = tile * TILE + tl.arange(0, TILE)
++        live = cols < vis
++        bits = tl.load(
++            logits_ptr + row * stride_logits_row + cols, mask=live, other=0.0
++        ).to(tl.int32, bitcast=True)
++        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
++        count_gt += tl.sum((live & (ordered > t0)).to(tl.int32), axis=0)
++        count_ge_zero += tl.sum((live & (ordered >= 0)).to(tl.int32), axis=0)
++        count_gt_zero += tl.sum((live & (ordered > 0)).to(tl.int32), axis=0)
++    # native compares floats (-0.0 == +0.0); the key orders -0.0 < +0.0
++    pos_zero = count_ge_zero >= want
++    is_zero = kth == 0.0
++    threshold = tl.where(is_zero, tl.where(pos_zero, 0, -1), t0)
++    above = tl.where(
++        is_zero, tl.where(pos_zero, count_gt_zero, count_ge_zero), count_gt
++    )
++    remaining = want - above
++    kept = 0
++    equals = 0
++    for tile in range(0, n_tiles):
++        cols = tile * TILE + tl.arange(0, TILE)
++        live = cols < vis
++        bits = tl.load(
++            logits_ptr + row * stride_logits_row + cols, mask=live, other=0.0
++        ).to(tl.int32, bitcast=True)
++        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
++        is_above = live & (ordered > threshold)
++        is_equal = live & (ordered == threshold)
++        equal_rank = equals + tl.cumsum(is_equal.to(tl.int32), axis=0)
++        keep = is_above | (is_equal & (equal_rank <= remaining))
++        slot = kept + tl.cumsum(keep.to(tl.int32), axis=0) - 1
++        tl.store(keep_ptr + row * stride_keep_row + slot, cols, mask=keep)
++        kept += tl.sum(keep.to(tl.int32), axis=0)
++        equals += tl.sum(is_equal.to(tl.int32), axis=0)
++    tl.store(
++        keep_ptr + row * stride_keep_row + slots,
++        tl.full((K_PAD,), -1, tl.int32),
++        mask=(slots >= kept) & (slots < K),
++    )
++
++
++@triton.jit
++def _qsa_select_order_kernel(
++    logits_ptr,
++    keep_ptr,
++    out_ptr,
++    stride_logits_row,
++    stride_keep_row,
++    stride_out_row,
++    K: tl.constexpr,
++    K_PAD: tl.constexpr,
++) -> None:
++    """One row per program: sort the kept columns by the torch key
++    (descending score, lower column first), -1 last."""
++    row = tl.program_id(0).to(tl.int64)
++    slots = tl.arange(0, K_PAD)
++    col = tl.load(keep_ptr + row * stride_keep_row + slots, mask=slots < K, other=-1)
++    valid = col >= 0
++    bits = tl.load(
++        logits_ptr + row * stride_logits_row + col, mask=valid, other=0.0
++    ).to(tl.int32, bitcast=True)
++    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
++    low = 0xFFFFFFFF - col.to(tl.int64)
++    key = (ordered << 32) | low
++    floor = tl.full((K_PAD,), -0x7FFFFFFFFFFFFFFF - 1, tl.int64)
++    key = tl.where(valid, key, floor)
++    key = tl.sort(key, descending=True)
++    top = 0xFFFFFFFF - (key & 0xFFFFFFFF)
++    top = tl.where(key == floor, -1, top)
++    tl.store(out_ptr + row * stride_out_row + slots, top.to(tl.int32), mask=slots < K)
++
++
++def _qsa_topk_select_triton(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_topk: int,
++    block_indices: torch.Tensor,
++    native_indices: torch.Tensor,
++) -> None:
++    """B70-QSA-D06: _qsa_topk_select (native-anchored) in two launches."""
++    rows, width = logits.shape
++    k = min(block_topk, width)
++    k_pad = 1 << max(0, k - 1).bit_length()
++    keep = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
++    logits = logits.contiguous()
++    visible = visible_blocks[:rows].to(torch.int32).contiguous()
++    _qsa_select_keep_kernel[(rows,)](
++        logits,
++        visible,
++        native_indices,
++        keep,
++        logits.stride(0),
++        native_indices.stride(0),
++        keep.stride(0),
++        width,
++        K=k,
++        K_PAD=k_pad,
++        TILE=1024,
++        num_warps=4,
++    )
++    _qsa_select_order_kernel[(rows,)](
++        logits,
++        keep,
++        block_indices,
++        logits.stride(0),
++        keep.stride(0),
++        block_indices.stride(0),
++        K=k,
++        K_PAD=k_pad,
++        num_warps=4,
++    )
++    if k < block_topk:
++        block_indices[:, k:].fill_(-1)
++
++
+ def _qsa_topk_native(
+     logits: torch.Tensor,
+     visible_blocks: torch.Tensor,
+@@ -952,10 +1127,13 @@ def _topk(
+             mode,
+             f" (repair = {det_impl})" if det_impl else "",
+         )
+-        if mode == "radix" or (det_impl == "select" and _qsa_debug.is_capturing()):
++        capture_radix = os.environ.get("B70_QSA_TOPK_CAPTURE", "native") == "radix"
++        if mode == "radix" or (
++            det_impl == "select" and capture_radix and _qsa_debug.is_capturing()
++        ):
+             _qsa_topk_select(logits, visible_blocks, block_topk, block_indices)
+             return
+-        if mode == "torch" or (mode == "native_det" and _qsa_debug.is_capturing()):
++        if mode == "torch" or (det_impl == "legacy" and _qsa_debug.is_capturing()):
+             _qsa_topk_torch(logits, visible_blocks, block_topk, block_indices)
+             return
+         _qsa_topk_native(logits, visible_blocks, block_topk, block_indices)

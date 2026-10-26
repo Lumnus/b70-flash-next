@@ -1,7 +1,7 @@
 From 3a70224ed616983d36c7e23a4561d2be3d39b939 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 23:44:35 +0000
-Subject: [PATCH 22/26] B70-QSA-Q04: state-contract tests route CPU tensors to
+Subject: [PATCH 22/32] B70-QSA-Q04: state-contract tests route CPU tensors to
  the torch metadata builder on GPU hosts
 
 With HAS_TRITON the module-level builder is the Triton one, so the ref backend (CPU tensors) hit a Triton launch on a GPU host: 59 failures with "Pointer argument doesn t reference accessible memory". An autouse fixture dispatches by tensor device; device tensors keep the production builder.

@@ -4,12 +4,39 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.32.0-b70.3 — 2026-10-26: sparse attention (QSA) brought near dense speed; dense engine args
+
+The dense series (`v0.32/patches/vllm/`, 49 patches, fork tag `v0.32.0-b70.1`) is unchanged.
+
+- **Sparse (QSA) code.** `v0.32/patches/vllm-qsa/` grows from 26 to 32 patches (0027–0032), authored `Lumnus`; fork branch
+  `b70/v0.32.0-qsa-release` (`be6a6e7d33`) on `Lumnus/vllm`; `v0.32/scripts/check-series.sh --qsa` checks it. The
+  deterministic top-k (`native_det`) repairs ties without a host synchronisation and without a full-width sort (0027), as a
+  fused Triton select (0031, `B70_QSA_TOPK_SELECT_IMPL=triton`); the faster scorer launch configurations from the sweeps
+  are the defaults on XPU (0029, `B70_QSA_SCORE_DEFAULTS=legacy` restores the old ones); top-k once per verify step and
+  skip-when-fits are in the series, off by default (0028); CPU tests (0030); profiler buckets (0032).
+- **Fix.** The b70.2 sparse build ran out of GPU memory on rank 0 (about 800 MiB, inside the tie repair) during 131K
+  prefills under load. The b70.3 build does not make that allocation and passed a stress stage of repeated 131K prefills
+  plus 8-stream decode with 0 out-of-memory and 0 device errors.
+- **Numbers**, same harness and window as dense ([docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md)): decode
+  at 1 stream 0.90× dense (153.1 against 169.3 tok/s), 4 concurrent 1.00× (306 tok/s), 8 streams 0.94× (569 against 605
+  tok/s), prefill 0.90× at 8K and 32K and faster than dense at 131K (4,916 against 4,641 tok/s); GPU KV 342,144 against
+  397,309 tokens (with the patched plugin; dense default 388,872). b70.2 was 0.74 / 0.53 / 0.46× with 329,287 KV tokens;
+  those numbers are kept in the measurements doc, labelled superseded. Beyond 2K tokens KL 0.0224 against dense (dense's
+  own run-to-run floor about 0.013–0.014); identical to dense up to 2K.
+- **Engine files.** `v0.32/engines/qsa-serve.env` gains `B70_QSA_TOPK_SELECT_IMPL=triton`; its header and `qsa-serve.args`'
+  header are updated. `serve-config-qsa.json` is unchanged.
+- **Not shipped as on:** top-k once per verify step (12 % slower at 4 streams, KL slightly worse), skip-when-fits (no
+  measurable gain), graph capture of the sparse path (`B70_QSA_EAGER_BREAK=0`: fidelity degrades beyond 2K tokens, do not
+  serve it).
 - **Dense engine args: DFlash's trailing-block drop is off** (`"disable_eagle_block_drop": true` in
   `v0.32/engines/serve.args`). On this tree the DFlash2 draft KV group is not recognised as the draft's, so vLLM's
   EAGLE trailing-block drop applied to every group. Measured back to back on the dense configuration (one run each):
   agent-session replay 232 s against 266 s, median decode 49.4 against 40.7 tok/s, TTFT p50 1.76 against 2.03 s,
   0 preemptions against 1; gates and the greedy token compare pass; GPU KV −1.6K tokens; draft acceptance unchanged
-  (5.02 against 5.07). The numbers tables were taken before this change. Not yet applied to `qsa-serve.args`.
+  (5.02 against 5.07). The numbers tables were taken before this change. Not applied to `qsa-serve.args`: not yet run on
+  the sparse engine.
 
 ## 0.32.0-b70.2 — 2026-10-26: sparse attention (QSA) variant, working and experimental
 

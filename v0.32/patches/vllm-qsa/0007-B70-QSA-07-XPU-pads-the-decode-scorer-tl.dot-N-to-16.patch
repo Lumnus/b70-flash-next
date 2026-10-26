@@ -1,7 +1,7 @@
 From d92021e91ca87951257154faa31c29717796c648 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 20:24:41 +0000
-Subject: [PATCH 07/26] B70-QSA-07: XPU pads the decode scorer tl.dot N to 16
+Subject: [PATCH 07/32] B70-QSA-07: XPU pads the decode scorer tl.dot N to 16
  by default
 
 Intel Triton 3.8.0+xpu rejects tl.dot with N < 16 at compile time

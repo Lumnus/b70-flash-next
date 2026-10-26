@@ -1,0 +1,25 @@
+From be6a6e7d336f595774673db25968c7e770bb8a8c Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 01:30:52 +0000
+Subject: [PATCH 32/32] B70-QSA-D06: profiler buckets for attn2 and select
+
+qsa_profile_summary.py now has buckets for the attn2 tile and merge kernels
+and the D05 select kernels (before, they fell into "other").
+---
+ benchmarks/kernels/qsa_profile_summary.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/benchmarks/kernels/qsa_profile_summary.py b/benchmarks/kernels/qsa_profile_summary.py
+index f2e1222617..3177ae8c90 100644
+--- a/benchmarks/kernels/qsa_profile_summary.py
++++ b/benchmarks/kernels/qsa_profile_summary.py
+@@ -37,6 +37,9 @@ BUCKETS = [
+     ("qsa_sparse_attn", r"_qsa_sparse_paged_gqa"),
+     ("qsa_merge", r"_qsa_merge_splitk"),
+     ("qsa_store_compress", r"_store_qsa_rows|_compress_qsa_groups"),
++    ("qsa_attn2", r"_qsa_attn2_tile"),
++    ("qsa_attn2_merge", r"_qsa_attn2_merge"),
++    ("qsa_select", r"_qsa_select_(keep|order)"),
+     ("torch_sort_topk", r"(?i)sort|topk|radix|segmented|bitonic"),
+     (
+         "elementwise_fill_copy",

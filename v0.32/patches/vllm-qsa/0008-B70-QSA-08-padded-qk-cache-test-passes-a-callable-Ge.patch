@@ -1,7 +1,7 @@
 From 5bad3fcd0c37be806f376f2c57ef44eb5c6a9c60 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 25 Oct 2026 20:24:42 +0000
-Subject: [PATCH 08/26] B70-QSA-08: padded-qk cache test passes a callable
+Subject: [PATCH 08/32] B70-QSA-08: padded-qk cache test passes a callable
  Gemma norm stub
 
 Off CUDA the indexer calls the norm module itself (no flashinfer), so the
