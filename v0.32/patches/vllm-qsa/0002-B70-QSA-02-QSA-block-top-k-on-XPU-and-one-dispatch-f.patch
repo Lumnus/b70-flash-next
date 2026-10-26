@@ -1,0 +1,261 @@
+From dab0736cdb59a1f394029e654d3eb394200a2b52 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 19:53:38 +0000
+Subject: [PATCH 02/26] B70-QSA-02: QSA block top-k on XPU and one dispatch
+ function per indexer kernel
+
+cooperative_topk/persistent_topk are CUDA-only csrc ops. Off CUDA, _topk now
+routes by B70_QSA_TOPK (auto|native|torch):
+- native: torch.ops._C.top_k_per_row_decode from vllm-xpu-kernels (SYCL,
+  registered for kXPU) with next_n=1 and the per-row visible count as seq_lens;
+  same contract (rows shorter than topK get 0..len-1 then -1).
+- torch: exact and deterministic. Sorts an int64 key (order-preserving float32
+  bits << 32 | inverted column), so exact ties break toward the lower column.
+  ReLU-summed scores tie at exactly 0.0 at the top-k boundary often (81 of 338
+  rows in a random prefill case), where float top-k picks arbitrarily.
+- auto (default): native when the op is registered, else torch.
+
+Decode and prefill tile/warp/stage choices move into _decode_launch_config and
+_prefill_launch_config (XPU entries are untuned copies of the GB300 ones), and
+the warmup uses the same helper as the launch. The decode scorer gains an
+optional MIN_DOT_N constexpr (default 1 = the original kernel):
+B70_QSA_MIN_DOT_N=16 pads its tl.dot N (query rows x 4 heads, 4 at a plain
+decode) into DPAS range for tuning. Intel Triton has no dot minimum; N < 16
+falls back to FMA and stays correct.
+---
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       | 150 ++++++++++++++++--
+ 1 file changed, 136 insertions(+), 14 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 9b28ed6dca..262e5321ac 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -2,19 +2,66 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Triton kernels for Qwen4Exp QSA index selection."""
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
++from vllm.logger import init_logger
+ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     TritonWarmupTensor,
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
++logger = init_logger(__name__)
++
+ _TOPK_WORKSPACE_BYTES = 1024 * 1024
+ _DECODE_BLOCK_N = 64
+ 
+ 
++def _min_dot_n() -> int:
++    """B70-QSA: floor for the decode scorer's tl.dot N (query rows x heads).
++
++    1 compiles the original kernel. Intel Triton has no dot minimum: N < 16
++    (4 at a plain decode) falls back from DPAS to FMA, correct but slower.
++    B70_QSA_MIN_DOT_N (XPU only, e.g. 16) pads N into DPAS range for the
++    tuning sweep; padded rows are masked.
++    """
++    if current_platform.is_xpu():
++        return max(1, int(os.environ.get("B70_QSA_MIN_DOT_N", "1")))
++    return 1
++
++
++def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
++    """(STAGES, num_warps) for the decode scoring kernel.
++
++    B70-QSA: every decode tile choice goes through here. The XPU entry is an
++    UNTUNED copy of the GB300 one (a BMG-measured table replaces it).
++    """
++    if current_platform.is_xpu():
++        return 2, 1 if dtype == torch.float8_e4m3fn else 2
++    # tuned on GB300
++    return 2, 1 if dtype == torch.float8_e4m3fn else 2
++
++
++def _prefill_launch_config(dtype: torch.dtype) -> tuple[int, int, int, int, int]:
++    """(TILE_R, BLOCK_N, K_TILES, STAGES, num_warps) for prefill scoring.
++
++    B70-QSA: every prefill tile choice goes through here; the XPU entry is an
++    UNTUNED copy of the GB300 one. Its dot is [BLOCK_N, D] x [D, TILE_R*heads],
++    so N = TILE_R * padded heads (256 here) is DPAS-eligible on XPU.
++    """
++    if current_platform.is_xpu():
++        if dtype == torch.float8_e4m3fn:
++            return 32, 64, 16, 2, 8
++        return 64, 64, 16, 2, 4
++    # tuned on GB300
++    if dtype == torch.float8_e4m3fn:
++        return 32, 64, 16, 2, 8
++    return 64, 64, 16, 2, 4
++
++
+ @triton.jit
+ def _qsa_mqa_paged_uniform_kernel(
+     q_ptr,
+@@ -36,10 +83,17 @@ def _qsa_mqa_paged_uniform_kernel(
+     BLOCK_N: tl.constexpr,
+     TILES_PER_PROG: tl.constexpr,
+     STAGES: tl.constexpr,
++    MIN_DOT_N: tl.constexpr = 1,
+ ) -> None:
+     NUM_COLUMNS: tl.constexpr = PAGE_TABLE_WIDTH * PAGE_SIZE
+-    DECODE_QUERY_LEN_PADDED: tl.constexpr = triton.next_power_of_2(DECODE_QUERY_LEN)
+     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
++    # B70-QSA: the dot's N is DECODE_QUERY_LEN_PADDED * NUM_HEADS_PADDED (4 at a
++    # plain decode). MIN_DOT_N (default 1 = unchanged) pads the query rows so
++    # N >= MIN_DOT_N, e.g. 16 for DPAS on XPU; padded rows are masked.
++    DECODE_QUERY_LEN_PADDED: tl.constexpr = max(
++        triton.next_power_of_2(DECODE_QUERY_LEN),
++        MIN_DOT_N // NUM_HEADS_PADDED,
++    )
+     # tl.dot requires a reduction dimension of at least 16.
+     BLOCK_D: tl.constexpr = max(16, triton.next_power_of_2(HEAD_DIM))
+     request = tl.program_id(0)
+@@ -347,6 +401,7 @@ def warmup_qsa_mqa_paged_decode(
+             shape=(num_rows, columns),
+         )
+         tiles_per_program = _decode_tiles_per_program(num_requests, columns)
++        stages, num_warps = _decode_launch_config(k_cache.dtype)
+         _qsa_mqa_paged_uniform_kernel.warmup(
+             q_ptr,
+             k_cache_ptr,
+@@ -366,9 +421,9 @@ def warmup_qsa_mqa_paged_decode(
+             DECODE_QUERY_LEN=decode_query_len,
+             BLOCK_N=_DECODE_BLOCK_N,
+             TILES_PER_PROG=tiles_per_program,
+-            STAGES=2,
+-            # tuned on GB300
+-            num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
++            STAGES=stages,
++            MIN_DOT_N=_min_dot_n(),
++            num_warps=num_warps,
+             grid=(
+                 num_requests,
+                 triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+@@ -401,13 +456,7 @@ def _prefill_logits(
+         num_queries, logits_width
+     )
+ 
+-    # tuned on GB300
+-    if k_cache.dtype == torch.float8_e4m3fn:
+-        TILE_R, STAGES, num_warps = 32, 2, 8
+-    else:
+-        TILE_R, STAGES, num_warps = 64, 2, 4
+-    BLOCK_N = 64
+-    K_TILES = 16
++    TILE_R, BLOCK_N, K_TILES, STAGES, num_warps = _prefill_launch_config(k_cache.dtype)
+     grid = (
+         page_table.shape[0],
+         triton.cdiv(min(num_queries, max_query_len), TILE_R),
+@@ -473,6 +522,56 @@ def expand_qsa_block_indices(
+     )
+ 
+ 
++def _qsa_topk_mode() -> str:
++    """B70-QSA: top-k backend off CUDA, from B70_QSA_TOPK.
++
++    ``native``: vllm-xpu-kernels ``torch.ops._C.top_k_per_row_decode`` (SYCL,
++    registered for kXPU). ``torch``: exact, deterministic torch path below.
++    ``auto`` (default): native when the op is registered, else torch.
++    """
++    mode = os.environ.get("B70_QSA_TOPK", "auto")
++    if mode not in ("auto", "native", "torch"):
++        raise ValueError(f"B70_QSA_TOPK must be auto|native|torch, got {mode!r}")
++    if mode == "auto":
++        has_native = hasattr(torch.ops._C, "top_k_per_row_decode")
++        mode = "native" if has_native else "torch"
++    return mode
++
++
++def _qsa_topk_torch(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_topk: int,
++    block_indices: torch.Tensor,
++) -> None:
++    """Deterministic row top-k with the cooperative/persistent_topk contract.
++
++    B70-QSA: columns >= visible_blocks[row] are ignored; a row with fewer than
++    block_topk visible blocks gets 0..visible-1 then -1. Ties break toward the
++    lower column, exactly, by sorting an int64 key (order-preserving float32
++    bits << 32 | inverted column) -- ReLU-summed scores tie at 0.0 often, and
++    float top-k picks among ties arbitrarily. Output order: descending score.
++    """
++    rows, width = logits.shape
++    if rows == 0:
++        return
++    k = min(block_topk, width)
++    bits = logits.contiguous().view(torch.int32).to(torch.int64)
++    # IEEE-754 total order on the int view: flip the magnitude bits of negatives.
++    bits = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
++    columns = torch.arange(width, device=logits.device, dtype=torch.int64)
++    key = (bits << 32) | (0xFFFFFFFF - columns)
++    visible = visible_blocks[:rows].to(torch.int64).clamp(0, width)
++    live = columns.unsqueeze(0) < visible.unsqueeze(1)
++    key = torch.where(live, key, torch.iinfo(torch.int64).min)
++    top = torch.topk(key, k, dim=1, largest=True, sorted=True).indices
++    ranks = torch.arange(k, device=logits.device, dtype=torch.int64)
++    top = torch.where(ranks.unsqueeze(0) < visible.unsqueeze(1), top, -1)
++    block_indices[:, :k].copy_(top.to(torch.int32))
++    if k < block_topk:
++        block_indices[:, k:].fill_(-1)
++
++
+ def _topk(
+     logits: torch.Tensor,
+     visible_blocks: torch.Tensor,
+@@ -483,6 +582,28 @@ def _topk(
+ ) -> None:
+     # similar dispatch logic as DeepSeek indexer
+     block_topk = token_topk // compress_ratio
++    if not current_platform.is_cuda():
++        # B70-QSA: cooperative/persistent_topk are CUDA-only csrc ops.
++        mode = _qsa_topk_mode()
++        logger.info_once("B70-QSA: QSA block top-k backend = %s", mode)
++        if mode == "torch":
++            _qsa_topk_torch(logits, visible_blocks, block_topk, block_indices)
++            return
++        assert block_indices.is_contiguous()
++        seq_lens = visible_blocks[: logits.shape[0]].to(torch.int32).contiguous()
++        # next_n=1: row i scores columns [0, seq_lens[i]); rows with fewer than
++        # topK columns get 0..len-1 then -1, as cooperative/persistent_topk do.
++        torch.ops._C.top_k_per_row_decode(
++            logits,
++            1,
++            seq_lens,
++            block_indices,
++            logits.shape[0],
++            logits.stride(0),
++            logits.stride(1),
++            block_topk,
++        )
++        return
+     use_cooperative_topk = (
+         logits.shape[0] <= 64
+         and logits.stride(0) % 4 == 0
+@@ -540,6 +661,7 @@ def qsa_select_paged_decode(
+     columns = page_table.shape[1] * k_cache.shape[1]
+     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+     tiles_per_program = _decode_tiles_per_program(num_requests, columns)
++    stages, num_warps = _decode_launch_config(k_cache.dtype)
+     grid = (
+         num_requests,
+         triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+@@ -561,9 +683,9 @@ def qsa_select_paged_decode(
+         DECODE_QUERY_LEN=decode_query_len,
+         BLOCK_N=_DECODE_BLOCK_N,
+         TILES_PER_PROG=tiles_per_program,
+-        STAGES=2,
+-        # tuned on GB300
+-        num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
++        STAGES=stages,
++        MIN_DOT_N=_min_dot_n(),
++        num_warps=num_warps,
+     )
+     _topk(
+         logits,

@@ -13,6 +13,32 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
   torch/oneCCL bump.
 - The default flips back to `serve-plugin.env` once uxlfoundation/oneCCL#229 ships in a oneCCL release that torch pins.
 
+## 0.32.0-b70.2 — 2026-10-26: sparse attention (QSA) variant, working and experimental
+
+Adds a second attention variant to the 0.32 line next to the dense release. The dense series (`v0.32/patches/vllm/`, 49
+patches, fork tag `v0.32.0-b70.1`) is unchanged.
+
+- **Code.** `v0.32/patches/vllm-qsa/`: 26 patches on top of the dense series, authored `Lumnus` (0001 is the
+  vllm-project/vllm#60602 cherry-pick). Fork branch `b70/v0.32.0-qsa-release` (`4acd39891b`) on `Lumnus/vllm`.
+  `v0.32/scripts/check-series.sh --qsa` checks the directory against it. QSA on XPU: block top-k, sparse GQA and
+  side-cache kernels, fused prepare, `attn2` (a Triton sparse-attention kernel with no register spills on Xe2), a
+  deterministic native top-k (`native_det`), a launch-override hook and sweep tools, 148 side-cache state-contract
+  tests, and fixes the bring-up exposed (Triton 3.8.0 refuses `tl.dot` N < 16; the torch top-k ran out of memory on a
+  long prefill).
+- **Engine files.** `v0.32/engines/qsa-serve.args`, `qsa-serve.env` (the patched-plugin configuration plus
+  `B70_QSA_ATTN_IMPL=attn2` and `B70_QSA_TOPK=native_det`) and `serve-config-qsa.json` (the dense config plus the five
+  `indexer_*` keys).
+- **Numbers**, same harness as the dense results ([docs/measurements/v0.32-qsa.md](docs/measurements/v0.32-qsa.md)):
+  0.74–0.81× dense on prefill and one-stream decode, 0.46–0.53× at 4–8 streams, KV 329,287 against 397,309 tokens.
+  Gates passed (needles 3/3, sanity 5/5, burst 0/150). Identical to dense up to 2K tokens; beyond 2K about 1.7–2× the
+  engines' own run-to-run KL on a 12K-token document. Kernel level: `attn2` matches Intel's SYCL kernel on decode and
+  beats it on prefill to 131K.
+- **Status.** Working, experimental, slower than dense on multi-stream. Not run for days, no task-level comparison with
+  dense. Not shipped: the engine-definition and card-sweep scripts we drove the measurements
+  with (they run on our own host).
+- `v0.32/README.md`: the "in preparation" placeholder is now the section [Sparse attention (QSA)](v0.32/README.md#sparse-attention-qsa)
+  (anchor renamed from `#sparse-attention-qsa-in-preparation`).
+
 ## Repository changes — 2026-10-25: attribution and scope of the headline numbers and gates
 
 Documentation only; no series change, no new tag.

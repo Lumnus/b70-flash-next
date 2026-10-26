@@ -1,0 +1,24 @@
+From 0ae90e2f0742062dc6ca033bfe29ec8b5ff9d061 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:45:26 +0000
+Subject: [PATCH 23/26] B70-QSA-B03: bench --ops attn keeps the attn@<impl>
+ side-by-side rows
+
+The --ops filter matched names exactly, so --ops attn --attn-impls splitk,attn2 silently timed only the default attn op (K1/K2 as written in K s6 produced no attn2 rows).
+---
+ benchmarks/kernels/bench_qwen4_qsa_xpu.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/benchmarks/kernels/bench_qwen4_qsa_xpu.py b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+index 3278618329..b12b3719db 100644
+--- a/benchmarks/kernels/bench_qwen4_qsa_xpu.py
++++ b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+@@ -956,7 +956,7 @@ def main() -> None:
+             p.expand()
+         per = totals.setdefault((m, rows, ctx), {})
+         for name, fn in ops.items():
+-            if want and name not in want:
++            if want and name not in want and name.split("@")[0] not in want:
+                 continue
+             _drain_kernel_info()
+             try:

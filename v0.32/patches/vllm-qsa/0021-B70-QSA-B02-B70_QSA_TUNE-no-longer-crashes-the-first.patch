@@ -1,0 +1,24 @@
+From 0051a2241882c90b618da2a060b8eca693a643be Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:44:35 +0000
+Subject: [PATCH 21/26] B70-QSA-B02: B70_QSA_TUNE no longer crashes the first
+ lookup (info_once got an unhashable dict)
+
+logger.info_once hashes its args; any non-empty B70_QSA_TUNE raised TypeError at the first get(), so the -tune engine def would have failed at warmup. Log the overrides as sorted JSON.
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+index 16c0314758..f40ea52de8 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+@@ -119,7 +119,7 @@ def _load() -> dict[str, dict[str, Any]]:
+             logger.warning_once("B70-QSA: B70_QSA_TUNE ignored off XPU")
+             parsed = {}
+         if parsed:
+-            logger.info_once("B70-QSA: XPU launch overrides active: %s", parsed)
++            logger.info_once("B70-QSA: XPU launch overrides active: %s", json.dumps(parsed, sort_keys=True))
+         _overrides = parsed
+     return _overrides
+ 

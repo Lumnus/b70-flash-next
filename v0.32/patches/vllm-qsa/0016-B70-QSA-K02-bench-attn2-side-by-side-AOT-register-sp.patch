@@ -1,0 +1,850 @@
+From 7c5f827dc7c18a6d04b724a5c2e91e17bd19ada7 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 22:41:58 +0000
+Subject: [PATCH 16/26] B70-QSA-K02: bench attn2 side by side; AOT
+ register/spill compile; CPU interpreter check
+
+bench_qwen4_qsa_xpu.py: --attn-impls splitk,attn2 adds attn@<impl> ops, each
+checked against the torch reference and against splitk; --sweep
+sparse_attn2_decode / sparse_attn2_prefill over the spill-free region; sweep
+references are computed with splitk forced.
+
+aot_attn_regs.py: compiles the QSA attention kernels for BMG-G31 with no
+device (ocloc zebin, spill size from .ze_info); reproduces the GPU-measured
+spill bytes of the splitk configs exactly.
+
+check_attn2_interp.py: TRITON_INTERPRET=1 fp16 check of attn2 against a torch
+reference (holes, partial tiles, empty row, out-of-range page, row chunks).
+---
+ .../kernels/b70_qsa_tune/aot_attn_regs.py     | 485 ++++++++++++++++++
+ .../b70_qsa_tune/check_attn2_interp.py        | 135 +++++
+ benchmarks/kernels/bench_qwen4_qsa_xpu.py     |  81 ++-
+ 3 files changed, 697 insertions(+), 4 deletions(-)
+ create mode 100644 benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py
+ create mode 100644 benchmarks/kernels/b70_qsa_tune/check_attn2_interp.py
+
+diff --git a/benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py b/benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py
+new file mode 100644
+index 0000000000..7458696ffd
+--- /dev/null
++++ b/benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py
+@@ -0,0 +1,485 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA-K: compile the QSA sparse attention kernels for BMG-G31 with NO device.
++
++Ahead-of-time: Triton's Intel backend lowers to SPIR-V and, with
++``generate_native_code``, runs ``ocloc`` for the zebin; the spill size is read
++from the zebin's ``.ze_info`` (the same field Triton uses to decide its 256-GRF
++retry). Nothing opens /dev/dri, so this runs while every card is busy:
++
++    unshare -m bash -c 'mount -t tmpfs none /dev/dri; \
++        TRITON_INTEL_DEVICE_ARCH=bmg <venv>/bin/python -I aot_attn_regs.py \
++        --ops-dir <tree>/vllm/models/qwen4_exp/nvidia/ops --target <kernel.json>'
++
++``--target`` is any Triton cache ``<kernel>.json`` compiled on a B70 (it holds
++the device properties dict); without it the built-in B70 dict below is used.
++
++Prints one json line per (kernel, config, grf_mode): spill bytes per thread,
++GRF mode the zebin was built with, threads per warp, TTGIR flags (dpas, 2D
++block IO, FMA dot) and shared memory. The shapes are the engine's TP4 shapes
++(6 q heads / 1 KV head / head_dim 256 / 2,051 selected tokens / 832-token
++blocks / page table at max_model_len 262,144).
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import os
++import re
++import sys
++import tempfile
++import types
++
++B70_ARCH = {
++    "architecture": 21483225088,
++    "device_id": 57891,
++    "driver_version": "1.17.39758+10",
++    "gpu_eu_count": 256,
++    "gpu_subslice_count": 32,
++    "has_atomic64": True,
++    "has_bfloat16_conversions": True,
++    "has_fp16": True,
++    "has_fp64": True,
++    "has_subgroup_2d_block_io": True,
++    "has_subgroup_matrix_multiply_accumulate": True,
++    "has_subgroup_matrix_multiply_accumulate_tensor_float32": False,
++    "is_integrated_gpu": False,
++    "last_level_cache_size": 25165824,
++    "local_mem_size": 131072,
++    "max_compute_units": 256,
++    "max_num_sub_groups": 64,
++    "max_work_group_size": 1024,
++    "memory_bus_width": 64,
++    "memory_clock_rate": 19000,
++    "name": "Intel(R) Arc(TM) Pro B70 Graphics",
++    "platform_name": "Intel(R) oneAPI Unified Runtime over Level-Zero V2",
++    "sub_group_sizes": [16, 32],
++    "total_memory": 34242297856,
++    "type": "gpu",
++    "vendor": "Intel(R) Corporation",
++    "version": "20.2.0",
++    "has_2d_block_io": True,
++    "has_bfloat16_conversion": True,
++    "__intel_already_queried_extensions__": True,
++    "arch": "bmg",
++}
++
++# TP4 engine shapes
++HEADS, KV_HEADS, HEAD_DIM = 6, 1, 256
++SEL_WIDTH = 2051
++BLOCK = 832
++WIDTH = 316  # ceil(262144 / 832)
++NBLOCKS = 4000
++
++
++class FakeTensor:
++    """Enough of a tensor for Triton's binder: dtype + a 16-aligned data_ptr."""
++
++    def __init__(self, dtype):
++        self.dtype = dtype
++
++    def data_ptr(self):
++        return 1 << 20
++
++
++def _stub_modules(ops_dir: str):
++    import triton
++    from triton import language as tl
++
++    def mod(name, **attrs):
++        m = types.ModuleType(name)
++        m.__dict__.update(attrs)
++        sys.modules[name] = m
++        return m
++
++    class _Plat:
++        def is_xpu(self):
++            return True
++
++        def get_device_capability(self):
++            return None
++
++        def has_device_capability(self, *_):
++            return False
++
++    mod("vllm")
++    mod("vllm.triton_utils", tl=tl, triton=triton, HAS_TRITON=True)
++    mod("vllm.platforms", current_platform=_Plat())
++    mod("vllm.model_executor")
++    mod("vllm.model_executor.warmup")
++    mod(
++        "vllm.model_executor.warmup.jit_warmup_triton_helper",
++        TritonWarmupTensor=object,
++        triton_scalar_specialization_rep=lambda x: x,
++    )
++    pkg = mod("qsaops")
++    pkg.__path__ = [ops_dir]
++    tune = {}
++    mod(
++        "qsaops.qsa_xpu_tuning",
++        get=lambda k, f, d: tune.get(k, {}).get(f, d),
++        launch_extra=lambda k: {},
++        _tune=tune,
++    )
++
++    def load(name):
++        spec = importlib.util.spec_from_file_location(
++            f"qsaops.{name}", os.path.join(ops_dir, f"{name}.py")
++        )
++        m = importlib.util.module_from_spec(spec)
++        sys.modules[f"qsaops.{name}"] = m
++        spec.loader.exec_module(m)
++        return m
++
++    return load
++
++
++SPILL_RE = re.compile(r"spill_size\s*[:=]\s*(\d+)")
++GRF_RE = re.compile(r"(grf_count|num_grf|grf_size)\s*[:=]\s*(\d+)", re.I)
++
++
++def zeinfo(zebin: bytes) -> dict:
++    from elftools.elf.elffile import ELFFile
++
++    with tempfile.NamedTemporaryFile(suffix=".zebin") as f:
++        f.write(zebin)
++        f.flush()
++        with open(f.name, "rb") as fh:
++            sec = ELFFile(fh).get_section_by_name(".ze_info")
++            text = sec.data().decode() if sec is not None else ""
++    out = {}
++    m = SPILL_RE.search(text)
++    out["spill_bytes"] = int(m.group(1)) if m else None
++    m = GRF_RE.search(text)
++    out["grf_field"] = int(m.group(2)) if m else None
++    for key in ("private_size", "slm_size", "has_stack_calls", "simd_size"):
++        mm = re.search(rf"{key}\s*[:=]\s*(\S+)", text)
++        if mm:
++            out[key] = mm.group(1)
++    return out
++
++
++DUMP = {"dir": ""}
++
++
++def compile_one(jit_fn, args, kwargs, target, grf_mode, label=""):
++    from triton.compiler import compile as tcompile
++    from triton.compiler import make_backend
++    from triton.runtime.jit import create_function_from_signature
++
++    backend = make_backend(target)
++    binder = create_function_from_signature(jit_fn.signature, jit_fn.params, backend)
++    kw = dict(kwargs)
++    kw["generate_native_code"] = True
++    kw["grf_mode"] = grf_mode
++    kw.setdefault("debug", False)
++    kw.setdefault("instrumentation_mode", "")
++    bound, spec, _opts = binder(*args, **kw)
++    options, signature, constexprs, attrs = jit_fn._pack_args(
++        backend, kw, bound, spec, _opts
++    )
++    src = (
++        jit_fn.ASTSource(jit_fn, signature, constexprs, attrs)
++        if hasattr(jit_fn, "ASTSource")
++        else None
++    )
++    if src is None:
++        from triton.compiler import ASTSource
++
++        src = ASTSource(jit_fn, signature, constexprs, attrs)
++    ck = tcompile(src, target=target, options=options.__dict__)
++    md = ck.metadata
++    info = zeinfo(ck.asm["zebin"])
++    ttgir = ck.asm.get("ttgir", "")
++    if DUMP["dir"] and label:
++        os.makedirs(DUMP["dir"], exist_ok=True)
++        for stage in ("ttgir", "llir"):
++            with open(os.path.join(DUMP["dir"], f"{label}.{stage}"), "w") as f:
++                f.write(ck.asm.get(stage, ""))
++    return {
++        **info,
++        "build_flags": getattr(md, "build_flags", ""),
++        "threads_per_warp": getattr(md, "threads_per_warp", None),
++        "shared": getattr(md, "shared", None),
++        "dpas": "dpas" in ttgir,
++        "block_io": "block_io" in ttgir,
++        "fma_dot": ("tt.dot" in ttgir) and "dpas" not in ttgir,
++        "ttgir_bytes": len(ttgir),
++    }
++
++
++def splitk_args(
++    q, k, ind, out, part, lse, gate, mod, rows, splits, block_n, warps, stages, block_m
++):
++    num_tiles = -(-SEL_WIDTH // block_n)
++    a = (
++        q,
++        k,
++        k,
++        ind,
++        FakeTensor(ind.dtype),
++        FakeTensor(ind.dtype),
++        part,
++        lse,
++        out,
++        0.0625,
++        1.0,
++        gate,
++        HEADS * HEAD_DIM,
++        HEAD_DIM,
++        BLOCK * 512,
++        512,
++        512,
++        BLOCK * 512,
++        512,
++        512,
++        SEL_WIDTH + 1,
++        WIDTH,
++        HEADS * HEAD_DIM,
++        HEAD_DIM,
++        HEADS * HEAD_DIM,
++        HEAD_DIM,
++        rows,
++        NBLOCKS,
++        max(rows // 8, 1),
++    )
++    kw = dict(
++        TOPK=SEL_WIDTH,
++        PAGE_SIZE=BLOCK,
++        PAGE_TABLE_WIDTH=WIDTH,
++        GROUP_SIZE=HEADS,
++        HEAD_DIM=HEAD_DIM,
++        NUM_QUERY_HEADS=HEADS,
++        NUM_SPLITS=splits,
++        NUM_TILES=num_tiles,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return a, kw
++
++
++def attn2_args(q, k, ind, part, rows, block_n, num_dchunk, tpp, warps, stages, block_m):
++    a = (
++        q,
++        k,
++        k,
++        ind,
++        FakeTensor(ind.dtype),
++        FakeTensor(ind.dtype),
++        part,
++        part,
++        0.0625,
++        1.0,
++        HEADS * HEAD_DIM,
++        HEAD_DIM,
++        BLOCK * 512,
++        512,
++        512,
++        BLOCK * 512,
++        512,
++        512,
++        SEL_WIDTH + 1,
++        WIDTH,
++        rows,
++        NBLOCKS,
++        max(rows // 8, 1),
++    )
++    kw = dict(
++        TOPK=SEL_WIDTH,
++        PAGE_SIZE=BLOCK,
++        PAGE_TABLE_WIDTH=WIDTH,
++        GROUP_SIZE=HEADS,
++        HEAD_DIM=HEAD_DIM,
++        NUM_QUERY_HEADS=HEADS,
++        BLOCK_M=block_m,
++        BLOCK_N=block_n,
++        NUM_DCHUNK=num_dchunk,
++        TILES_PER_PROG=tpp,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return a, kw
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--ops-dir", required=True)
++    ap.add_argument("--target", default="")
++    ap.add_argument("--kernels", default="splitk,attn2,merge2")
++    ap.add_argument("--grf", default="default,256")
++    ap.add_argument("--grid", default="", help="json list of attn2 configs to try")
++    ap.add_argument("--dump", default="", help="write ttgir/llir per config here")
++    args = ap.parse_args()
++    os.environ.setdefault("TRITON_INTEL_DEVICE_ARCH", "bmg")
++    DUMP["dir"] = args.dump
++
++    import torch
++    from triton.backends.compiler import GPUTarget
++
++    arch = B70_ARCH
++    if args.target:
++        with open(args.target) as f:
++            arch = json.load(f)["target"]["arch"]
++    target = GPUTarget("xpu", arch, 16)
++    load = _stub_modules(args.ops_dir)
++    which = args.kernels.split(",")
++    q = FakeTensor(torch.bfloat16)
++    k = FakeTensor(torch.bfloat16)
++    ind = FakeTensor(torch.int32)
++    out = FakeTensor(torch.bfloat16)
++    part = FakeTensor(torch.float32)
++    grfs = args.grf.split(",")
++
++    def emit(row):
++        print(json.dumps(row), flush=True)
++
++    if "splitk" in which:
++        qsa = load("qsa")
++        # (label, rows, splits, block_n, warps, stages, block_m): defaults + C1's best so far
++        cfgs = [
++            ("dec8-default", 8, 64, 32, 4, 2, 8),
++            ("dec8-c1best", 8, 4, 16, 8, 1, 16),
++            ("dec64-default", 64, 8, 32, 1, 2, 8),
++            ("pre-default", 4096, 1, 32, 1, 2, 8),
++            ("pre-c1best", 4096, 1, 16, 1, 3, 8),
++        ]
++        for label, rows, splits, bn, w, st, bm in cfgs:
++            for grf in grfs:
++                a, kw = splitk_args(
++                    q,
++                    k,
++                    ind,
++                    out,
++                    part if splits > 1 else out,
++                    part if splits > 1 else out,
++                    out,
++                    qsa,
++                    rows,
++                    splits,
++                    bn,
++                    w,
++                    st,
++                    bm,
++                )
++                row = {
++                    "kernel": "splitk",
++                    "cfg": label,
++                    "block_n": bn,
++                    "num_warps": w,
++                    "num_stages": st,
++                    "block_m": bm,
++                    "splits": splits,
++                    "grf_mode": grf,
++                }
++                try:
++                    row.update(
++                        compile_one(
++                            qsa._qsa_sparse_paged_gqa_splitk_kernel,
++                            a,
++                            kw,
++                            target,
++                            grf,
++                            f"splitk-{label}-grf{grf}",
++                        )
++                    )
++                except Exception as e:  # record, do not crash
++                    row["error"] = f"{type(e).__name__}: {str(e)[:300]}"
++                emit(row)
++
++    if "attn2" in which or "merge2" in which:
++        m2 = load("qsa_attn2")
++    if "attn2" in which:
++        if args.grid:
++            grid = json.loads(args.grid)
++        else:
++            grid = [
++                {
++                    "block_n": bn,
++                    "num_dchunk": nd,
++                    "tiles_per_prog": tpp,
++                    "num_warps": w,
++                    "num_stages": st,
++                }
++                for bn in (16, 32, 64, 128)
++                for nd in (2, 4, 8)
++                for tpp in (1, 4)
++                for w in (1,)
++                for st in (1, 2)
++            ]
++        for c in grid:
++            for grf in grfs:
++                a, kw = attn2_args(
++                    q,
++                    k,
++                    ind,
++                    part,
++                    c.get("rows", 8),
++                    c["block_n"],
++                    c.get("num_dchunk", 4),
++                    c.get("tiles_per_prog", 1),
++                    c.get("num_warps", 1),
++                    c.get("num_stages", 1),
++                    c.get("block_m", 8),
++                )
++                row = {"kernel": "attn2", **c, "grf_mode": grf}
++                try:
++                    label = (
++                        "attn2-"
++                        + "-".join(f"{k}{v}" for k, v in sorted(c.items()))
++                        + f"-grf{grf}"
++                    )
++                    row.update(
++                        compile_one(
++                            m2._qsa_attn2_tile_kernel, a, kw, target, grf, label
++                        )
++                    )
++                except Exception as e:
++                    row["error"] = f"{type(e).__name__}: {str(e)[:300]}"
++                emit(row)
++    if "merge2" in which:
++        for bn in (16, 32, 64):
++            for w in (1, 2, 4):
++                a = (
++                    part,
++                    part,
++                    ind,
++                    out,
++                    out,
++                    SEL_WIDTH + 1,
++                    HEADS * HEAD_DIM,
++                    HEAD_DIM,
++                    HEADS * HEAD_DIM,
++                    HEAD_DIM,
++                    8,
++                )
++                kw = dict(
++                    TOPK=SEL_WIDTH,
++                    BLOCK_N=bn,
++                    HEAD_DIM=HEAD_DIM,
++                    NUM_QUERY_HEADS=HEADS,
++                    num_warps=w,
++                    num_stages=1,
++                )
++                row = {
++                    "kernel": "merge2",
++                    "block_n": bn,
++                    "num_warps": w,
++                    "grf_mode": "default",
++                }
++                try:
++                    row.update(
++                        compile_one(
++                            m2._qsa_attn2_merge_kernel, a, kw, target, "default"
++                        )
++                    )
++                except Exception as e:
++                    row["error"] = f"{type(e).__name__}: {str(e)[:300]}"
++                emit(row)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/kernels/b70_qsa_tune/check_attn2_interp.py b/benchmarks/kernels/b70_qsa_tune/check_attn2_interp.py
+new file mode 100644
+index 0000000000..951b36f167
+--- /dev/null
++++ b/benchmarks/kernels/b70_qsa_tune/check_attn2_interp.py
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA-K: CPU correctness check of attn2 vs the torch reference and splitk.
++
++Runs both Triton paths under TRITON_INTERPRET=1 on CPU tensors (no device),
++at small shapes that still exercise: several requests, -1 holes in the
++selection, a per-row valid count below the selection width, partial last
++tiles, out-of-range physical pages, an all-empty row, and the output gate.
++
++    TRITON_INTERPRET=1 python -I check_attn2_interp.py --ops-dir <tree>/vllm/models/qwen4_exp/nvidia/ops
++
++The interpreter mis-handles bfloat16 operands of tl.dot (raw bits read as
++integers), so the check runs in float16 and calls the attn2 launcher directly;
++the bf16 path is covered by the GPU bench (--attn-impls) and the G1 suite.
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from aot_attn_regs import _stub_modules  # noqa: E402
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--ops-dir", required=True)
++    ap.add_argument("--sel", type=int, default=150)
++    ap.add_argument("--rows", type=int, default=5)
++    ap.add_argument("--head-dim", type=int, default=128)
++    args = ap.parse_args()
++    assert os.environ.get("TRITON_INTERPRET") == "1", "set TRITON_INTERPRET=1"
++    import torch
++
++    load = _stub_modules(args.ops_dir)
++    load("qsa")  # imports qsa_attn2 through the stubbed package
++    attn2 = sys.modules["qsaops.qsa_attn2"]
++    tune = sys.modules["qsaops.qsa_xpu_tuning"]._tune
++
++    torch.manual_seed(0)
++    rows, sel, d = args.rows, args.sel, args.head_dim
++    heads, kvh, page, nblocks, width = 6, 1, 32, 40, 8
++    dt = torch.float16
++    q = torch.randn(rows, heads, d).to(dt)
++    gate = torch.randn(rows, heads, d).to(dt)
++    kv = torch.randn(nblocks, page, kvh, 2 * d).to(dt)
++    k_cache, v_cache = kv.split(d, dim=-1)
++    table = torch.randint(0, nblocks, (2, width), dtype=torch.int32)
++    table[1, 3] = nblocks + 5  # out-of-range physical page -> masked
++    token_to_req = torch.tensor([i % 2 for i in range(rows)], dtype=torch.int32)
++    ind = torch.full((rows, sel + 1), -1, dtype=torch.int32)
++    for r in range(rows):
++        n = sel - 7 * r if r != rows - 1 else 0  # last row: empty
++        n = max(n, 0)
++        toks = torch.randperm(width * page)[:n].to(torch.int32)
++        if n > 10:
++            toks[5] = -1  # hole
++        ind[r, :n] = toks
++        ind[r, sel] = n
++
++    def reference():
++        out = torch.zeros(rows, heads, d)
++        for r in range(rows):
++            n = int(ind[r, sel])
++            lg = ind[r, :n].long()
++            lg = lg[lg >= 0]
++            req = int(token_to_req[r])
++            pages = table[req, lg // page].long()
++            ok = (pages >= 0) & (pages < nblocks)
++            lg, pages = lg[ok], pages[ok]
++            if lg.numel() == 0:
++                o = torch.zeros(heads, d)
++            else:
++                kk = k_cache[pages, lg % page, 0].float()
++                vv = v_cache[pages, lg % page, 0].float()
++                sc = q[r].float() @ kk.T * d**-0.5
++                o = (torch.softmax(sc, -1) @ vv).to(dt).float()
++            out[r] = o * torch.sigmoid(gate[r].float())
++        return out
++
++    ref = reference()
++
++    def run(impl, cfg=None):
++        os.environ["B70_QSA_ATTN_IMPL"] = impl
++        tune.clear()
++        if cfg:
++            tune["sparse_attn2_decode"] = cfg
++        out = torch.empty_like(q)
++        if impl == "splitk":
++            raise RuntimeError("splitk needs bf16 Q (wrapper assert); skipped in fp16")
++        attn2.qsa_sparse_paged_attention_attn2(
++            q,
++            k_cache,
++            v_cache,
++            ind,
++            table,
++            token_to_req,
++            False,
++            out,
++            gate,
++            d**-0.5,
++            1.0,
++            8,
++        )
++        return out.float()
++
++    ok = True
++    try:
++        base = run("splitk")
++        e = (base - ref).abs().max().item()
++        print(f"splitk vs ref max_abs {e:.3e}")
++    except Exception as exc:  # the interpreter cannot run every splitk path
++        print(f"splitk not runnable under the interpreter: {str(exc)[:160]}")
++        base = ref
++    for cfg in (
++        {"block_n": 16, "num_dchunk": 4, "tiles_per_prog": 1},
++        {"block_n": 32, "num_dchunk": 2, "tiles_per_prog": 3, "row_chunk": 2},
++        {"block_n": 64, "num_dchunk": 8, "tiles_per_prog": 2},
++    ):
++        got = run("attn2", cfg)
++        e = (got - ref).abs().max().item()
++        e2 = (got - base).abs().max().item()
++        good = e <= 2e-2 and torch.isfinite(got).all().item()
++        ok &= good
++        print(
++            f"attn2 {cfg} vs ref {e:.3e} vs splitk {e2:.3e} {'OK' if good else 'FAIL'}"
++        )
++    print("RESULT", "PASS" if ok else "FAIL")
++    sys.exit(0 if ok else 1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/kernels/bench_qwen4_qsa_xpu.py b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+index cc7a8fd6ff..8a6596c7b0 100644
+--- a/benchmarks/kernels/bench_qwen4_qsa_xpu.py
++++ b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+@@ -14,7 +14,11 @@ BF16), through the real vLLM entry points, with a torch reference check:
+   prefill_score  _qsa_mqa_paged_prefill_kernel (one 4096-row chunk)
+   select_prefill scorer + top-k as qsa_select_paged_prefill runs them
+   expand         _expand_qsa_indices_kernel
+-  attn           _qsa_sparse_paged_gqa_splitk_kernel (+ _qsa_merge_splitk_kernel)
++  attn           sparse GQA as the engine dispatches it (B70_QSA_ATTN_IMPL; default splitk =
++                 _qsa_sparse_paged_gqa_splitk_kernel + _qsa_merge_splitk_kernel)
++  attn@<impl>    with --attn-impls splitk,attn2: each implementation side by side
++                 (attn2 = qsa_attn2._qsa_attn2_tile_kernel + _qsa_attn2_merge_kernel), each
++                 checked against the torch reference and against splitk
+ 
+ Decode rows are requests x DECODE_QUERY_LEN (8 = one DFlash K=7 verify step), so
+ rows 8/32/64 = 1/4/8 requests; prefill is one request's 4096-row chunk at the
+@@ -32,6 +36,8 @@ Usage (one card; --card picks it with ZE_AFFINITY_MASK semantics):
+   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep sparse_gqa_prefill --ctx 32768
+   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep decode_score --rows 8 --ctx 4096,131072
+   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --budget   # per-step totals vs the W1 dense gap
++  python benchmarks/kernels/bench_qwen4_qsa_xpu.py --ops attn --attn-impls splitk,attn2 --graph
++  python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep sparse_attn2_decode --rows 8,64 --graph
+ 
+ Overrides use the same mechanism as the engine (B70_QSA_TUNE, see
+ vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py), so a winning sweep row is
+@@ -60,6 +66,7 @@ import torch  # noqa: E402
+ 
+ # Importing the XPU platform registers torch.ops._C (vllm-xpu-kernels).
+ from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops  # noqa: E402
++from vllm.models.qwen4_exp.nvidia.ops import qsa_attn2 as attn2_ops  # noqa: E402
+ from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as idx_ops  # noqa: E402
+ from vllm.models.qwen4_exp.nvidia.ops import qsa_xpu_tuning as xpu_tune  # noqa: E402
+ from vllm.platforms import current_platform  # noqa: E402
+@@ -175,6 +182,8 @@ for _fn in (
+     idx_ops._expand_qsa_indices_kernel,
+     qsa_ops._qsa_sparse_paged_gqa_splitk_kernel,
+     qsa_ops._qsa_merge_splitk_kernel,
++    attn2_ops._qsa_attn2_tile_kernel,
++    attn2_ops._qsa_attn2_merge_kernel,
+ ):
+     _hook_jit(_fn)
+ 
+@@ -386,6 +395,22 @@ class Problem:
+             self.logical,
+         )
+ 
++    def attn_impl(self, impl: str) -> Callable[[], None]:
++        """Run attn with B70_QSA_ATTN_IMPL forced to `impl` (read at call/capture)."""
++
++        def run() -> None:
++            saved = os.environ.get(attn2_ops.ATTN_IMPL_ENV)
++            os.environ[attn2_ops.ATTN_IMPL_ENV] = impl
++            try:
++                self.attn()
++            finally:
++                if saved is None:
++                    os.environ.pop(attn2_ops.ATTN_IMPL_ENV, None)
++                else:
++                    os.environ[attn2_ops.ATTN_IMPL_ENV] = saved
++
++        return run
++
+     def attn(self) -> None:
+         qsa_ops.qsa_sparse_paged_attention(
+             self.q,
+@@ -664,6 +689,22 @@ GRIDS: dict[str, dict[str, list]] = {
+         "num_stages": [1, 2, 3],
+         "grf_mode": ["default", "256"],
+     },
++    # B70-QSA-K attn2: the spill-free region from the AOT compile (num_warps
++    # stays 1: Intel lays a chained dot's warps on M = 8 heads, so more warps
++    # replicate). See artifacts/K-sparse-attn-kernel.md; refine with --grid-json.
++    "sparse_attn2_decode": {
++        "block_n": [16, 32, 64],
++        "num_dchunk": [4, 8],
++        "tiles_per_prog": [1, 2],
++        "grf_mode": ["default", "256"],
++    },
++    "sparse_attn2_prefill": {
++        "block_n": [16, 32, 64],
++        "num_dchunk": [4, 8],
++        "tiles_per_prog": [1, 4],
++        "row_chunk": [128, 512],
++        "grf_mode": ["default", "256"],
++    },
+     "merge": {"num_warps": [1, 2, 4, 8]},
+     "expand": {"column_block": [128, 256, 512, 1024], "num_warps": [1, 2, 4, 8]},
+ }
+@@ -672,12 +713,16 @@ ENV_GRIDS: dict[str, dict[str, list[str]]] = {
+     "decode_score": {"B70_QSA_MIN_DOT_N": ["16", "32"]},
+     "sparse_gqa_decode": {"B70_QSA_MIN_BLOCK_M": ["1", "16"]},
+     "sparse_gqa_prefill": {"B70_QSA_MIN_BLOCK_M": ["1", "16"]},
++    "sparse_attn2_decode": {attn2_ops.ATTN_IMPL_ENV: ["attn2"]},
++    "sparse_attn2_prefill": {attn2_ops.ATTN_IMPL_ENV: ["attn2"]},
+ }
+ SWEEP_OP = {
+     "decode_score": ("decode", "decode_score"),
+     "prefill_score": ("prefill", "prefill_score"),
+     "sparse_gqa_decode": ("decode", "attn"),
+     "sparse_gqa_prefill": ("prefill", "attn"),
++    "sparse_attn2_decode": ("decode", "attn"),
++    "sparse_attn2_prefill": ("prefill", "attn"),
+     "merge": ("decode", "attn"),
+     "expand": ("decode", "expand"),
+ }
+@@ -742,6 +787,11 @@ def main() -> None:
+     ap.add_argument(
+         "--budget", action="store_true", help="per-step totals vs the W1 dense gap"
+     )
++    ap.add_argument(
++        "--attn-impls",
++        default="",
++        help="comma list (splitk,attn2): add attn@<impl> ops side by side",
++    )
+     ap.add_argument("--no-check", action="store_true")
+     ap.add_argument("--reps", type=int, default=5)
+     ap.add_argument("--out", default="")
+@@ -763,6 +813,8 @@ def main() -> None:
+         "block": a.block,
+         "max_model_len": a.max_model_len,
+         "graph": a.graph,
++        "attn_impl_env": os.environ.get(attn2_ops.ATTN_IMPL_ENV, "splitk"),
++        "attn_impls": a.attn_impls,
+     }
+     print(json.dumps({"meta": meta}), flush=True)
+ 
+@@ -795,7 +847,7 @@ def main() -> None:
+             p.expand()
+             ref = None
+             if op == "attn":
+-                p.attn()
++                p.attn_impl("splitk")()
+                 ref = p.out.clone()
+             for cfg, env in configs:
+                 saved = {k: os.environ.get(k) for k in env}
+@@ -828,6 +880,8 @@ def main() -> None:
+                     if op in ("decode_score", "prefill_score") and not a.no_check:
+                         p.select()
+                         row.update(check_selection(p))
++                    if op == "attn" and not a.no_check:
++                        row.update(check_attention(p))
+                     emit(row)
+                 except (
+                     Exception
+@@ -872,6 +926,9 @@ def main() -> None:
+             )
+             continue
+         ops = build_ops(p)
++        impls = [x for x in a.attn_impls.split(",") if x]
++        for impl in impls:
++            ops[f"attn@{impl}"] = p.attn_impl(impl)
+         checks: dict[str, Any] = {}
+         if not a.no_check:
+             p.select()
+@@ -879,6 +936,17 @@ def main() -> None:
+             p.expand()
+             p.attn()
+             checks.update(check_attention(p))
++            ref_out = None
++            for impl in impls:
++                p.attn_impl(impl)()
++                c = check_attention(p)
++                if impl == "splitk":
++                    ref_out = p.out.clone()
++                elif ref_out is not None:
++                    c["max_abs_vs_splitk"] = (
++                        (p.out.float() - ref_out.float()).abs().max().item()
++                    )
++                checks[f"attn@{impl}"] = c
+         else:
+             p.select()
+             p.expand()
+@@ -909,12 +977,17 @@ def main() -> None:
+                     "op": name,
+                     **t,
+                     "kernels": _drain_kernel_info(),
+-                    **sycl_bar(name, rows, ctx),
++                    **sycl_bar(name.split("@")[0], rows, ctx),
+                     **(
+-                        checks
++                        {
++                            k: v
++                            for k, v in checks.items()
++                            if not k.startswith("attn@")
++                        }
+                         if name in ("select_decode", "select_prefill", "attn")
+                         else {}
+                     ),
++                    **(checks.get(name, {}) if name.startswith("attn@") else {}),
+                     "decode_logits_width": p.columns
+                     if m == "decode"
+                     else p.logits_width,

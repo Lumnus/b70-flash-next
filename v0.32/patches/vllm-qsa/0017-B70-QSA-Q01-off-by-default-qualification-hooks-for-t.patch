@@ -1,0 +1,483 @@
+From a36d7de44a644154857a3534e85e78fbbd5df8ab Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 21:48:36 +0000
+Subject: [PATCH 17/26] B70-QSA-Q01: off-by-default qualification hooks for the
+ QSA side caches
+
+New common/qsa_debug.py, every flag read once at import; with none set the
+serving path only tests a module constant.
+
+- B70_QSA_DEBUG_RING=raise|warn: QSAMetadataBuilder.build (ring group) keeps
+  a host mirror of each ring block's last written position and checks that a
+  step starting inside a compression group finds that group's committed keys
+  in the ring (catches an unaligned prefix/offload hit, a ring too narrow for
+  the speculative lookahead, a ring block shared by two live requests).
+  Skipped under graph capture; costs three small device->host copies.
+- B70_QSA_DEBUG_DUMP=<dir> (+ _LAYERS): after steps with prefill rows, rank 0
+  saves each prefill request's compressed-key rows in logical order and the
+  selected blocks of its last row, so cold / prefix-hit / CPU-reload paths of
+  the same prompt can be compared (tools/b70_qsa/qsa_engine_lifecycle.py).
+- B70_QSA_DEBUG_TIES=1: counts top-k rows whose boundary is an exact tie.
+- B70_QSA_GRAPH_CHECK=1: at C1 target-graph capture only, the QSA side-cache
+  rows the step writes are compared after the eager pass and after replay,
+  and the null block before/after; a mismatch disables that graph key.
+---
+ vllm/models/qwen4_exp/common/qsa_cache.py     |  23 ++
+ vllm/models/qwen4_exp/common/qsa_debug.py     | 285 ++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_target_graph.py      |  51 ++++
+ vllm/models/qwen4_exp/nvidia/indexer_qsa.py   |   9 +
+ 4 files changed, 368 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/common/qsa_debug.py
+
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index ff36c6fba2..b0fb03d7cc 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -44,6 +44,8 @@ from vllm.v1.kv_cache_interface import (
+     MLAAttentionSpec,
+ )
+ 
++from . import qsa_debug as _qsa_debug
++
+ 
+ def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
+     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
+@@ -702,6 +704,13 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+                 request_capacity=request_capacity,
+             )
+         )
++        if _qsa_debug.RING_MODE and self.is_circular_buffer:
++            # B70-QSA-Q: qualification hook, off by default (B70_QSA_DEBUG_RING).
++            _qsa_debug.observe_ring_metadata(
++                common_attn_metadata,
++                self.kv_cache_spec.block_size,
++                self._ring_compress_ratio(),
++            )
+         return QSAForwardMetadata(
+             block_table=common_attn_metadata.block_table_tensor,
+             slot_mapping=slot_mapping,
+@@ -723,6 +732,20 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
+             compress_ratio=self.compress_ratio,
+         )
+ 
++    def _ring_compress_ratio(self) -> int:
++        # The ring spec does not carry the ratio; its owning layers do.
++        ratio = getattr(self, "_debug_ring_ratio", None)
++        if ratio is None:
++            ratio = 4
++            context = self.vllm_config.compilation_config.static_forward_context
++            for name in self.layer_names:
++                layer = context.get(name)
++                if layer is not None and hasattr(layer, "compress_ratio"):
++                    ratio = int(layer.compress_ratio)
++                    break
++            self._debug_ring_ratio = ratio
++        return ratio
++
+ 
+ class QSAStateBackend(AttentionBackend):
+     """Key-only dummy backend for out-of-band QSA side-cache operations."""
+diff --git a/vllm/models/qwen4_exp/common/qsa_debug.py b/vllm/models/qwen4_exp/common/qsa_debug.py
+new file mode 100644
+index 0000000000..d404717787
+--- /dev/null
++++ b/vllm/models/qwen4_exp/common/qsa_debug.py
+@@ -0,0 +1,285 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA qualification hooks. Every hook is off unless its env var is set.
++
++The flags are read once at import. With all of them unset nothing here runs on
++the serving path: the call sites test a module-level constant first.
++
++  B70_QSA_DEBUG_RING=raise|warn   host mirror of each raw-key ring's write
++                                  frontier, checked at every metadata build.
++                                  Catches a step that needs committed keys of
++                                  the open compression group which the ring
++                                  does not hold: an unaligned prefix/offload
++                                  hit, a ring too narrow for the speculative
++                                  lookahead, or a ring block shared by two
++                                  live requests. Forces a device->host copy of
++                                  three small tensors per build.
++  B70_QSA_DEBUG_DUMP=<dir>        after each step that carries prefill rows,
++                                  rank 0 writes every prefill request's
++                                  compressed-key rows (logical order) and the
++                                  selected block ids of its last row, for the
++                                  layers in B70_QSA_DEBUG_DUMP_LAYERS (default
++                                  "0"). Decode-only steps (the graph-captured
++                                  ones) are never dumped.
++  B70_QSA_DEBUG_TIES=1            count top-k rows whose selection boundary is
++                                  an exact score tie (the rows where native and
++                                  torch top-k may legitimately pick different
++                                  blocks). Eager steps only; logs a running
++                                  total every B70_QSA_DEBUG_TIES_PERIOD rows.
++  B70_QSA_GRAPH_CHECK=1           at C1 target-graph capture only, compare the
++                                  QSA side-cache rows the step writes after the
++                                  eager pass and after the replay, and the null
++                                  block before and after; a mismatch disables
++                                  that graph key.
++"""
++
++import os
++import threading
++from pathlib import Path
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger("vllm.b70_qsa_debug")
++
++TAG = "B70-QSA-DEBUG"
++
++RING_MODE = os.environ.get("B70_QSA_DEBUG_RING", "").strip().lower()
++if RING_MODE in ("1", "true", "yes", "on"):
++    RING_MODE = "raise"
++if RING_MODE not in ("", "raise", "warn"):
++    raise ValueError(f"B70_QSA_DEBUG_RING must be raise|warn, got {RING_MODE!r}")
++
++DUMP_DIR = os.environ.get("B70_QSA_DEBUG_DUMP", "").strip()
++DUMP_LAYERS = frozenset(
++    int(x) for x in os.environ.get("B70_QSA_DEBUG_DUMP_LAYERS", "0").split(",") if x
++)
++TIES = os.environ.get("B70_QSA_DEBUG_TIES", "").strip() in ("1", "true", "on")
++TIES_PERIOD = int(os.environ.get("B70_QSA_DEBUG_TIES_PERIOD", "100000"))
++GRAPH_CHECK = os.environ.get("B70_QSA_GRAPH_CHECK", "").strip() in ("1", "true", "on")
++
++
++class QSARingContractError(RuntimeError):
++    pass
++
++
++class QSARingContract:
++    """Host mirror of each ring block's last written logical position.
++
++    A step for one request computes rows ``[s, s + q)`` (``s`` = seq_len - q).
++    Compressing the group that contains ``s`` reads the committed keys of
++    positions ``[s - s % ratio, s)`` from the ring. They are there iff the ring
++    was last written through position ``>= s - 1`` and the newest write
++    ``last`` has not wrapped onto them: ``last - capacity + 1 <= s - s % ratio``.
++    Rows written past ``s - 1`` are rejected drafts the step rewrites.
++    """
++
++    def __init__(self, capacity: int, compress_ratio: int, mode: str) -> None:
++        self.capacity = capacity
++        self.compress_ratio = compress_ratio
++        self.mode = mode
++        self.last: dict[int, int] = {}
++        self.counts = {
++            "steps": 0,
++            "checked": 0,
++            "first_sight_unaligned": 0,
++            "missing": 0,
++            "overwritten": 0,
++        }
++        self._lock = threading.Lock()
++
++    def _violation(self, kind: str, message: str) -> None:
++        self.counts[kind] += 1
++        n = self.counts[kind]
++        if self.mode == "raise" and kind != "first_sight_unaligned":
++            raise QSARingContractError(f"{TAG} ring {kind}: {message}")
++        if n <= 50 or n % 1000 == 0:
++            logger.warning(
++                "%s ring %s #%d: %s counts=%s", TAG, kind, n, message, self.counts
++            )
++
++    def observe(
++        self,
++        ring_blocks: list[int],
++        query_start_loc: list[int],
++        seq_lens: list[int],
++    ) -> None:
++        ratio, cap = self.compress_ratio, self.capacity
++        with self._lock:
++            self.counts["steps"] += 1
++            for r, block in enumerate(ring_blocks):
++                q = query_start_loc[r + 1] - query_start_loc[r]
++                if q <= 0 or block <= 0:
++                    continue  # empty row or a dummy/padding request (null block)
++                s = seq_lens[r] - q
++                if s % ratio:
++                    self.counts["checked"] += 1
++                    open_start = s - s % ratio
++                    last = self.last.get(block)
++                    where = f"block={block} start={s} rows={q} last_write={last}"
++                    if last is None:
++                        # Either warmup or a fresh request whose prefix hit is
++                        # not a multiple of the ratio. Hard in real traffic.
++                        self._violation("first_sight_unaligned", where)
++                    elif last < s - 1:
++                        self._violation(
++                            "missing",
++                            f"{where}: ring never received positions "
++                            f"[{last + 1}, {s}) of the open group",
++                        )
++                    elif last - cap + 1 > open_start:
++                        self._violation(
++                            "overwritten",
++                            f"{where}: capacity {cap} lets position {last} "
++                            f"overwrite committed position {open_start}",
++                        )
++                self.last[block] = s + q - 1
++
++
++_ring_contracts: dict[tuple[int, int], QSARingContract] = {}
++
++
++def ring_contract(capacity: int, compress_ratio: int) -> QSARingContract:
++    key = (capacity, compress_ratio)
++    contract = _ring_contracts.get(key)
++    if contract is None:
++        contract = _ring_contracts[key] = QSARingContract(
++            capacity, compress_ratio, RING_MODE
++        )
++    return contract
++
++
++def observe_ring_metadata(common_attn_metadata, capacity: int, ratio: int) -> None:
++    """Called from QSAMetadataBuilder.build for the ring group (debug only)."""
++    if _is_capturing():
++        return
++    num_reqs = common_attn_metadata.query_start_loc.shape[0] - 1
++    if num_reqs <= 0 or not all(common_attn_metadata.block_table_tensor.shape):
++        return
++    # Device values: under async scheduling the CPU copies can be stale.
++    qsl = common_attn_metadata.query_start_loc[: num_reqs + 1].cpu().tolist()
++    seq = common_attn_metadata.seq_lens[:num_reqs].cpu().tolist()
++    blocks = common_attn_metadata.block_table_tensor[:num_reqs, 0].cpu().tolist()
++    ring_contract(capacity, ratio).observe(blocks, qsl, seq)
++
++
++def _is_capturing() -> bool:
++    for mod in (getattr(torch, "xpu", None), getattr(torch, "cuda", None)):
++        fn = getattr(mod, "is_current_stream_capturing", None)
++        try:
++            if fn is not None and fn():
++                return True
++        except Exception:
++            pass
++    return False
++
++
++is_capturing = _is_capturing
++
++
++def layer_index(prefix: str) -> int | None:
++    parts = prefix.split(".")
++    for i, part in enumerate(parts[:-1]):
++        if part == "layers" and parts[i + 1].isdigit():
++            return int(parts[i + 1])
++    return None
++
++
++_dump_step = [0]
++
++
++def dump_prefill_state(
++    prefix: str,
++    compressed_metadata,
++    compressed_cache: torch.Tensor,
++    selected: torch.Tensor,
++) -> None:
++    """Write prefill requests' compressed rows and last-row selections."""
++    if not DUMP_DIR or _is_capturing():
++        return
++    layer = layer_index(prefix)
++    if layer is None or layer not in DUMP_LAYERS:
++        return
++    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
++        return
++    m = compressed_metadata
++    if m.num_decode_tokens >= m.num_actual_tokens:
++        return
++    qsl = m.query_start_loc.cpu().tolist()
++    seq = m.seq_lens.cpu().tolist()
++    page = compressed_cache.shape[1]
++    requests = []
++    for r in range(m.num_decodes, len(qsl) - 1):
++        q = qsl[r + 1] - qsl[r]
++        if q <= 0:
++            continue
++        groups = seq[r] // m.compress_ratio
++        logical = torch.arange(groups, device=compressed_cache.device)
++        pages = m.block_table[r, logical // page].long()
++        rows = compressed_cache[pages, logical % page, 0].float().cpu()
++        last = qsl[r + 1] - 1
++        requests.append(
++            {
++                "seq_len": seq[r],
++                "query_len": q,
++                "compressed": rows,
++                "last_row_selected": selected[last].cpu(),
++            }
++        )
++    if not requests:
++        return
++    _dump_step[0] += 1
++    path = Path(DUMP_DIR)
++    path.mkdir(parents=True, exist_ok=True)
++    torch.save(
++        {"layer": layer, "step": _dump_step[0], "requests": requests},
++        path / f"qsa-L{layer:02d}-{os.getpid()}-{_dump_step[0]:07d}.pt",
++    )
++
++
++_tie_counts = {"rows": 0, "tied": 0}
++
++
++def count_boundary_ties(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_indices: torch.Tensor,
++    block_topk: int,
++) -> None:
++    """Count rows whose k-th score is shared by a column outside the selection."""
++    if _is_capturing():
++        return
++    tied = boundary_tie_rows(logits, visible_blocks, block_indices, block_topk)
++    _tie_counts["rows"] += int(logits.shape[0])
++    before = _tie_counts["tied"]
++    _tie_counts["tied"] += int(tied.sum().item())
++    if _tie_counts["rows"] // TIES_PERIOD != (
++        _tie_counts["rows"] - logits.shape[0]
++    ) // TIES_PERIOD or (before == 0 and _tie_counts["tied"]):
++        logger.info(
++            "%s top-k boundary ties: %d of %d rows",
++            TAG,
++            _tie_counts["tied"],
++            _tie_counts["rows"],
++        )
++
++
++def boundary_tie_rows(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_indices: torch.Tensor,
++    block_topk: int,
++) -> torch.Tensor:
++    """Rows where the selection is not unique: more than k visible columns
++    score at least the smallest selected score. Device ops only."""
++    rows, width = logits.shape
++    k = min(block_topk, width)
++    sel = block_indices[:rows, :k].long()
++    valid = sel >= 0
++    picked = logits.gather(1, sel.clamp_min(0))
++    inf = torch.tensor(float("inf"), device=logits.device, dtype=logits.dtype)
++    threshold = torch.where(valid, picked, inf).min(dim=1).values
++    visible = visible_blocks[:rows].to(torch.int64).clamp(0, width)
++    live = torch.arange(width, device=logits.device).unsqueeze(0) < visible.unsqueeze(1)
++    at_least = ((logits >= threshold.unsqueeze(1)) & live).sum(dim=1)
++    return (visible > k) & (at_least > k)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+index b4da5a138e..7ed41740af 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_target_graph.py
+@@ -15,6 +15,8 @@ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+ 
++_GRAPH_CHECK = os.environ.get("B70_QSA_GRAPH_CHECK", "").strip() in ("1", "true", "on")
++
+ 
+ def state_routes(runner, metadata):
+     context = runner.vllm_config.compilation_config.static_forward_context
+@@ -36,6 +38,38 @@ def state_routes(runner, metadata):
+     ]
+ 
+ 
++def qsa_side_rows(runner, metadata):
++    """B70-QSA-Q: the QSA side-cache rows this step writes (B70_QSA_GRAPH_CHECK).
++
++    The side caches are not state routes: their writes are expected to be
++    idempotent for a repeated 8-row verify step. This lets the capture prove
++    it on the live batch instead of assuming it.
++    """
++    from vllm.models.qwen4_exp.common.qsa_cache import QSAForwardMetadata
++
++    context = runner.vllm_config.compilation_config.static_forward_context
++    found = []
++    for name, meta in metadata.items():
++        if not isinstance(meta, QSAForwardMetadata):
++            continue
++        cache = getattr(context.get(name), "kv_cache", None)
++        if not isinstance(cache, torch.Tensor) or cache.ndim != 4 or not cache.numel():
++            continue
++        slots = meta.slot_mapping[: meta.num_actual_tokens].long()
++        page = cache.shape[1]
++        safe = slots.clamp_min(0)
++        found.append((name, cache, safe // page, safe % page, slots >= 0))
++    return found
++
++
++def qsa_side_snapshot(side):
++    return [
++        (torch.where(valid.view(-1, 1, 1), cache[blocks, offsets], 0).clone(),
++         cache[0].clone())
++        for _, cache, blocks, offsets, valid in side
++    ]
++
++
+ def save(routes):
+     return [tensor[indices].clone() for _, tensor, indices in routes]
+ 
+@@ -225,9 +259,12 @@ class TargetGraphs:
+         # Capture must never advance the accepted-prefix state. Several layers
+         # share cache arenas: union every layer's indices before saving them.
+         routes = state_routes(runner, metadata)
++        side = qsa_side_rows(runner, target_metadata) if _GRAPH_CHECK else []
++        side_initial = qsa_side_snapshot(side)
+         initial = save(routes)
+         expected = clone_output(eager(runner, batch, metadata, inputs))
+         expected_state = save(routes)
++        side_expected = qsa_side_snapshot(side)
+         restore(routes, initial)
+         static = stage(current, {}, bound)
+         model_inputs, model_metadata, slots, padding = static
+@@ -251,6 +288,20 @@ class TargetGraphs:
+                 torch.equal(value, tensor[indices])
+                 for (_, tensor, indices), value in zip(routes, expected_state)
+             )
++            if side:
++                side_replayed = qsa_side_snapshot(side)
++                bad = [
++                    side[i][0]
++                    for i, ((rows, null), (rows2, null2), (_, null0)) in enumerate(
++                        zip(side_expected, side_replayed, side_initial)
++                    )
++                    if not (torch.equal(rows, rows2) and torch.equal(null2, null0))
++                ]
++                logger.info(
++                    "B70-QSA-GRAPH-CHECK: %d QSA side caches, %d differ after "
++                    "replay: %s", len(side), len(bad), bad[:4]
++                )
++                passed = passed and not bad
+             verdict = torch.tensor(int(passed), dtype=torch.int32)
+             dist.all_reduce(
+                 verdict, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
+diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+index 4e67d892f3..fafc9f6dfd 100644
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+ from vllm.platforms import current_platform
+ 
++from ..common import qsa_debug as _qsa_debug
+ from ..common.qsa_cache import (
+     QSACompressedKeyCache,
+     QSAForwardMetadata,
+@@ -494,6 +495,14 @@ class QSAIndexer(nn.Module):
+             self.token_topk,
+             out,
+         )
++        if _qsa_debug.DUMP_DIR:
++            # B70-QSA-Q: qualification hook, off by default (B70_QSA_DEBUG_DUMP).
++            _qsa_debug.dump_prefill_state(
++                self.compressed_key_cache.prefix,
++                compressed_metadata,
++                compressed_key_cache,
++                block_indices,
++            )
+         return out, main_outputs
+ 
+ 

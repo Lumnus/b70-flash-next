@@ -1,0 +1,34 @@
+From 8be6dc7e4f5a1c1e318f1eb46ea943b61559a016 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 19:53:38 +0000
+Subject: [PATCH 05/26] B70-QSA-05: QSA raw-key ring widens to a whole group
+ that divides the block
+
+With DFlash2 K=7 the minimal ring is 12 slots (4 + 7, whole groups), and the
+assert block_size % capacity failed on BMG, where the hybrid block is 832
+tokens (13 x 64). A wider ring only adds slack (no aliasing), so take the next
+whole-group size that divides the block: 16 for 832. Minimal sizes that
+already divide are unchanged (all existing ring tests).
+---
+ vllm/models/qwen4_exp/common/qsa_cache.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index f960dea071..ff36c6fba2 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -849,6 +849,14 @@ class QSAKeyStateCache(_QSAStateCache):
+         # overwrite a committed key the next step needs to close the group.
+         span = self.compress_ratio + vllm_config.num_speculative_tokens
+         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
++        # B70-QSA: a wider ring is equally correct (it only adds slack), so
++        # when the minimal whole-group capacity does not divide the attention
++        # block, take the next whole-group size that does. Flash-Next with
++        # DFlash2 K=7 needs 12, and the hybrid block on BMG is 832 = 13 x 64;
++        # 16 divides it.
++        block_size = self.cache_config.block_size
++        while block_size % capacity and capacity < block_size:
++            capacity += self.compress_ratio
+         assert self.cache_config.block_size % capacity == 0, (
+             f"QSA ring capacity {capacity} must divide the attention block "
+             f"size {self.cache_config.block_size}"

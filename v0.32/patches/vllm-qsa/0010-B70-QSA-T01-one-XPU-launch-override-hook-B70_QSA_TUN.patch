@@ -1,0 +1,463 @@
+From 0d2650a6e765344f50a8002d2baf9cd10765edcd Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 21:30:46 +0000
+Subject: [PATCH 10/26] B70-QSA-T01: one XPU launch-override hook
+ (B70_QSA_TUNE) for every QSA Triton kernel
+
+Measurement/tuning only; nothing changes unless an override is set.
+
+- qsa_xpu_tuning.py: B70_QSA_TUNE (JSON or @file) keyed by kernel
+  (decode_score, prefill_score, sparse_gqa_decode, sparse_gqa_prefill,
+  merge, expand); validated field names; grf_mode passes through as the
+  Intel backend launch option; set_overrides() for in-process benches.
+  Ignored off XPU (grf_mode is an Intel option).
+- The dispatch functions (_decode_launch_config, _prefill_launch_config,
+  _select_xpu_config, decode block_n / tiles-per-program) read it, and the
+  launch sites and JIT warmups take num_stages / grf_mode from the same
+  helpers, so warmup compiles exactly the variant that runs.
+- B70_QSA_MIN_DOT_N below 16 is honoured only with
+  B70_QSA_ALLOW_SMALL_DOT=1: the arm for Intel triton main, whose frontend
+  accepts tl.dot N < 16 (3.8.0+xpu refuses it at compile time).
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py       |  95 ++++++++++----
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       |  53 ++++++--
+ .../qwen4_exp/nvidia/ops/qsa_xpu_tuning.py    | 120 ++++++++++++++++++
+ 3 files changed, 233 insertions(+), 35 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 36605512a6..b7863af3f2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -16,6 +16,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+ 
++from . import qsa_xpu_tuning as xpu_tune
++
+ 
+ @lru_cache(maxsize=1)
+ def _is_sm120() -> bool:
+@@ -575,20 +577,36 @@ def _select_xpu_config(
+     """
+     del is_fp8
+     if base_programs > 2048:
+-        return (32, 1, 1) if use_prefill_config else (64, 1, 2)
+-    if base_programs <= 24:
+-        return 32, 64, 4
+-    if base_programs <= 32:
+-        return 32, 16, 1
+-    if base_programs <= 64:
+-        return 32, 8, 1
+-    if base_programs <= 128:
+-        return 32, 4, 1
+-    if base_programs <= 256:
+-        return 32, 8, 1
+-    if base_programs <= 512:
+-        return 64, 4, 2
+-    return 64, 1, 2
++        config = (32, 1, 1) if use_prefill_config else (64, 1, 2)
++    elif base_programs <= 24:
++        config = 32, 64, 4
++    elif base_programs <= 32:
++        config = 32, 16, 1
++    elif base_programs <= 64:
++        config = 32, 8, 1
++    elif base_programs <= 128:
++        config = 32, 4, 1
++    elif base_programs <= 256:
++        config = 32, 8, 1
++    elif base_programs <= 512:
++        config = 64, 4, 2
++    else:
++        config = 64, 1, 2
++    # B70-QSA-T: B70_QSA_TUNE overrides one region at a time (see
++    # qsa_xpu_tuning); the warmup enumerates through this function too.
++    key = _sparse_gqa_tune_key(base_programs, use_prefill_config)
++    return (
++        xpu_tune.get(key, "block_n", config[0]),
++        xpu_tune.get(key, "splits", config[1]),
++        xpu_tune.get(key, "num_warps", config[2]),
++    )
++
++
++def _sparse_gqa_tune_key(base_programs: int, use_prefill_config: bool) -> str:
++    """B70-QSA-T: tuning region of a sparse GQA launch."""
++    if base_programs > 2048 and use_prefill_config:
++        return "sparse_gqa_prefill"
++    return "sparse_gqa_decode"
+ 
+ 
+ def _qsa_block_m(group_size: int) -> int:
+@@ -817,7 +835,7 @@ def qsa_sparse_paged_attention(
+         BLOCK_M=block_m,
+         BLOCK_N=block_n,
+         num_warps=partial_warps,
+-        num_stages=2,
++        **_sparse_gqa_stage_kwargs(q.shape[0] * k_cache.shape[2], use_prefill_config),
+     )
+     if num_splits == 1:
+         return out
+@@ -836,12 +854,33 @@ def qsa_sparse_paged_attention(
+         NUM_QUERY_HEADS=q.shape[1],
+         NUM_SPLITS=num_splits,
+         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+-        num_warps=2,
+-        num_stages=1,
++        **_merge_kwargs(),
+     )
+     return out
+ 
+ 
++def _sparse_gqa_stage_kwargs(base_programs: int, use_prefill_config: bool) -> dict:
++    """num_stages (+ XPU grf_mode) of a sparse GQA launch; warmup reads it too."""
++    if not current_platform.is_xpu():
++        return {"num_stages": 2}
++    key = _sparse_gqa_tune_key(base_programs, use_prefill_config)
++    return {
++        "num_stages": xpu_tune.get(key, "num_stages", 2),
++        **xpu_tune.launch_extra(key),
++    }
++
++
++def _merge_kwargs() -> dict:
++    """num_warps/num_stages (+ XPU grf_mode) of the split-K merge."""
++    if not current_platform.is_xpu():
++        return {"num_warps": 2, "num_stages": 1}
++    return {
++        "num_warps": xpu_tune.get("merge", "num_warps", 2),
++        "num_stages": 1,
++        **xpu_tune.launch_extra("merge"),
++    }
++
++
+ def warmup_qsa_sparse_paged_attention(
+     kv_cache: torch.Tensor,
+     block_table: torch.Tensor,
+@@ -866,9 +905,20 @@ def warmup_qsa_sparse_paged_attention(
+     block_m = _qsa_block_m(group_size)
+ 
+     # Every config the dispatch can pick for this group size.
++    # B70-QSA-T: num_stages/grf_mode depend on the tuning region, so a
++    # profile carries the region's stage kwargs as a sorted tuple.
+     profiles = {
+-        _select_config(
+-            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
++        (
++            *_select_config(
++                num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
++            ),
++            tuple(
++                sorted(
++                    _sparse_gqa_stage_kwargs(
++                        num_rows * num_kv_heads, use_prefill_config
++                    ).items()
++                )
++            ),
+         )
+         for num_rows in range(1, 8193)
+         for use_prefill_config in (False, True)
+@@ -912,7 +962,7 @@ def warmup_qsa_sparse_paged_attention(
+     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
+ 
+     warmed = []
+-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
++    for block_n, warps, num_tiles, num_splits, stage_items in sorted(profiles):
+         if num_splits == 1:
+             partial_output_ptr = output_ptr
+             partial_lse_ptr = output_ptr
+@@ -965,7 +1015,7 @@ def warmup_qsa_sparse_paged_attention(
+             BLOCK_M=block_m,
+             BLOCK_N=block_n,
+             num_warps=warps,
+-            num_stages=2,
++            **dict(stage_items),
+             grid=(num_rows, num_kv_heads, num_splits),
+         )
+         if num_splits > 1:
+@@ -983,8 +1033,7 @@ def warmup_qsa_sparse_paged_attention(
+                 NUM_QUERY_HEADS=num_query_heads,
+                 NUM_SPLITS=num_splits,
+                 BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+-                num_warps=2,
+-                num_stages=1,
++                **_merge_kwargs(),
+                 grid=(num_rows, num_query_heads),
+             )
+         warmed.append((block_n, num_splits, warps))
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 261f274c35..d0b71474ef 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -14,6 +14,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
++from . import qsa_xpu_tuning as xpu_tune
++
+ logger = init_logger(__name__)
+ 
+ _TOPK_WORKSPACE_BYTES = 1024 * 1024
+@@ -28,12 +30,25 @@ def _min_dot_n() -> int:
+     N >= 16 and K >= 16"; measured on B70, G1 2026-10-25), and a plain decode
+     has N = 4. So XPU pads N to 16 by default; padded rows are masked.
+     B70_QSA_MIN_DOT_N (XPU only) overrides, e.g. 32 for the tuning sweep.
++    B70-QSA-T: values below 16 are honoured only with B70_QSA_ALLOW_SMALL_DOT=1,
++    the arm for a Triton that accepts N < 16 (Intel backend main, whose
++    min_dot_size is (1, 1, 1)); on 3.8.0 that arm fails to compile by design.
+     """
+     if current_platform.is_xpu():
+-        return max(16, int(os.environ.get("B70_QSA_MIN_DOT_N", "16")))
++        value = int(os.environ.get("B70_QSA_MIN_DOT_N", "16"))
++        if os.environ.get("B70_QSA_ALLOW_SMALL_DOT", "0") == "1":
++            return max(1, value)
++        return max(16, value)
+     return 1
+ 
+ 
++def _decode_block_n() -> int:
++    """Key tile of the decode scorer (B70-QSA-T: overridable on XPU)."""
++    if current_platform.is_xpu():
++        return xpu_tune.get("decode_score", "block_n", _DECODE_BLOCK_N)
++    return _DECODE_BLOCK_N
++
++
+ def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
+     """(STAGES, num_warps) for the decode scoring kernel.
+ 
+@@ -41,7 +56,9 @@ def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
+     UNTUNED copy of the GB300 one (a BMG-measured table replaces it).
+     """
+     if current_platform.is_xpu():
+-        return 2, 1 if dtype == torch.float8_e4m3fn else 2
++        stages = xpu_tune.get("decode_score", "stages", 2)
++        warps = 1 if dtype == torch.float8_e4m3fn else 2
++        return stages, xpu_tune.get("decode_score", "num_warps", warps)
+     # tuned on GB300
+     return 2, 1 if dtype == torch.float8_e4m3fn else 2
+ 
+@@ -54,9 +71,13 @@ def _prefill_launch_config(dtype: torch.dtype) -> tuple[int, int, int, int, int]
+     so N = TILE_R * padded heads (256 here) is DPAS-eligible on XPU.
+     """
+     if current_platform.is_xpu():
+-        if dtype == torch.float8_e4m3fn:
+-            return 32, 64, 16, 2, 8
+-        return 64, 64, 16, 2, 4
++        base = (
++            (32, 64, 16, 2, 8) if dtype == torch.float8_e4m3fn else (64, 64, 16, 2, 4)
++        )
++        names = ("tile_r", "block_n", "k_tiles", "stages", "num_warps")
++        return tuple(  # type: ignore[return-value]
++            xpu_tune.get("prefill_score", n, v) for n, v in zip(names, base)
++        )
+     # tuned on GB300
+     if dtype == torch.float8_e4m3fn:
+         return 32, 64, 16, 2, 8
+@@ -332,7 +353,11 @@ def _expand_qsa_indices_kernel(
+ 
+ 
+ def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
+-    programs = num_requests * triton.cdiv(columns, _DECODE_BLOCK_N)
++    if current_platform.is_xpu():
++        forced = xpu_tune.get("decode_score", "tiles_per_prog", 0)
++        if forced:
++            return forced
++    programs = num_requests * triton.cdiv(columns, _decode_block_n())
+     if programs < 16384:
+         return 1
+     if programs < 32768:
+@@ -420,15 +445,16 @@ def warmup_qsa_mqa_paged_decode(
+             NUM_HEADS=num_heads,
+             HEAD_DIM=head_dim,
+             DECODE_QUERY_LEN=decode_query_len,
+-            BLOCK_N=_DECODE_BLOCK_N,
++            BLOCK_N=_decode_block_n(),
+             TILES_PER_PROG=tiles_per_program,
+             STAGES=stages,
+             MIN_DOT_N=_min_dot_n(),
+             num_warps=num_warps,
+             grid=(
+                 num_requests,
+-                triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
++                triton.cdiv(columns, _decode_block_n() * tiles_per_program),
+             ),
++            **xpu_tune.launch_extra("decode_score"),
+         )
+     return profiles
+ 
+@@ -485,6 +511,7 @@ def _prefill_logits(
+         K_TILES=K_TILES,
+         STAGES=STAGES,
+         num_warps=num_warps,
++        **xpu_tune.launch_extra("prefill_score"),
+     )
+     return logits
+ 
+@@ -507,7 +534,7 @@ def expand_qsa_block_indices(
+     # count (never a token index); the index region below only writes
+     # columns [0, output_width).
+     assert out.shape == (block_indices.shape[0], output_width + 1)
+-    column_block = 256
++    column_block = xpu_tune.get("expand", "column_block", 256)
+     grid = (block_indices.shape[0], triton.cdiv(output_width, column_block))
+     _expand_qsa_indices_kernel[grid](
+         block_indices,
+@@ -519,7 +546,8 @@ def expand_qsa_block_indices(
+         BLOCK_TOPK=block_topk,
+         COMPRESS_RATIO=compress_ratio,
+         COLUMN_BLOCK=column_block,
+-        num_warps=4,
++        num_warps=xpu_tune.get("expand", "num_warps", 4),
++        **xpu_tune.launch_extra("expand"),
+     )
+ 
+ 
+@@ -698,7 +726,7 @@ def qsa_select_paged_decode(
+     stages, num_warps = _decode_launch_config(k_cache.dtype)
+     grid = (
+         num_requests,
+-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
++        triton.cdiv(columns, _decode_block_n() * tiles_per_program),
+     )
+     _qsa_mqa_paged_uniform_kernel[grid](
+         q,
+@@ -715,11 +743,12 @@ def qsa_select_paged_decode(
+         NUM_HEADS=q.shape[1],
+         HEAD_DIM=q.shape[2],
+         DECODE_QUERY_LEN=decode_query_len,
+-        BLOCK_N=_DECODE_BLOCK_N,
++        BLOCK_N=_decode_block_n(),
+         TILES_PER_PROG=tiles_per_program,
+         STAGES=stages,
+         MIN_DOT_N=_min_dot_n(),
+         num_warps=num_warps,
++        **xpu_tune.launch_extra("decode_score"),
+     )
+     _topk(
+         logits,
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+new file mode 100644
+index 0000000000..7284e2fdef
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA: one place for Intel XPU launch overrides of the QSA Triton kernels.
++
++Measurement and tuning only. Nothing changes unless an override is set.
++
++``B70_QSA_TUNE`` holds a JSON object (or ``@/path/to/file.json``) keyed by
++kernel name; each value is a dict of launch choices. Example::
++
++    B70_QSA_TUNE='{"sparse_gqa_prefill": {"block_n": 64, "splits": 1,
++                   "num_warps": 8, "grf_mode": "256"},
++                   "decode_score": {"num_warps": 4, "grf_mode": "auto"}}'
++
++Kernel keys and the fields each one reads:
++
++``decode_score``   num_warps, stages, block_n, tiles_per_prog, grf_mode
++``prefill_score``  tile_r, block_n, k_tiles, stages, num_warps, grf_mode
++``sparse_gqa_decode``   block_n, splits, num_warps, num_stages, grf_mode
++                        (every base_programs region except the prefill one)
++``sparse_gqa_prefill``  same fields; base_programs > 2048 with
++                        use_prefill_config (the 4096-row prefill chunk)
++``merge``          num_warps, grf_mode
++``expand``         column_block, num_warps, grf_mode
++
++The launch site and the JIT warmup read the same values, so warmup can never
++compile a variant other than the one that runs. ``set_overrides`` is the
++in-process form used by benchmarks/kernels/bench_qwen4_qsa_xpu.py; it clears
++the cache of the dispatch helpers that memoise.
++
++Only XPU reads overrides: ``grf_mode`` is an Intel backend option and would
++be rejected by the CUDA backend.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from typing import Any
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
++
++_KNOWN = {
++    "decode_score": {"num_warps", "stages", "block_n", "tiles_per_prog", "grf_mode"},
++    "prefill_score": {
++        "tile_r",
++        "block_n",
++        "k_tiles",
++        "stages",
++        "num_warps",
++        "grf_mode",
++    },
++    "sparse_gqa_decode": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
++    "sparse_gqa_prefill": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
++    "merge": {"num_warps", "grf_mode"},
++    "expand": {"column_block", "num_warps", "grf_mode"},
++}
++_GRF_MODES = {"default", "128", "256", "512", "auto"}
++
++_overrides: dict[str, dict[str, Any]] | None = None
++
++
++def _validate(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
++    out: dict[str, dict[str, Any]] = {}
++    for kernel, fields in raw.items():
++        if kernel not in _KNOWN:
++            raise ValueError(
++                f"B70_QSA_TUNE: unknown kernel {kernel!r}; known: {sorted(_KNOWN)}"
++            )
++        if not isinstance(fields, dict):
++            raise ValueError(f"B70_QSA_TUNE[{kernel!r}] must be an object")
++        bad = set(fields) - _KNOWN[kernel]
++        if bad:
++            raise ValueError(
++                f"B70_QSA_TUNE[{kernel!r}]: unknown fields {sorted(bad)}; "
++                f"known: {sorted(_KNOWN[kernel])}"
++            )
++        grf = fields.get("grf_mode")
++        if grf is not None and str(grf) not in _GRF_MODES:
++            raise ValueError(f"B70_QSA_TUNE: grf_mode must be one of {_GRF_MODES}")
++        out[kernel] = {
++            k: (str(v) if k == "grf_mode" else int(v)) for k, v in fields.items()
++        }
++    return out
++
++
++def _load() -> dict[str, dict[str, Any]]:
++    global _overrides
++    if _overrides is None:
++        spec = os.environ.get("B70_QSA_TUNE", "").strip()
++        if spec.startswith("@"):
++            with open(spec[1:]) as f:
++                spec = f.read()
++        parsed = _validate(json.loads(spec)) if spec else {}
++        if parsed and not current_platform.is_xpu():
++            logger.warning_once("B70-QSA: B70_QSA_TUNE ignored off XPU")
++            parsed = {}
++        if parsed:
++            logger.info_once("B70-QSA: XPU launch overrides active: %s", parsed)
++        _overrides = parsed
++    return _overrides
++
++
++def set_overrides(raw: dict[str, dict[str, Any]] | None) -> None:
++    """Replace the overrides in-process (benchmarks). None = re-read the env."""
++    global _overrides
++    _overrides = None if raw is None else _validate(raw)
++
++
++def get(kernel: str, field: str, default: Any) -> Any:
++    """Override for one field, or ``default``."""
++    return _load().get(kernel, {}).get(field, default)
++
++
++def launch_extra(kernel: str) -> dict[str, Any]:
++    """Extra Triton launch kwargs (today only ``grf_mode``) for ``kernel``."""
++    grf = _load().get(kernel, {}).get("grf_mode")
++    return {"grf_mode": grf} if grf is not None and grf != "default" else {}

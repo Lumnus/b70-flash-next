@@ -1,0 +1,730 @@
+From 84f1ad073c566c65260bd8b7405ec49758698cce Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 22:41:58 +0000
+Subject: [PATCH 15/26] B70-QSA-K01: attn2 sparse GQA path for Xe2
+ (B70_QSA_ATTN_IMPL=attn2), no register spills
+
+The splitk kernel holds a [BLOCK_M, HEAD_DIM] fp32 accumulator plus gathered
+K/V tiles per program; at head_dim 256 every BMG config spills 11-46 KB per
+thread, and extra warps only replicate work (Intel lays a chained dot's warps
+on M = 8 heads). attn2 follows the SYCL kernels' shape inside Triton: one
+subgroup per (row, KV group, tile of BLOCK_N selected tokens); Q.K and P.V
+run head_dim chunk by chunk in runtime loops with each output chunk stored
+at once; each tile writes an fp32 partial (normalised output + log2-sum-exp);
+an online LSE merge applies BF16 rounding and the sigmoid gate. Rows go in
+chunks to bound the partial workspace.
+
+Default stays splitk. Defaults compile with zero spill on BMG-G31 (Triton
+3.8.0+xpu, IGC 2.41.5, AOT): decode BLOCK_N 32 x 4 chunks, prefill
+BLOCK_N 64 x 8 chunks. Tune keys sparse_attn2_decode/_prefill. Warmup
+compiles the attn2 profiles when the env selects it. Untimed on GPU.
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py       | 134 +++++
+ vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py | 490 ++++++++++++++++++
+ .../qwen4_exp/nvidia/ops/qsa_xpu_tuning.py    |  23 +-
+ 3 files changed, 646 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index b7863af3f2..e98ab00687 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -16,6 +16,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+ 
++from . import qsa_attn2 as attn2
+ from . import qsa_xpu_tuning as xpu_tune
+ 
+ 
+@@ -772,6 +773,22 @@ def qsa_sparse_paged_attention(
+ 
+     group_size = q.shape[1] // k_cache.shape[2]
+     block_m = _qsa_block_m(group_size)
++    if attn2.attn_impl() == "attn2":
++        # B70-QSA-K: head_dim-chunked, all-heads-per-program kernel (qsa_attn2).
++        return attn2.qsa_sparse_paged_attention_attn2(
++            q,
++            k_cache,
++            v_cache,
++            logical_indices,
++            block_table,
++            token_to_req,
++            use_prefill_config,
++            out,
++            output_gate_view,
++            softmax_scale,
++            output_scale,
++            block_m,
++        )
+     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+     block_n, partial_warps, num_tiles, num_splits = _select_config(
+         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+@@ -961,6 +978,30 @@ def warmup_qsa_sparse_paged_attention(
+     row_stride = num_query_heads * head_dim
+     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
+ 
++    if attn2.attn_impl() == "attn2":
++        return _warmup_attn2(
++            q_ptr,
++            k_cache_ptr,
++            v_cache_ptr,
++            indices_ptr,
++            block_table_ptr,
++            token_to_req_ptr,
++            output_ptr,
++            output_gate_ptr,
++            key_cache,
++            value_cache,
++            block_table,
++            num_rows=num_rows,
++            num_requests=num_requests,
++            num_cache_blocks=num_cache_blocks,
++            num_query_heads=num_query_heads,
++            num_kv_heads=num_kv_heads,
++            group_size=group_size,
++            block_m=block_m,
++            head_dim=head_dim,
++            selection_width=selection_width,
++        )
++
+     warmed = []
+     for block_n, warps, num_tiles, num_splits, stage_items in sorted(profiles):
+         if num_splits == 1:
+@@ -1040,6 +1081,99 @@ def warmup_qsa_sparse_paged_attention(
+     return tuple(warmed)
+ 
+ 
++def _warmup_attn2(
++    q_ptr,
++    k_cache_ptr,
++    v_cache_ptr,
++    indices_ptr,
++    block_table_ptr,
++    token_to_req_ptr,
++    output_ptr,
++    output_gate_ptr,
++    key_cache,
++    value_cache,
++    block_table,
++    *,
++    num_rows,
++    num_requests,
++    num_cache_blocks,
++    num_query_heads,
++    num_kv_heads,
++    group_size,
++    block_m,
++    head_dim,
++    selection_width,
++) -> tuple[tuple[int, int, int], ...]:
++    """B70-QSA-K: compile every attn2 tile/merge specialization dispatch can pick."""
++    head_stride = head_dim
++    row_stride = num_query_heads * head_dim
++    partial_output_ptr = TritonWarmupTensor(torch.float32)
++    partial_lse_ptr = TritonWarmupTensor(torch.float32)
++    warmed = []
++    profiles = attn2.attn2_profiles(num_kv_heads, selection_width)
++    for block_n, num_dchunk, tpp, warps, stages, extra in sorted(profiles):
++        attn2._qsa_attn2_tile_kernel.warmup(
++            q_ptr,
++            k_cache_ptr,
++            v_cache_ptr,
++            indices_ptr,
++            block_table_ptr,
++            token_to_req_ptr,
++            partial_output_ptr,
++            partial_lse_ptr,
++            1.0,
++            1.0,
++            row_stride,
++            head_stride,
++            key_cache.stride(0),
++            key_cache.stride(1),
++            key_cache.stride(2),
++            value_cache.stride(0),
++            value_cache.stride(1),
++            value_cache.stride(2),
++            selection_width + 1,
++            block_table.stride(0),
++            num_rows,
++            num_cache_blocks,
++            num_requests,
++            TOPK=selection_width,
++            PAGE_SIZE=key_cache.shape[1],
++            PAGE_TABLE_WIDTH=block_table.shape[1],
++            GROUP_SIZE=group_size,
++            HEAD_DIM=head_dim,
++            NUM_QUERY_HEADS=num_query_heads,
++            BLOCK_M=block_m,
++            BLOCK_N=block_n,
++            NUM_DCHUNK=num_dchunk,
++            TILES_PER_PROG=tpp,
++            num_warps=warps,
++            num_stages=stages,
++            **dict(extra),
++            grid=(num_rows, num_kv_heads, 1),
++        )
++        attn2._qsa_attn2_merge_kernel.warmup(
++            partial_output_ptr,
++            partial_lse_ptr,
++            indices_ptr,
++            output_ptr,
++            output_gate_ptr,
++            selection_width + 1,
++            row_stride,
++            head_stride,
++            row_stride,
++            head_stride,
++            num_rows,
++            TOPK=selection_width,
++            BLOCK_N=block_n,
++            HEAD_DIM=head_dim,
++            NUM_QUERY_HEADS=num_query_heads,
++            **attn2.merge_kwargs(),
++            grid=(num_rows, num_query_heads),
++        )
++        warmed.append((block_n, tpp, warps))
++    return tuple(warmed)
++
++
+ def qsa_store_cache_rows(
+     cache: torch.Tensor,
+     slot_mapping: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
+new file mode 100644
+index 0000000000..ab20b62931
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
+@@ -0,0 +1,490 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-QSA-K: Xe2-shaped sparse paged GQA attention for Qwen4Exp QSA (Intel XPU).
++
++Selected with ``B70_QSA_ATTN_IMPL=attn2`` (default ``splitk`` = the original
++``_qsa_sparse_paged_gqa_splitk_kernel``). Same numerical contract as the
++original: BF16 (or fp8-e4m3) K/V, BF16 Q, FP32 scores / softmax /
++accumulation, FP32 partials merged by log-sum-exp, BF16 rounding of the
++attention output before the FP32 sigmoid gate.
++
++Why a second kernel (measured in the Triton tuning drill): the original holds a whole ``[BLOCK_M, HEAD_DIM]`` FP32 accumulator
++plus gathered K and V tiles in one program. At head_dim 256 that alone is the
++whole 256-GRF file of a Xe2 hardware thread, so every config spills 11-46 KB
++per thread. Adding warps does not help: Triton's Intel backend lays a chained
++(Q.K -> P.V) dot's warps along M, and M is only the 6 (padded 8) heads of one
++KV group, so extra warps replicate the same work. The SYCL kernels at the bar
++(analytics-zoo vllm-xpu-kernels ``token_split_attention_v3``) instead keep
++each subgroup's live state small and get their parallelism from many short
++token partials merged afterwards.
++
++attn2 does the same within Triton:
++
++1. **One program = one row x one KV group x TILES_PER_PROG tiles of BLOCK_N
++   selected tokens, one subgroup (num_warps 1).** All 6 heads of the group are
++   the dot's M (padded to 8), so each gathered K/V row serves every head.
++2. **Each tile is finished in place**: Q.K over head_dim chunks (a runtime loop,
++   so only one Q chunk and one K chunk are ever live), an exact softmax over the
++   tile's BLOCK_N scores, then P.V chunk by chunk with each ``[BM, DC]`` output
++   chunk stored as soon as it is computed. No full-head_dim accumulator exists.
++3. **Each tile writes an FP32 partial** (normalised output + log2-sum-exp, the
++   layout the original split-K uses), and ``_qsa_attn2_merge_kernel`` combines a
++   row's tiles with an online log-sum-exp merge, rounds to BF16 and applies the
++   gate. The merge reads the row's valid count, so tiles past it are never read.
++4. **Rows go in chunks** (``row_chunk``) so the partial workspace stays bounded
++   (prefill default: 256 rows x 6 heads x 33 tiles x 1 KB = 51 MB at BLOCK_N 64;
++   decode 64 rows x 6 x 65 x 1 KB = 25 MB at BLOCK_N 32). It is a transient
++   torch.empty outside the engine's profiled peak, like the original's
++   partials.
++5. Every dot is M 8, N = BLOCK_N or DC >= 16, K = DC or BLOCK_N >= 16: DPAS
++   eligible and legal under Triton 3.8.0+xpu's N/K >= 16 minimum.
++
++Launch choices go through ``B70_QSA_TUNE`` keys ``sparse_attn2_decode`` and
++``sparse_attn2_prefill`` (fields in qsa_xpu_tuning); the merge reads ``merge``.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from . import qsa_xpu_tuning as xpu_tune
++
++ATTN_IMPL_ENV = "B70_QSA_ATTN_IMPL"
++_IMPLS = ("splitk", "attn2")
++
++
++def attn_impl() -> str:
++    """Selected sparse attention implementation (read per call; host-side only)."""
++    impl = os.environ.get(ATTN_IMPL_ENV, "splitk").strip() or "splitk"
++    if impl not in _IMPLS:
++        raise ValueError(f"{ATTN_IMPL_ENV}={impl!r}; expected one of {_IMPLS}")
++    return impl
++
++
++@triton.jit
++def _attn2_dequant(tile):
++    # Same decode as qsa._maybe_dequant: e4m3 bytes -> fp16 of x * 2^-8 (the
++    # host folds 2^8 into the scales); e4m3 view -> fp16; anything else as is.
++    if tile.dtype == tl.uint8:
++        code = tile.to(tl.uint16)
++        bits = ((code & 0x80) << 8) | ((code & 0x7F) << 7)
++        return bits.to(tl.float16, bitcast=True)
++    elif tile.dtype == tl.float8e4nv:
++        return tile.to(tl.float16)
++    else:
++        return tile
++
++
++@triton.jit(do_not_specialize=["num_rows", "num_requests"])
++def _qsa_attn2_tile_kernel(
++    q_ptr,
++    k_cache_ptr,
++    v_cache_ptr,
++    indices_ptr,
++    block_table_ptr,
++    token_to_req_ptr,
++    partial_output_ptr,
++    partial_lse_ptr,
++    softmax_scale,
++    output_scale,
++    stride_q_row,
++    stride_q_head,
++    stride_k_block,
++    stride_k_token,
++    stride_k_head,
++    stride_v_block,
++    stride_v_token,
++    stride_v_head,
++    stride_indices_row,
++    stride_table_req,
++    num_rows,
++    num_cache_blocks,
++    num_requests,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    PAGE_TABLE_WIDTH: tl.constexpr,
++    GROUP_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_QUERY_HEADS: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    NUM_DCHUNK: tl.constexpr,
++    TILES_PER_PROG: tl.constexpr,
++) -> None:
++    DC: tl.constexpr = HEAD_DIM // NUM_DCHUNK
++    row = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    prog = tl.program_id(2)
++    request = tl.load(token_to_req_ptr + row)
++    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
++    request_ok = (request >= 0) & (request < num_requests)
++    # Trailing count column of the packed selection buffer (see qsa.py).
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++    num_tiles = tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N)
++
++    head_offsets = tl.arange(0, BLOCK_M)
++    head_mask = head_offsets < GROUP_SIZE
++    dc_offsets = tl.arange(0, DC)
++    column_offsets = tl.arange(0, BLOCK_N)
++    first_head = kv_head * GROUP_SIZE
++    q_rows = (
++        q_ptr
++        + row * stride_q_row
++        + (first_head + head_offsets[:, None]) * stride_q_head
++    )
++    score_scale = softmax_scale * 1.4426950408889634
++
++    for t in range(TILES_PER_PROG):
++        tile = prog * TILES_PER_PROG + t
++        if tile < num_tiles:
++            columns = tile * BLOCK_N + column_offsets
++            logical_token = tl.load(
++                indices_ptr + row * stride_indices_row + columns,
++                mask=columns < TOPK,
++                other=-1,
++            )
++            safe_token = tl.maximum(logical_token, 0)
++            logical_page = safe_token // PAGE_SIZE
++            page_offset = safe_token % PAGE_SIZE
++            valid = (
++                request_ok & (logical_token >= 0) & (logical_page < PAGE_TABLE_WIDTH)
++            )
++            physical_page = tl.load(
++                block_table_ptr
++                + safe_request * stride_table_req
++                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
++                mask=valid,
++                other=-1,
++            )
++            valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
++            safe_page = tl.maximum(physical_page, 0).to(tl.int64)
++            # One int64 base per token; elements add a contiguous dim offset.
++            k_base = (
++                k_cache_ptr
++                + safe_page * stride_k_block
++                + page_offset * stride_k_token
++                + kv_head * stride_k_head
++            )
++            v_base = (
++                v_cache_ptr
++                + safe_page * stride_v_block
++                + page_offset * stride_v_token
++                + kv_head * stride_v_head
++            )
++
++            # Q.K, head_dim chunk by chunk (runtime loop: one chunk live).
++            scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            for c in range(NUM_DCHUNK):
++                q_chunk = tl.load(
++                    q_rows + c * DC + dc_offsets[None, :],
++                    mask=head_mask[:, None],
++                    other=0.0,
++                )
++                k_chunk = tl.load(
++                    k_base[None, :] + c * DC + dc_offsets[:, None],
++                    mask=valid[None, :],
++                    other=0.0,
++                )
++                scores = tl.dot(
++                    q_chunk, _attn2_dequant(k_chunk).to(q_chunk.dtype), acc=scores
++                )
++
++            # Exact softmax over this tile.
++            scores = tl.where(valid[None, :], scores * score_scale, -1.0e20)
++            tile_max = tl.max(scores, axis=1)
++            probabilities = tl.where(
++                valid[None, :], tl.math.exp2(scores - tile_max[:, None]), 0.0
++            )
++            tile_sum = tl.sum(probabilities, axis=1)
++            has_values = tile_sum > 0
++            inv_sum = tl.where(
++                has_values, output_scale / tl.maximum(tile_sum, 1.0e-20), 0.0
++            )
++            partial_row = (tile * num_rows + row).to(tl.int64)
++            tl.store(
++                partial_lse_ptr
++                + partial_row * NUM_QUERY_HEADS
++                + first_head
++                + head_offsets,
++                tl.where(
++                    has_values,
++                    tile_max + tl.math.log2(tl.maximum(tile_sum, 1.0e-20)),
++                    -float("inf"),
++                ),
++                mask=head_mask,
++            )
++            part_rows = (
++                partial_output_ptr
++                + (partial_row * NUM_QUERY_HEADS + first_head + head_offsets[:, None])
++                * HEAD_DIM
++            )
++
++            # P.V, chunk by chunk; each [BM, DC] output chunk is stored at once.
++            for c in range(NUM_DCHUNK):
++                v_chunk = _attn2_dequant(
++                    tl.load(
++                        v_base[:, None] + c * DC + dc_offsets[None, :],
++                        mask=valid[:, None],
++                        other=0.0,
++                    )
++                )
++                out_chunk = tl.dot(probabilities.to(v_chunk.dtype), v_chunk)
++                tl.store(
++                    part_rows + c * DC + dc_offsets[None, :],
++                    out_chunk * inv_sum[:, None],
++                    mask=head_mask[:, None],
++                )
++
++
++@triton.jit(do_not_specialize=["num_rows"])
++def _qsa_attn2_merge_kernel(
++    partial_output_ptr,
++    partial_lse_ptr,
++    indices_ptr,
++    output_ptr,
++    output_gate_ptr,
++    stride_indices_row,
++    stride_output_row,
++    stride_output_head,
++    stride_output_gate_row,
++    stride_output_gate_head,
++    num_rows,
++    TOPK: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_QUERY_HEADS: tl.constexpr,
++) -> None:
++    """Online log-sum-exp merge of one (row, head)'s tile partials + gate."""
++    row = tl.program_id(0)
++    head = tl.program_id(1)
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++    num_tiles = tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N)
++    dim_offsets = tl.arange(0, HEAD_DIM)
++    running_max = -float("inf")
++    denominator = 0.0
++    merged = tl.zeros((HEAD_DIM,), dtype=tl.float32)
++    for tile in range(num_tiles):
++        partial_row = (tile * num_rows + row).to(tl.int64)
++        lse = tl.load(partial_lse_ptr + partial_row * NUM_QUERY_HEADS + head)
++        if lse > -float("inf"):
++            next_max = tl.maximum(running_max, lse)
++            alpha = tl.math.exp2(running_max - next_max)
++            weight = tl.math.exp2(lse - next_max)
++            part = tl.load(
++                partial_output_ptr
++                + (partial_row * NUM_QUERY_HEADS + head) * HEAD_DIM
++                + dim_offsets
++            )
++            merged = merged * alpha + part * weight
++            denominator = denominator * alpha + weight
++            running_max = next_max
++    merged = tl.where(denominator > 0, merged / denominator, 0.0)
++    # Original contract: BF16 attention output, then the FP32 sigmoid gate.
++    merged = merged.to(output_ptr.dtype.element_ty).to(tl.float32)
++    gate = tl.load(
++        output_gate_ptr
++        + row * stride_output_gate_row
++        + head * stride_output_gate_head
++        + dim_offsets
++    ).to(tl.float32)
++    tl.store(
++        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
++        merged * tl.sigmoid(gate),
++    )
++
++
++# --------------------------------------------------------------------------------------
++# dispatch
++# --------------------------------------------------------------------------------------
++# Defaults are the configs that compile with zero spill for BMG-G31 (Triton
++# 3.8.0+xpu, IGC 2.41.5; benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py):
++# decode BLOCK_N 32 x 4 chunks (256 GRF), prefill BLOCK_N 64 x 8 chunks (256 GRF).
++# Untimed: the GPU block picks the winners with --sweep sparse_attn2_*.
++_DEFAULTS = {
++    "sparse_attn2_decode": {
++        "block_n": 32,
++        "num_dchunk": 4,
++        "tiles_per_prog": 1,
++        "row_chunk": 4096,
++        "num_warps": 1,
++        "num_stages": 1,
++    },
++    "sparse_attn2_prefill": {
++        "block_n": 64,
++        "num_dchunk": 8,
++        "tiles_per_prog": 1,
++        "row_chunk": 256,
++        "num_warps": 1,
++        "num_stages": 1,
++    },
++}
++# Rows at/above which a use_prefill_config call takes the prefill region.
++_PREFILL_ROWS = 2048
++
++
++def _region(num_rows: int, use_prefill_config: bool) -> str:
++    if use_prefill_config and num_rows >= _PREFILL_ROWS:
++        return "sparse_attn2_prefill"
++    return "sparse_attn2_decode"
++
++
++def select_attn2_config(
++    num_rows: int, num_kv_heads: int, use_prefill_config: bool, selection_width: int
++) -> dict:
++    """Launch config of one call: a pure function of shapes (graph-capture stable)."""
++    del num_kv_heads
++    region = _region(num_rows, use_prefill_config)
++
++    def get(field):
++        return xpu_tune.get(region, field, _DEFAULTS[region][field])
++
++    block_n = get("block_n")
++    num_dchunk = get("num_dchunk")
++    tiles_per_prog = get("tiles_per_prog")
++    num_tiles = triton.cdiv(selection_width, block_n)
++    return {
++        "region": region,
++        "block_n": block_n,
++        "num_dchunk": num_dchunk,
++        "tiles_per_prog": min(tiles_per_prog, num_tiles),
++        "num_tiles": num_tiles,
++        "row_chunk": max(1, min(get("row_chunk"), num_rows)),
++        "num_warps": get("num_warps"),
++        "num_stages": get("num_stages"),
++        "extra": xpu_tune.launch_extra(region),
++    }
++
++
++def merge_kwargs() -> dict:
++    return {
++        "num_warps": xpu_tune.get("merge", "num_warps", 2),
++        "num_stages": 1,
++        **xpu_tune.launch_extra("merge"),
++    }
++
++
++def qsa_sparse_paged_attention_attn2(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    logical_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    use_prefill_config: bool,
++    out: torch.Tensor,
++    output_gate_view: torch.Tensor,
++    softmax_scale: float,
++    output_scale: float,
++    block_m: int,
++) -> torch.Tensor:
++    """Launch attn2; the caller (qsa.qsa_sparse_paged_attention) validated inputs."""
++    head_dim = q.shape[2]
++    num_kv_heads = k_cache.shape[2]
++    group_size = q.shape[1] // num_kv_heads
++    selection_width = logical_indices.shape[1] - 1
++    cfg = select_attn2_config(
++        q.shape[0], num_kv_heads, use_prefill_config, selection_width
++    )
++    dc = head_dim // cfg["num_dchunk"]
++    assert dc >= 16 and dc * cfg["num_dchunk"] == head_dim, "attn2 head_dim chunking"
++    rows_total = q.shape[0]
++    row_chunk = cfg["row_chunk"]
++    num_tiles = cfg["num_tiles"]
++    partial_output = torch.empty(
++        (num_tiles, row_chunk, q.shape[1], head_dim),
++        dtype=torch.float32,
++        device=q.device,
++    )
++    partial_lse = torch.empty(
++        (num_tiles, row_chunk, q.shape[1]), dtype=torch.float32, device=q.device
++    )
++    progs = triton.cdiv(num_tiles, cfg["tiles_per_prog"])
++    for r0 in range(0, rows_total, row_chunk):
++        rows = min(row_chunk, rows_total - r0)
++        q_c = q[r0 : r0 + rows]
++        ind_c = logical_indices[r0 : r0 + rows]
++        req_c = token_to_req[r0 : r0 + rows]
++        _qsa_attn2_tile_kernel[(rows, num_kv_heads, progs)](
++            q_c,
++            k_cache,
++            v_cache,
++            ind_c,
++            block_table,
++            req_c,
++            partial_output,
++            partial_lse,
++            softmax_scale,
++            output_scale,
++            q.stride(0),
++            q.stride(1),
++            k_cache.stride(0),
++            k_cache.stride(1),
++            k_cache.stride(2),
++            v_cache.stride(0),
++            v_cache.stride(1),
++            v_cache.stride(2),
++            logical_indices.stride(0),
++            block_table.stride(0),
++            rows,
++            k_cache.shape[0],
++            block_table.shape[0],
++            TOPK=selection_width,
++            PAGE_SIZE=k_cache.shape[1],
++            PAGE_TABLE_WIDTH=block_table.shape[1],
++            GROUP_SIZE=group_size,
++            HEAD_DIM=head_dim,
++            NUM_QUERY_HEADS=q.shape[1],
++            BLOCK_M=block_m,
++            BLOCK_N=cfg["block_n"],
++            NUM_DCHUNK=cfg["num_dchunk"],
++            TILES_PER_PROG=cfg["tiles_per_prog"],
++            num_warps=cfg["num_warps"],
++            num_stages=cfg["num_stages"],
++            **cfg["extra"],
++        )
++        _qsa_attn2_merge_kernel[(rows, q.shape[1])](
++            partial_output,
++            partial_lse,
++            ind_c,
++            out[r0 : r0 + rows],
++            output_gate_view[r0 : r0 + rows],
++            logical_indices.stride(0),
++            out.stride(0),
++            out.stride(1),
++            output_gate_view.stride(0),
++            output_gate_view.stride(1),
++            rows,
++            TOPK=selection_width,
++            BLOCK_N=cfg["block_n"],
++            HEAD_DIM=head_dim,
++            NUM_QUERY_HEADS=q.shape[1],
++            **merge_kwargs(),
++        )
++    return out
++
++
++def attn2_profiles(
++    num_kv_heads: int, selection_width: int, max_rows: int = 8192
++) -> set[tuple]:
++    """Every (block_n, num_dchunk, tiles_per_prog, warps, stages, extra) in use."""
++    out = set()
++    for num_rows in range(1, max_rows + 1):
++        for use_prefill_config in (False, True):
++            c = select_attn2_config(
++                num_rows, num_kv_heads, use_prefill_config, selection_width
++            )
++            out.add(
++                (
++                    c["block_n"],
++                    c["num_dchunk"],
++                    c["tiles_per_prog"],
++                    c["num_warps"],
++                    c["num_stages"],
++                    tuple(sorted(c["extra"].items())),
++                )
++            )
++    return out
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+index 7284e2fdef..16c0314758 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+@@ -19,7 +19,10 @@ Kernel keys and the fields each one reads:
+                         (every base_programs region except the prefill one)
+ ``sparse_gqa_prefill``  same fields; base_programs > 2048 with
+                         use_prefill_config (the 4096-row prefill chunk)
+-``merge``          num_warps, grf_mode
++``sparse_attn2_decode`` / ``sparse_attn2_prefill`` (B70_QSA_ATTN_IMPL=attn2)
++                   block_n, num_dchunk (head_dim chunks), tiles_per_prog,
++                   row_chunk, num_warps, num_stages, grf_mode
++``merge``          num_warps, grf_mode (also the attn2 merge)
+ ``expand``         column_block, num_warps, grf_mode
+ 
+ The launch site and the JIT warmup read the same values, so warmup can never
+@@ -54,6 +57,24 @@ _KNOWN = {
+     },
+     "sparse_gqa_decode": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
+     "sparse_gqa_prefill": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
++    "sparse_attn2_decode": {
++        "block_n",
++        "num_dchunk",
++        "tiles_per_prog",
++        "row_chunk",
++        "num_warps",
++        "num_stages",
++        "grf_mode",
++    },
++    "sparse_attn2_prefill": {
++        "block_n",
++        "num_dchunk",
++        "tiles_per_prog",
++        "row_chunk",
++        "num_warps",
++        "num_stages",
++        "grf_mode",
++    },
+     "merge": {"num_warps", "grf_mode"},
+     "expand": {"column_block", "num_warps", "grf_mode"},
+ }

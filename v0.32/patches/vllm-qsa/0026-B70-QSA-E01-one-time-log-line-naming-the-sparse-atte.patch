@@ -1,0 +1,37 @@
+From 4acd39891b8a1d39002aca3aecfc9de1d7468123 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Mon, 26 Oct 2026 00:02:39 +0000
+Subject: [PATCH 26/26] B70-QSA-E01: one-time log line naming the sparse
+ attention implementation
+
+attn_impl() is read per call; the boot log now proves which kernel (splitk|attn2) the engine ran.
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
+index f0ca966747..3163b88e18 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_attn2.py
+@@ -49,10 +49,13 @@ import os
+ 
+ import torch
+ 
++from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ 
+ from . import qsa_xpu_tuning as xpu_tune
+ 
++logger = init_logger(__name__)
++
+ ATTN_IMPL_ENV = "B70_QSA_ATTN_IMPL"
+ _IMPLS = ("splitk", "attn2")
+ 
+@@ -62,6 +65,7 @@ def attn_impl() -> str:
+     impl = os.environ.get(ATTN_IMPL_ENV, "splitk").strip() or "splitk"
+     if impl not in _IMPLS:
+         raise ValueError(f"{ATTN_IMPL_ENV}={impl!r}; expected one of {_IMPLS}")
++    logger.info_once("B70-QSA: sparse attention implementation = %s", impl)
+     return impl
+ 
+ 

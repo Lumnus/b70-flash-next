@@ -1,0 +1,107 @@
+From a1158464ad6b1d945613fe6c6a838a70537f8c49 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 20:46:59 +0000
+Subject: [PATCH 09/26] B70-QSA-09: torch top-k caps its transient memory by
+ processing rows in chunks
+
+The deterministic torch top-k (B70_QSA_TOPK=torch) builds an int64 key per
+logit, about five int64 temporaries, ~10x the fp32 logits. With the KV pool
+at util 0.89 a 4096-row prefill chunk OOMed rank 0 ("Tried to allocate
+192.00 MiB ... 178.85 MiB is free", W1 2026-10-25) and took the engine down.
+Rows are independent, so they are now processed in chunks sized to
+B70_QSA_TOPK_TORCH_CHUNK_MB of key memory (default 64); one log line when
+chunking is active. Output is identical (new test: one-row chunks == one
+pass; decode/split selection suites pass with chunk 0 and 64 on XPU).
+Also ruff-formats the B70-QSA-08 stub.
+---
+ tests/models/qwen4_exp/test_qsa_reference.py  | 18 +++++++++-
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       | 33 +++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/qwen4_exp/test_qsa_reference.py b/tests/models/qwen4_exp/test_qsa_reference.py
+index 58e1cdf017..b37a673ba0 100644
+--- a/tests/models/qwen4_exp/test_qsa_reference.py
++++ b/tests/models/qwen4_exp/test_qsa_reference.py
+@@ -282,6 +282,22 @@ def test_qsa_topk_torch_contract_and_ties(width: int) -> None:
+         assert chosen.tolist() == order[:k]
+ 
+ 
++def test_qsa_topk_torch_row_chunks_match_one_pass(monkeypatch) -> None:
++    """B70-QSA-09: chunking rows (memory cap) gives the same indices."""
++    torch.manual_seed(1)
++    rows, width, block_topk = 37, 700, 512
++    logits = torch.randn(rows, width)
++    logits[logits < 0.2] = 0.0
++    visible = torch.randint(0, width + 1, (rows,), dtype=torch.int32)
++    whole = torch.empty(rows, block_topk, dtype=torch.int32)
++    chunked = torch.empty(rows, block_topk, dtype=torch.int32)
++    monkeypatch.setenv("B70_QSA_TOPK_TORCH_CHUNK_MB", "4096")
++    qsa_indexer_ops._qsa_topk_torch(logits, visible, block_topk, whole)
++    monkeypatch.setenv("B70_QSA_TOPK_TORCH_CHUNK_MB", "0")  # one row per chunk
++    qsa_indexer_ops._qsa_topk_torch(logits, visible, block_topk, chunked)
++    assert torch.equal(whole, chunked)
++
++
+ @requires_qsa_kernels
+ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
+     device = torch.device(_DEVICE)
+@@ -556,7 +572,6 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
+     assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
+ 
+ 
+-
+ class _GemmaNormStub(SimpleNamespace):
+     """weight + variance_epsilon like GemmaRMSNorm, and callable: off CUDA the
+     indexer calls the norm module itself (no flashinfer), so the stub must too."""
+@@ -566,6 +581,7 @@ class _GemmaNormStub(SimpleNamespace):
+         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+         return (xf * (1.0 + self.weight.float())).to(x.dtype)
+ 
++
+ @requires_qsa_kernels
+ @pytest.mark.usefixtures("default_vllm_config")
+ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 386ea0dfd3..261f274c35 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -556,6 +556,39 @@ def _qsa_topk_torch(
+     rows, width = logits.shape
+     if rows == 0:
+         return
++    # B70-QSA-09: the int64 key costs ~5 transient int64 copies of the logits
++    # (bits, flip, key, mask select, topk input) -- ~10x the fp32 logits. A
++    # 4096-row prefill chunk at long context OOMed rank 0 (192 MiB alloc, 179 MiB
++    # free; W1 2026-10-25). Rows are independent, so process them in chunks
++    # sized to B70_QSA_TOPK_TORCH_CHUNK_MB (default 64) of key memory.
++    budget = int(os.environ.get("B70_QSA_TOPK_TORCH_CHUNK_MB", "64")) << 20
++    step = max(1, budget // max(1, width * 8 * 5))
++    if step < rows:
++        logger.info_once(
++            "B70-QSA: torch top-k processes rows in chunks of %d (width %d)",
++            step,
++            width,
++        )
++        for start in range(0, rows, step):
++            end = min(rows, start + step)
++            _qsa_topk_torch_rows(
++                logits[start:end],
++                visible_blocks[start:end],
++                block_topk,
++                block_indices[start:end],
++            )
++        return
++    _qsa_topk_torch_rows(logits, visible_blocks, block_topk, block_indices)
++
++
++def _qsa_topk_torch_rows(
++    logits: torch.Tensor,
++    visible_blocks: torch.Tensor,
++    block_topk: int,
++    block_indices: torch.Tensor,
++) -> None:
++    """One chunk of _qsa_topk_torch (same contract)."""
++    rows, width = logits.shape
+     k = min(block_topk, width)
+     bits = logits.contiguous().view(torch.int32).to(torch.int64)
+     # IEEE-754 total order on the int view: flip the magnitude bits of negatives.

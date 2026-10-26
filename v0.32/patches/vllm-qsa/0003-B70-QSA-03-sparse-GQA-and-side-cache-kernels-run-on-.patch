@@ -1,0 +1,134 @@
+From 0782dedfe14b79b0c522ad11a339660740248ff2 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 19:53:38 +0000
+Subject: [PATCH 03/26] B70-QSA-03: sparse GQA and side-cache kernels run on
+ XPU
+
+- qsa_store_cache_rows / qsa_compress_groups_with_ratio gated on is_cuda,
+  which is False for XPU tensors; accept cuda and xpu devices.
+- _select_config dispatches XPU to _select_xpu_config, the single place for
+  BMG tile choices (an untuned copy of the generic GB300 table for now).
+- block_m comes from _qsa_block_m for both launch and warmup. Default is
+  unchanged (next_pow2(group) = 8 at TP4); B70_QSA_MIN_BLOCK_M raises the XPU
+  floor for DPAS tuning. M = 8 is legal on Intel Triton (min_dot_size 1).
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py | 64 +++++++++++++++++++++++--
+ 1 file changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index c7fe601449..36605512a6 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from functools import lru_cache
+ 
+ import torch
+@@ -562,6 +563,55 @@ def _select_sm90_config(
+     return 32, 4, 1
+ 
+ 
++def _select_xpu_config(
++    base_programs: int, use_prefill_config: bool, is_fp8: bool
++) -> tuple[int, int, int]:
++    """(block_n, target_splits, num_warps) for Intel XPU (Arc Pro B70 / BMG).
++
++    B70-QSA: UNTUNED placeholder — a copy of the generic (GB300) table below so
++    the functional bring-up starts from known-correct shapes. Every XPU tile
++    decision for the sparse GQA kernel lives here; a measured table replaces the body
++    with BMG-measured entries. BLOCK_N >= 16 keeps the QK dot DPAS-eligible.
++    """
++    del is_fp8
++    if base_programs > 2048:
++        return (32, 1, 1) if use_prefill_config else (64, 1, 2)
++    if base_programs <= 24:
++        return 32, 64, 4
++    if base_programs <= 32:
++        return 32, 16, 1
++    if base_programs <= 64:
++        return 32, 8, 1
++    if base_programs <= 128:
++        return 32, 4, 1
++    if base_programs <= 256:
++        return 32, 8, 1
++    if base_programs <= 512:
++        return 64, 4, 2
++    return 64, 1, 2
++
++
++def _qsa_block_m(group_size: int) -> int:
++    """Query-head tile (tl.dot M) for the sparse GQA kernel.
++
++    B70-QSA: Intel Triton has no tl.dot minimum for bf16/fp16 (min_dot_size
++    (1,1,1)); a shape DPAS cannot take (N < 16, K not a multiple of 16) falls
++    back to FMA, correct but slower. So M = 8 (TP4: 6 heads per KV head) is
++    legal and stays the default. B70_QSA_MIN_BLOCK_M (XPU only) raises the
++    floor for the tuning sweep (rows >= GROUP_SIZE are masked).
++    """
++    block_m = triton.next_power_of_2(group_size)
++    if current_platform.is_xpu():
++        floor = int(os.environ.get("B70_QSA_MIN_BLOCK_M", "1"))
++        block_m = max(block_m, triton.next_power_of_2(max(floor, 1)))
++    return block_m
++
++
++def _qsa_is_gpu_tensor(tensor: torch.Tensor) -> bool:
++    """B70-QSA: the Triton paths run on CUDA, ROCm and XPU (was `is_cuda`)."""
++    return tensor.device.type in ("cuda", "xpu")
++
++
+ def _select_config(
+     num_rows: int,
+     num_kv_heads: int,
+@@ -578,7 +628,11 @@ def _select_config(
+     and sm_90 (Hopper) to _select_sm90_config.
+     """
+     base_programs = num_rows * num_kv_heads
+-    if _is_sm120():
++    if current_platform.is_xpu():
++        BLOCK_N, target_splits, num_warps = _select_xpu_config(
++            base_programs, use_prefill_config, is_fp8
++        )
++    elif _is_sm120():
+         BLOCK_N, target_splits, num_warps = _select_sm120_config(
+             base_programs, use_prefill_config, is_fp8
+         )
+@@ -699,7 +753,7 @@ def qsa_sparse_paged_attention(
+         return out
+ 
+     group_size = q.shape[1] // k_cache.shape[2]
+-    block_m = triton.next_power_of_2(group_size)
++    block_m = _qsa_block_m(group_size)
+     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+     block_n, partial_warps, num_tiles, num_splits = _select_config(
+         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+@@ -809,7 +863,7 @@ def warmup_qsa_sparse_paged_attention(
+     cache_dtype = fp8_dtype if is_fp8 else key_cache.dtype
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+-    block_m = triton.next_power_of_2(group_size)
++    block_m = _qsa_block_m(group_size)
+ 
+     # Every config the dispatch can pick for this group size.
+     profiles = {
+@@ -943,7 +997,7 @@ def qsa_store_cache_rows(
+     rows: torch.Tensor,
+ ) -> None:
+     """Store fixed-width rows in a QSA cache without boolean indexing."""
+-    if not cache.is_cuda or not HAS_TRITON:
++    if not _qsa_is_gpu_tensor(cache) or not HAS_TRITON:
+         raise RuntimeError("QSA CUDA cache stores require Triton")
+     if cache.ndim != 4 or cache.shape[2] != 1:
+         raise ValueError("QSA cache must be [pages, page_size, 1, width]")
+@@ -988,7 +1042,7 @@ def qsa_compress_groups_with_ratio(
+     rope_cache: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Pool completed groups from the compressor-state ring and raw token rows."""
+-    if not raw_keys.is_cuda or not HAS_TRITON:
++    if not _qsa_is_gpu_tensor(raw_keys) or not HAS_TRITON:
+         raise RuntimeError("QSA CUDA compression requires Triton")
+     rows = token_to_req.numel()
+     if compress_ratio <= 0:

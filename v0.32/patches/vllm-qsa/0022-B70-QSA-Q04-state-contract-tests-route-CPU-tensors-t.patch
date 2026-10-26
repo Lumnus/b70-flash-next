@@ -1,0 +1,42 @@
+From 3a70224ed616983d36c7e23a4561d2be3d39b939 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:44:35 +0000
+Subject: [PATCH 22/26] B70-QSA-Q04: state-contract tests route CPU tensors to
+ the torch metadata builder on GPU hosts
+
+With HAS_TRITON the module-level builder is the Triton one, so the ref backend (CPU tensors) hit a Triton launch on a GPU host: 59 failures with "Pointer argument doesn t reference accessible memory". An autouse fixture dispatches by tensor device; device tensors keep the production builder.
+---
+ .../qwen4_exp/test_qsa_state_contracts.py     | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/tests/models/qwen4_exp/test_qsa_state_contracts.py b/tests/models/qwen4_exp/test_qsa_state_contracts.py
+index 90646da56c..b14101a2cf 100644
+--- a/tests/models/qwen4_exp/test_qsa_state_contracts.py
++++ b/tests/models/qwen4_exp/test_qsa_state_contracts.py
+@@ -48,6 +48,26 @@ def should_do_global_cleanup_after_test() -> bool:
+     return _ON_GPU
+ 
+ 
++_PROD_BUILDER = qsa_cache.build_qsa_metadata
++
++
++def _builder_by_device(*args, **kwargs):
++    """CPU tensors take the torch builder; device tensors keep the production one."""
++    for x in (*args, *kwargs.values()):
++        if isinstance(x, torch.Tensor):
++            if x.device.type == "cpu":
++                return qsa_cache._build_qsa_metadata_torch(*args, **kwargs)
++            break
++    return _PROD_BUILDER(*args, **kwargs)
++
++
++@pytest.fixture(autouse=True)
++def _cpu_tensors_use_the_torch_builder(monkeypatch):
++    # On a GPU host HAS_TRITON is true, so the module-level builder is the
++    # Triton one, and the ref backend's CPU tensors would reach a Triton launch.
++    monkeypatch.setattr(qsa_cache, "build_qsa_metadata", _builder_by_device)
++
++
+ CR = 4  # compression ratio
+ K = 7  # DFlash2 draft length on the serving def
+ D = 32  # raw-key width for state tests (production: 128; width is irrelevant)

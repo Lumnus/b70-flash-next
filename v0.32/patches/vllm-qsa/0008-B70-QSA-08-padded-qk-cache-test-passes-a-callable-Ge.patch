@@ -1,0 +1,44 @@
+From 5bad3fcd0c37be806f376f2c57ef44eb5c6a9c60 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 20:24:42 +0000
+Subject: [PATCH 08/26] B70-QSA-08: padded-qk cache test passes a callable
+ Gemma norm stub
+
+Off CUDA the indexer calls the norm module itself (no flashinfer), so the
+SimpleNamespace norm in test_qsa_unfused_cache_update_ignores_padded_qk raised
+"object is not callable" on XPU. The stub keeps weight/variance_epsilon and
+computes the same Gemma RMSNorm. Test-only.
+---
+ tests/models/qwen4_exp/test_qsa_reference.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/qwen4_exp/test_qsa_reference.py b/tests/models/qwen4_exp/test_qsa_reference.py
+index d32a1f430c..58e1cdf017 100644
+--- a/tests/models/qwen4_exp/test_qsa_reference.py
++++ b/tests/models/qwen4_exp/test_qsa_reference.py
+@@ -556,6 +556,16 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
+     assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
+ 
+ 
++
++class _GemmaNormStub(SimpleNamespace):
++    """weight + variance_epsilon like GemmaRMSNorm, and callable: off CUDA the
++    indexer calls the norm module itself (no flashinfer), so the stub must too."""
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        xf = x.float()
++        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
++        return (xf * (1.0 + self.weight.float())).to(x.dtype)
++
+ @requires_qsa_kernels
+ @pytest.mark.usefixtures("default_vllm_config")
+ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
+@@ -584,7 +594,7 @@ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
+         )
+     raw_cache = torch.zeros((1, 4, 1, 64), dtype=torch.bfloat16, device=device)
+     compressed_cache = torch.zeros((1, 2, 1, 64), dtype=torch.bfloat16, device=device)
+-    norm = SimpleNamespace(
++    norm = _GemmaNormStub(
+         weight=torch.zeros(64, dtype=torch.bfloat16, device=device),
+         variance_epsilon=1e-6,
+     )

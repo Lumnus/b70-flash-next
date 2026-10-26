@@ -1,0 +1,1510 @@
+From c0e2e5b9da87a28553669c6aa0a2e7565fb722c9 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 21:48:36 +0000
+Subject: [PATCH 19/26] B70-QSA-Q03: QSA side-cache state-contract tests and an
+ engine lifecycle driver
+
+tests/models/qwen4_exp/test_qsa_state_contracts.py drives one layer's ring
+and compressed-key cache through engine-shaped step sequences and checks the
+state after every step against a ground truth built from committed tokens
+only (draft keys differ from committed ones):
+- spec rollback: every residue mod 4 x acceptance 0..7, plain decode between
+  verifies, 60-step random runs (ring wrap, page crossings), the 832 block;
+- prefix hit / CPU reload with and without the EAGLE trailing-block drop;
+  characterizations of an unaligned hit and a missing compressed reload;
+- repeated execution as C1 capture does it (idempotent for 8-row verify,
+  padding rows, null block untouched), real graph capture/replay on GPU, and
+  the long-prefill non-idempotence that keeps target graphs verify-only;
+- the 2,048 + 3 boundary (selection = whole prefix through 2,051 tokens;
+  sparse == dense attention on GPU) for plain and speculative rows;
+- selector identity under ties: native_det == torch exactly (CPU with an
+  adversarial native stub; GPU with the real op, repeats, graph replay).
+The ref backend runs on CPU; triton/graph cases need XPU or CUDA.
+
+tools/b70_qsa/qsa_engine_lifecycle.py compares cold, GPU-hit, CPU-reload,
+unaligned-junction, cancel+reuse and interleaved paths of one prompt on a
+running engine: greedy tokens (near-tie aware) and the dumped compressed rows.
+---
+ .../qwen4_exp/test_qsa_state_contracts.py     | 1155 +++++++++++++++++
+ tools/b70_qsa/qsa_engine_lifecycle.py         |  310 +++++
+ 2 files changed, 1465 insertions(+)
+ create mode 100644 tests/models/qwen4_exp/test_qsa_state_contracts.py
+ create mode 100644 tools/b70_qsa/qsa_engine_lifecycle.py
+
+diff --git a/tests/models/qwen4_exp/test_qsa_state_contracts.py b/tests/models/qwen4_exp/test_qsa_state_contracts.py
+new file mode 100644
+index 0000000000..90646da56c
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_state_contracts.py
+@@ -0,0 +1,1155 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA-Q: engine-level state contracts of the QSA side caches.
++
++The kernel tests in test_qsa_reference.py check one launch against a reference.
++These tests drive the side caches through the sequences a serving engine
++produces -- chunked prefill, DFlash K=7 verify with every acceptance length,
++plain decode, ring wrap, compressed-page crossings, repeated execution under
++graph capture, prefix hits -- and check the state after every step against a
++ground truth built only from committed tokens:
++
++  * compressed row of every complete committed group == mean of its 4
++    committed raw keys (exact: keys are small integers in bf16);
++  * the ring holds the committed keys of each request's open group;
++  * the null block and blocks owned by nobody are never written.
++
++Draft rows get keys that differ from the committed ones, so a rejected draft
++that survives anywhere it is later read fails the comparison.
++
++Two backends run the same scenarios: ``ref`` (production metadata and slot
++mappings, torch compression/store with the kernel's semantics; runs on CPU)
++and ``triton`` (production metadata, compression and store kernels; needs an
++XPU or CUDA device). The compressed rows are stored before Gemma-norm/RoPE,
++which are row-wise maps that do not touch the state machine; the fused
++prepare arm compares against the unfused arm with those maps applied.
++"""
++
++import math
++import random
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.common import qsa_cache, qsa_debug
++from vllm.models.qwen4_exp.common.qsa_cache import QSAMetadataBuilder
++from vllm.platforms import current_platform
++from vllm.triton_utils import HAS_TRITON
++
++_ON_GPU = (current_platform.is_cuda() or current_platform.is_xpu()) and HAS_TRITON
++_GPU = "xpu" if current_platform.is_xpu() else "cuda"
++requires_gpu = pytest.mark.skipif(not _ON_GPU, reason="needs XPU/CUDA + Triton")
++
++
++@pytest.fixture
++def should_do_global_cleanup_after_test() -> bool:
++    # The ref backend runs on CPU-only hosts, where the global cleanup's
++    # accelerator calls raise.
++    return _ON_GPU
++
++
++CR = 4  # compression ratio
++K = 7  # DFlash2 draft length on the serving def
++D = 32  # raw-key width for state tests (production: 128; width is irrelevant)
++SENTINEL = -100.0  # never produced by a key or a group mean
++
++
++def _ring_capacity(block_size: int, num_spec: int = K) -> int:
++    """Production capacity rule (QSAKeyStateCache.get_kv_cache_spec)."""
++    layer = qsa_cache.QSAKeyStateCache(
++        head_size=64,
++        dtype=torch.bfloat16,
++        cache_config=SimpleNamespace(block_size=block_size),
++        prefix=f"cap.{block_size}.{num_spec}.{random.random()}",
++        vllm_config=SimpleNamespace(
++            compilation_config=SimpleNamespace(static_forward_context={})
++        ),
++        compress_ratio=CR,
++    )
++    return layer.get_kv_cache_spec(
++        SimpleNamespace(num_speculative_tokens=num_spec)
++    ).block_size
++
++
++def _builder(device, *, circular: bool, size: int, max_tokens=4096, max_reqs=8):
++    b = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
++    b.compress_ratio = 1 if circular else CR
++    b.reorder_batch_threshold = 1 + K
++    b.is_circular_buffer = circular
++    b.kv_cache_spec = SimpleNamespace(block_size=size)
++    b.storage_block_size = size
++    b.request_capacity = max_reqs
++    b.token_to_req_buffer = torch.empty(max_tokens, dtype=torch.int32, device=device)
++    b.slot_mapping_buffer = torch.empty(max_tokens, dtype=torch.int64, device=device)
++    b.logical_positions_buffer = torch.empty(
++        max_tokens, dtype=torch.int64, device=device
++    )
++    b.visible_blocks_buffer = torch.empty(max_tokens, dtype=torch.int32, device=device)
++    if circular:
++        b.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
++    else:
++        b.k_work_metadata_buffer = torch.empty(
++            (max_tokens + (CR - 1) * max_reqs) // CR,
++            2,
++            dtype=torch.int32,
++            device=device,
++        )
++    b._debug_ring_ratio = CR
++    return b
++
++
++# --------------------------------------------------------------------------
++# Side-cache ops: torch reference with the kernel's semantics, or production.
++# --------------------------------------------------------------------------
++
++
++class _RefOps:
++    name = "ref"
++
++    @staticmethod
++    def compress(raw, ring, ring_table, token_to_req, qsl, logical, comp_slots):
++        rows = raw.shape[0]
++        cap = ring.shape[1]
++        pooled = torch.zeros_like(raw)
++        t2r = token_to_req.tolist()
++        pos = logical.tolist()
++        slots = comp_slots.tolist()
++        q = qsl.tolist()
++        for row in range(rows):
++            r, end = t2r[row], pos[row]
++            if slots[row] < 0 or end < CR - 1 or r < 0 or r >= len(q) - 1:
++                continue
++            if not (q[r] <= row < q[r + 1]):
++                continue
++            chunk_start = end - (row - q[r])
++            block = int(ring_table[r, 0])
++            acc = torch.zeros(raw.shape[-1], dtype=torch.float32, device=raw.device)
++            for member in range(end - CR + 1, end + 1):
++                if member >= chunk_start:
++                    acc += raw[q[r] + member - chunk_start, 0].float()
++                else:
++                    acc += ring[block, member % cap, 0].float()
++            pooled[row, 0] = (acc / CR).to(raw.dtype)
++        return pooled
++
++    @staticmethod
++    def store(cache, slots, rows):
++        page = cache.shape[1]
++        for row, slot in enumerate(slots.tolist()):
++            if 0 <= slot < cache.shape[0] * page:
++                cache[slot // page, slot % page, 0] = rows[row, 0]
++
++
++class _TritonOps:
++    name = "triton"
++
++    @staticmethod
++    def compress(raw, ring, ring_table, token_to_req, qsl, logical, comp_slots):
++        from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
++
++        positions = logical.view(-1, 1, 1).expand(-1, 1, 3).contiguous()
++        pooled, _ = qsa_ops.qsa_compress_groups_with_ratio(
++            raw,
++            positions,
++            ring,
++            ring_table,
++            token_to_req,
++            qsl,
++            logical,
++            comp_slots,
++            CR,
++        )
++        return pooled
++
++    @staticmethod
++    def store(cache, slots, rows):
++        from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
++
++        qsa_ops.qsa_store_cache_rows(cache, slots, rows)
++
++
++# --------------------------------------------------------------------------
++# The engine-shaped driver and its ground truth.
++# --------------------------------------------------------------------------
++
++
++class _Sim:
++    """Side caches of one QSA layer, driven step by step."""
++
++    def __init__(
++        self, ops, device, *, num_reqs, cap, comp_page, max_groups, seed=0, max_reqs=8
++    ):
++        self.ops, self.device = ops, device
++        self.cap, self.page = cap, comp_page
++        self.gen = torch.Generator().manual_seed(seed)
++        pages_per_req = math.ceil(max_groups / comp_page)
++        # Block 0 is the null block; two extra spare blocks nobody owns.
++        n_ring = num_reqs + 3
++        n_comp = num_reqs * pages_per_req + 3
++        self.ring = torch.full(
++            (n_ring, cap, 1, D), SENTINEL, dtype=torch.bfloat16, device=device
++        )
++        self.comp = torch.full(
++            (n_comp, comp_page, 1, D), SENTINEL, dtype=torch.bfloat16, device=device
++        )
++        ring_perm = torch.randperm(n_ring - 1, generator=self.gen)[:num_reqs] + 1
++        self.ring_table = ring_perm.view(-1, 1).to(torch.int32).to(device)
++        comp_perm = (
++            torch.randperm(n_comp - 1, generator=self.gen)[: num_reqs * pages_per_req]
++            + 1
++        )
++        self.comp_table = (
++            comp_perm.view(num_reqs, pages_per_req).to(torch.int32).to(device)
++        )
++        self.owned_ring = set(ring_perm.tolist())
++        self.owned_comp = set(comp_perm.tolist())
++        self.committed = [[] for _ in range(num_reqs)]
++        self.ring_b = _builder(device, circular=True, size=cap, max_reqs=max_reqs)
++        self.comp_b = _builder(
++            device, circular=False, size=comp_page, max_reqs=max_reqs
++        )
++        self.contract = qsa_debug.QSARingContract(cap, CR, "warn")
++        self.num_reqs = num_reqs
++
++    def key(self):
++        return torch.randint(-8, 9, (D,), generator=self.gen).to(torch.bfloat16)
++
++    def length(self, r):
++        return len(self.committed[r])
++
++    def _common(self, qsl, seq_lens, num_tokens, table):
++        q = torch.tensor(qsl, dtype=torch.int32, device=self.device)
++        t2r = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
++        for r in range(len(qsl) - 1):
++            t2r[qsl[r] : qsl[r + 1]] = r
++        main_slots = torch.full(
++            (num_tokens,), -1, dtype=torch.int64, device=self.device
++        )
++        main_slots[: qsl[-1]] = torch.arange(qsl[-1], device=self.device)
++        lens = [qsl[i + 1] - qsl[i] for i in range(len(qsl) - 1)]
++        return SimpleNamespace(
++            num_actual_tokens=num_tokens,
++            num_reqs=len(qsl) - 1,
++            max_query_len=max(lens),
++            max_seq_len=max(seq_lens),
++            query_start_loc=q,
++            query_start_loc_cpu=q.cpu(),
++            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
++            slot_mapping=main_slots,
++            block_table_tensor=table,
++            token_to_req_indices=lambda buf: buf[:num_tokens].copy_(t2r),
++        )
++
++    def step(self, plan, pad_tokens=0, repeat=1):
++        """plan: list of (request, n_rows, accepted) in batch order.
++
++        Rows start at the request's committed length. accepted=None: every row
++        is a committed token (prefill/plain decode). Otherwise row 0 is the
++        committed token and rows 1.. are drafts, of which ``accepted`` are kept.
++        """
++        qsl, seq_lens, keys, outcome = [0], [], [], []
++        for r, n, accepted in plan:
++            start = self.length(r)
++            rows = [self.key() for _ in range(n)]
++            keys += rows
++            qsl.append(qsl[-1] + n)
++            seq_lens.append(start + n)
++            keep = n if accepted is None else 1 + accepted
++            outcome.append((r, rows[:keep]))
++        num_tokens = qsl[-1] + pad_tokens
++        reqs = [r for r, _, _ in plan]
++        ring_table = self.ring_table[reqs]
++        comp_table = self.comp_table[reqs]
++        raw = torch.zeros(num_tokens, 1, D, dtype=torch.bfloat16)
++        raw[: len(keys), 0] = torch.stack(keys) if keys else raw[:0, 0]
++        raw = raw.to(self.device)
++        ring_meta = self.ring_b.build(
++            0, self._common(qsl, seq_lens, num_tokens, ring_table)
++        )
++        comp_meta = self.comp_b.build(
++            0, self._common(qsl, seq_lens, num_tokens, comp_table)
++        )
++        self.contract.observe(ring_table[:, 0].tolist(), qsl, seq_lens)
++        self._check_visible(comp_meta, qsl, seq_lens)
++        for _ in range(repeat):
++            pooled = self.ops.compress(
++                raw,
++                self.ring,
++                ring_table,
++                ring_meta.token_to_req,
++                ring_meta.query_start_loc,
++                ring_meta.logical_positions,
++                comp_meta.slot_mapping,
++            )
++            self.ops.store(self.comp, comp_meta.slot_mapping, pooled)
++            self.ops.store(self.ring, ring_meta.slot_mapping, raw)
++        for r, kept in outcome:
++            self.committed[r] += kept
++        return ring_meta, comp_meta
++
++    @staticmethod
++    def _check_visible(comp_meta, qsl, seq_lens):
++        vis = comp_meta.visible_blocks.tolist()
++        pos = comp_meta.logical_positions.tolist()
++        for r in range(len(qsl) - 1):
++            for row in range(qsl[r], qsl[r + 1]):
++                assert vis[row] == min((pos[row] + 1) // CR, seq_lens[r] // CR), (
++                    "a row may only see groups closed at or before its own position"
++                )
++        assert all(v == 0 for v in vis[qsl[-1] :]), "padding rows must see nothing"
++
++    def check(self, label=""):
++        ring, comp = self.ring.cpu().float(), self.comp.cpu().float()
++        for r in range(self.num_reqs):
++            keys = self.committed[r]
++            n = len(keys)
++            groups = n // CR
++            if groups:
++                truth = torch.stack(keys[: groups * CR]).float().view(groups, CR, D)
++                truth = truth.mean(dim=1)
++                g = torch.arange(groups)
++                pages = self.comp_table[r].cpu()[g // self.page].long()
++                got = comp[pages, g % self.page, 0]
++                bad = (got != truth).any(dim=1).nonzero().flatten().tolist()
++                assert not bad, (
++                    f"{label} req {r}: compressed groups {bad[:8]} differ from the "
++                    f"mean of their committed keys (committed length {n})"
++                )
++            block = int(self.ring_table[r, 0])
++            for x in range(n - n % CR, n):
++                assert torch.equal(ring[block, x % self.cap, 0], keys[x].float()), (
++                    f"{label} req {r}: ring slot {x % self.cap} does not hold the "
++                    f"committed key of open-group position {x}"
++                )
++        for block in range(ring.shape[0]):
++            if block not in self.owned_ring:
++                assert bool((ring[block] == SENTINEL).all()), (
++                    f"{label} ring block {block} (null/unowned) was written"
++                )
++        for block in range(comp.shape[0]):
++            if block not in self.owned_comp:
++                assert bool((comp[block] == SENTINEL).all()), (
++                    f"{label} compressed block {block} (null/unowned) was written"
++                )
++
++
++def _prefill(sim, r, total, chunks):
++    """Chunked prefill of request r to ``total`` tokens with given chunk sizes."""
++    done = sim.length(r)
++    for size in chunks:
++        if done >= total:
++            break
++        n = min(size, total - done)
++        sim.step([(r, n, None)])
++        done += n
++    if done < total:
++        sim.step([(r, total - done, None)])
++
++
++def _ops_for(backend):
++    if backend == "triton":
++        if not _ON_GPU:
++            pytest.skip("triton backend needs XPU/CUDA")
++        return _TritonOps, torch.device(_GPU)
++    return _RefOps, torch.device("cpu")
++
++
++BACKENDS = ["ref", pytest.param("triton", marks=requires_gpu)]
++
++
++# --------------------------------------------------------------------------
++# Test 1: speculative rollback at compression boundaries.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("residue", [0, 1, 2, 3])
++@pytest.mark.parametrize("accepted", list(range(K + 1)))
++def test_spec_rollback_every_residue_and_acceptance(backend, residue, accepted):
++    """verify(a) -> plain decode -> verify -> verify, three requests, ring 16.
++
++    Each request starts at a different residue mod 4 so every boundary case
++    of the open group meets every acceptance length.
++    """
++    ops, device = _ops_for(backend)
++    cap = _ring_capacity(832)
++    assert cap == 16
++    sim = _Sim(
++        ops,
++        device,
++        num_reqs=3,
++        cap=cap,
++        comp_page=8,
++        max_groups=64,
++        seed=residue * 31 + accepted,
++    )
++    for r in range(3):
++        _prefill(sim, r, 40 + (residue + r) % 4, chunks=[13, 11, 9])
++    sim.check("prefill")
++    sim.step([(r, K + 1, accepted) for r in range(3)])
++    sim.check(f"verify a={accepted}")
++    sim.step([(r, 1, None) for r in range(3)])
++    sim.check("plain decode")
++    sim.step([(r, K + 1, (accepted + 3 + r) % (K + 1)) for r in range(3)])
++    sim.check("verify 2")
++    sim.step([(r, K + 1, K - accepted) for r in range(3)])
++    sim.check("verify 3")
++    assert sim.contract.counts["missing"] == sim.contract.counts["overwritten"] == 0
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("seed", [0, 1, 2, 3])
++def test_spec_rollback_long_random_run_wraps_ring_and_pages(backend, seed):
++    """60 steps of random acceptance with interleaved plain decodes: the ring
++    wraps every 16 positions and compressed pages cross every 32 tokens."""
++    ops, device = _ops_for(backend)
++    rnd = random.Random(seed)
++    sim = _Sim(
++        ops,
++        device,
++        num_reqs=4,
++        cap=_ring_capacity(832),
++        comp_page=8,
++        max_groups=160,
++        seed=100 + seed,
++    )
++    for r in range(4):
++        _prefill(sim, r, 21 + 5 * r, chunks=[7, 6])
++    for i in range(60):
++        if rnd.random() < 0.2:
++            sim.step([(r, 1, None) for r in range(4)])
++        else:
++            sim.step([(r, K + 1, rnd.randint(0, K)) for r in range(4)])
++        sim.check(f"step {i}")
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("start", [826, 827, 828, 829])
++def test_spec_rollback_across_the_832_attention_block(backend, start):
++    """Serving geometry: attention block 832 = 208 compressed rows per page.
++    Verify rows straddle position 832 (the page crossing) at all residues."""
++    ops, device = _ops_for(backend)
++    sim = _Sim(
++        ops,
++        device,
++        num_reqs=2,
++        cap=_ring_capacity(832),
++        comp_page=208,
++        max_groups=420,
++        seed=start,
++    )
++    for r in range(2):
++        _prefill(sim, r, start + r, chunks=[512, 200])
++    for a in (0, 7, 3, 1, 6, 2, 5, 4):
++        sim.step([(r, K + 1, a) for r in range(2)])
++        sim.check(f"a={a}")
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++def test_mixed_decode_and_chunked_prefill_batch(backend):
++    """Decode-verify rows first, a prefill chunk after them (reordered batch),
++    with chunk boundaries off the group grid."""
++    ops, device = _ops_for(backend)
++    sim = _Sim(
++        ops,
++        device,
++        num_reqs=3,
++        cap=_ring_capacity(832),
++        comp_page=8,
++        max_groups=128,
++        seed=7,
++    )
++    _prefill(sim, 0, 29, chunks=[29])
++    _prefill(sim, 1, 30, chunks=[30])
++    for i, chunk in enumerate([37, 13, 50]):
++        sim.step(
++            [(0, K + 1, i % (K + 1)), (1, K + 1, (5 * i) % (K + 1)), (2, chunk, None)]
++        )
++        sim.check(f"mixed {i}")
++
++
++def test_rollback_check_discriminates_a_narrow_ring():
++    """Negative control: a ring of 8 with K=7 lets a rejected draft displace a
++    committed open-group key. The ground truth and the debug contract must
++    both catch it, or the tests above prove nothing."""
++    sim = _Sim(
++        _RefOps,
++        torch.device("cpu"),
++        num_reqs=1,
++        cap=8,
++        comp_page=8,
++        max_groups=32,
++        seed=3,
++    )
++    _prefill(sim, 0, 41, chunks=[41])  # open group holds position 40
++    sim.step([(0, K + 1, 0)])  # writes 41..48; 48 % 8 == 40 % 8
++    with pytest.raises(AssertionError, match="ring slot 0 does not hold"):
++        sim.check()
++    sim.step([(0, K + 1, 1)])  # row 43 closes group 40..43 from the clobbered slot
++    with pytest.raises(AssertionError, match="compressed groups"):
++        sim.check()
++    assert sim.contract.counts["overwritten"] >= 1
++
++
++# --------------------------------------------------------------------------
++# Test 2 (unit part): prefix hits, CPU reload, eagle block drop.
++# --------------------------------------------------------------------------
++
++
++def _new_request_from_cache(sim, src, dst, hit, reload_compressed=True):
++    """Request ``dst`` reuses ``src``'s first ``hit`` tokens as a cache hit.
++
++    Compressed rows for the hit are copied page by page (GPU hit / CPU
++    reload). The ring is never cached: ``dst`` gets a fresh ring block whose
++    contents are a previous request's leftovers.
++    """
++    groups = hit // CR
++    for g in range(groups):
++        s_page, d_page = (
++            sim.comp_table[src, g // sim.page],
++            sim.comp_table[dst, g // sim.page],
++        )
++        if reload_compressed:
++            sim.comp[d_page, g % sim.page] = sim.comp[s_page, g % sim.page]
++    blk = int(sim.ring_table[dst, 0])
++    sim.ring[blk] = (
++        torch.randint(-8, 9, sim.ring[blk].shape).to(sim.ring.dtype).to(sim.ring.device)
++    )
++    sim.committed[dst] = list(sim.committed[src][:hit])
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("eagle_drop", [False, True])
++@pytest.mark.parametrize("prompt", [1700, 1703])
++def test_prefix_hit_and_reload_keep_side_caches_consistent(backend, eagle_drop, prompt):
++    """A hit is a multiple of the hash/scheduler block (here 64; serving 832).
++    With the EAGLE trailing-block drop the hit loses one more whole block --
++    still group-aligned, so the fresh ring is never read and every compressed
++    row of the reused prefix matches the recomputed one."""
++    ops, device = _ops_for(backend)
++    block = 64
++    sim = _Sim(
++        ops,
++        device,
++        num_reqs=2,
++        cap=_ring_capacity(832),
++        comp_page=16,
++        max_groups=600,
++        seed=prompt,
++    )
++    _prefill(sim, 0, prompt, chunks=[512, 512, 512])
++    hit = prompt // block * block
++    if eagle_drop:
++        hit -= block
++    sim.contract.last.pop(int(sim.ring_table[1, 0]), None)
++    _new_request_from_cache(sim, 0, 1, hit)
++    # Recompute the uncached tail with request 0's committed keys.
++    _step_with_keys(sim, 1, sim.committed[0][hit:prompt])
++    assert len(sim.committed[1]) == prompt
++    sim.check(f"hit={hit}")
++    assert sim.contract.counts["first_sight_unaligned"] == 0
++    sim.step([(1, K + 1, 3)])
++    sim.check("verify after hit")
++
++
++def _step_with_keys(sim, r, keys):
++    """One prefill step for request r whose rows carry the given keys."""
++    it = iter(keys)
++    original = sim.key
++    sim.key = lambda: next(it)
++    try:
++        if keys:
++            sim.step([(r, len(keys), None)])
++    finally:
++        sim.key = original
++
++
++def test_unaligned_hit_corrupts_a_group_and_the_contract_flags_it():
++    """Characterization: if a hit ever ended inside a compression group, the
++    group's earlier members would be read from a ring that never held them.
++    Hit lengths are multiples of the scheduler/hash block (both multiples of
++    4 on this model); B70_QSA_DEBUG_RING turns a violation into an error."""
++    sim = _Sim(
++        _RefOps,
++        torch.device("cpu"),
++        num_reqs=2,
++        cap=16,
++        comp_page=16,
++        max_groups=128,
++        seed=11,
++    )
++    _prefill(sim, 0, 300, chunks=[300])
++    hit = 258  # 258 % 4 == 2
++    _new_request_from_cache(sim, 0, 1, hit)
++    _step_with_keys(sim, 1, sim.committed[0][hit:300])
++    with pytest.raises(AssertionError, match="compressed groups"):
++        sim.check()
++    assert sim.contract.counts["first_sight_unaligned"] == 1
++
++
++def test_missing_compressed_reload_is_detected():
++    """A CPU reload that restored the main KV but not the compressed-key group
++    leaves stale rows the next selection would score. The ground truth sees it
++    (in the engine, the dump comparison of qsa_engine_lifecycle.py does)."""
++    sim = _Sim(
++        _RefOps,
++        torch.device("cpu"),
++        num_reqs=2,
++        cap=16,
++        comp_page=16,
++        max_groups=128,
++        seed=12,
++    )
++    _prefill(sim, 0, 256, chunks=[256])
++    _new_request_from_cache(sim, 0, 1, 192, reload_compressed=False)
++    _step_with_keys(sim, 1, sim.committed[0][192:256])
++    with pytest.raises(AssertionError, match="compressed groups"):
++        sim.check()
++
++
++def test_ring_contract_hook_cases():
++    """The B70_QSA_DEBUG_RING contract on hand-made frontiers."""
++    c = qsa_debug.QSARingContract(16, 4, "raise")
++    c.observe([5], [0, 37], [37])  # prefill 0..36
++    c.observe([5], [0, 8], [45])  # verify rows 37..44
++    c.observe([5], [0, 8], [46])  # 0 accepted: next verify starts at 38
++    assert c.counts["checked"] == 2
++    c.observe([6], [0, 3], [3])
++    with pytest.raises(qsa_debug.QSARingContractError, match="missing"):
++        c.observe([6], [0, 1], [10])  # starts at 9; ring stops at 2
++
++    c2 = qsa_debug.QSARingContract(8, 4, "raise")
++    c2.observe([2], [0, 41], [41])
++    c2.observe([2], [0, 8], [49])  # rows 41..48: 48 lands on 40's slot
++    with pytest.raises(qsa_debug.QSARingContractError, match="overwritten"):
++        c2.observe([2], [0, 8], [50])  # 0 accepted: starts at 42, needs 40
++
++    c3 = qsa_debug.QSARingContract(16, 4, "warn")
++    c3.observe([3], [0, 64], [832])  # aligned hit at 768: ring not read
++    c3.observe([4], [0, 30], [800])  # unaligned start 770 on a fresh block
++    c3.observe([0], [0, 8], [801])  # null block (padding): ignored
++    assert c3.counts["first_sight_unaligned"] == 1
++    assert c3.counts["missing"] == c3.counts["overwritten"] == 0
++
++
++# --------------------------------------------------------------------------
++# Test 3 (unit part): repeated execution, as graph capture does it.
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("num_reqs", [1, 2, 3, 4])
++@pytest.mark.parametrize("pad", [0, 8])
++def test_verify_step_is_idempotent_under_capture_repeats(backend, num_reqs, pad):
++    """TargetGraphs runs a new 8-row verify batch eagerly, again as warm-up,
++    and once more on replay, restoring only the GDN state routes. QSA side
++    caches are written three times from the same pre-state; with padding rows
++    (cudagraph padding) and nontrivial prior ring contents, the result must be
++    identical to one eager pass, null and unowned blocks included."""
++    ops, device = _ops_for(backend)
++
++    def build():
++        sim = _Sim(
++            ops,
++            device,
++            num_reqs=num_reqs,
++            cap=_ring_capacity(832),
++            comp_page=8,
++            max_groups=64,
++            seed=num_reqs * 10 + pad,
++        )
++        for r in range(num_reqs):
++            _prefill(sim, r, 50 + r, chunks=[23, 17])  # residues 2,3,0,1
++            sim.step([(r, K + 1, (2 * r + 1) % (K + 1))])
++        return sim
++
++    once, thrice = build(), build()  # same seed: same keys, same pre-state
++    plan = [(r, K + 1, 4) for r in range(num_reqs)]
++    once.step(plan, pad_tokens=pad)
++    thrice.step(plan, pad_tokens=pad, repeat=3)
++    assert torch.equal(once.ring.cpu(), thrice.ring.cpu())
++    assert torch.equal(once.comp.cpu(), thrice.comp.cpu())
++    once.check("once")
++
++
++def test_repeating_a_long_prefill_chunk_is_not_idempotent():
++    """Characterization, and the reason C1 target graphs must stay verify-only:
++    a chunk longer than capacity - (ratio - 1) rows overwrites, on its first
++    execution, ring slots its second execution reads to close the first group."""
++
++    def build():
++        sim = _Sim(
++            _RefOps,
++            torch.device("cpu"),
++            num_reqs=1,
++            cap=16,
++            comp_page=8,
++            max_groups=64,
++            seed=5,
++        )
++        _prefill(sim, 0, 13, chunks=[13])  # residue 1
++        return sim
++
++    once, twice = build(), build()
++    state = once.gen.get_state()
++    once.step([(0, 40, None)])
++    twice.gen.set_state(state)
++    twice.step([(0, 40, None)], repeat=2)
++    once.check()
++    assert not torch.equal(once.comp, twice.comp)
++    # The graph path only takes uniform 8-row verify batches; 8 rows plus the
++    # 3 open-group keys fit in the serving ring.
++    assert _ring_capacity(832) >= 8 + CR - 1
++
++
++# --------------------------------------------------------------------------
++# Test 3 (graph part): real capture and replay of the side-cache step.
++# --------------------------------------------------------------------------
++
++
++def _graph_api():
++    if current_platform.is_xpu():
++        return torch.xpu.XPUGraph, torch.xpu.graph, torch.xpu.synchronize
++    return torch.cuda.CUDAGraph, torch.cuda.graph, torch.cuda.synchronize
++
++
++@requires_gpu
++@pytest.mark.parametrize("num_reqs", [1, 3, 4])
++@pytest.mark.parametrize("fallback", [False, True])
++def test_side_cache_graph_capture_matches_one_eager_pass(num_reqs, fallback):
++    """The TargetGraphs protocol on the production side-cache kernels:
++    eager -> warm-up -> capture -> replay (and, for a failed capture, the
++    eager fallback once more). Compare full tensors with one eager pass."""
++    ops, device = _TritonOps, torch.device(_GPU)
++    Graph, graph_ctx, sync = _graph_api()
++
++    def build():
++        sim = _Sim(
++            ops,
++            device,
++            num_reqs=num_reqs,
++            cap=_ring_capacity(832),
++            comp_page=8,
++            max_groups=64,
++            seed=40 + num_reqs,
++        )
++        for r in range(num_reqs):
++            _prefill(sim, r, 45 + r, chunks=[19])
++            sim.step([(r, K + 1, 6 - r)])
++        return sim
++
++    ref, cap_sim = build(), build()
++    state = ref.gen.get_state()
++    plan = [(r, K + 1, 2) for r in range(num_reqs)]
++    ref.step(plan, pad_tokens=8)
++    ref.check("eager reference")
++
++    # Same inputs for the captured sim: build metadata once, then the protocol.
++    cap_sim.gen.set_state(state)
++    keys, qsl, seq_lens = [], [0], []
++    for r, n, _ in plan:
++        start = cap_sim.length(r)
++        keys += [cap_sim.key() for _ in range(n)]
++        qsl.append(qsl[-1] + n)
++        seq_lens.append(start + n)
++    num_tokens = qsl[-1] + 8
++    raw = torch.zeros(num_tokens, 1, D, dtype=torch.bfloat16)
++    raw[: len(keys), 0] = torch.stack(keys)
++    raw = raw.to(device)
++    reqs = [r for r, _, _ in plan]
++    ring_table = cap_sim.ring_table[reqs]
++    ring_meta = cap_sim.ring_b.build(
++        0, cap_sim._common(qsl, seq_lens, num_tokens, ring_table)
++    )
++    comp_meta = cap_sim.comp_b.build(
++        0, cap_sim._common(qsl, seq_lens, num_tokens, cap_sim.comp_table[reqs])
++    )
++
++    def run():
++        pooled = ops.compress(
++            raw,
++            cap_sim.ring,
++            ring_table,
++            ring_meta.token_to_req,
++            ring_meta.query_start_loc,
++            ring_meta.logical_positions,
++            comp_meta.slot_mapping,
++        )
++        ops.store(cap_sim.comp, comp_meta.slot_mapping, pooled)
++        ops.store(cap_sim.ring, ring_meta.slot_mapping, raw)
++
++    run()  # eager pass
++    sync()
++    run()  # warm-up
++    sync()
++    graph = Graph()
++    with graph_ctx(graph):
++        run()
++    graph.replay()
++    sync()
++    if fallback:
++        run()
++        sync()
++    graph.replay()  # a second replay of the same step
++    sync()
++    for r, n, accepted in plan:
++        cap_sim.committed[r] += keys[
++            qsl[reqs.index(r)] : qsl[reqs.index(r)] + 1 + accepted
++        ]
++    assert torch.equal(ref.ring.cpu(), cap_sim.ring.cpu())
++    assert torch.equal(ref.comp.cpu(), cap_sim.comp.cpu())
++    cap_sim.check("captured")
++
++
++# --------------------------------------------------------------------------
++# Test 4: short-context and the 2,048 + 3 boundary.
++# --------------------------------------------------------------------------
++
++BUDGET = 2048
++
++
++def _selected_tokens_reference(logits, visible, positions):
++    """Production torch top-k + reference expansion -> attended token sets."""
++    from tests.models.qwen4_exp.test_qsa_reference import (
++        _expand_qsa_indices_reference,
++    )
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++    out = torch.empty(logits.shape[0], BUDGET // CR, dtype=torch.int32)
++    qi._qsa_topk_torch(logits, visible, BUDGET // CR, out)
++    seq = positions + 1
++    expanded = _expand_qsa_indices_reference(out, positions, seq, CR, BUDGET)
++    return [set(x for x in row.tolist() if x >= 0) for row in expanded]
++
++
++@pytest.mark.parametrize("context", [2047, 2048, 2049, 2050, 2051, 2052, 2053, 2056])
++def test_boundary_selection_covers_all_tokens_up_to_2051(context):
++    """Row at position ``context - 1``: through 2,051 visible tokens (512
++    groups + a 3-token tail) the selection is the whole causal prefix, so
++    sparse attention must equal dense; from 2,052 one group drops out."""
++    gen = torch.Generator().manual_seed(context)
++    positions = torch.tensor([context - 1])
++    visible = torch.minimum((positions + 1) // CR, torch.tensor([context]) // CR)
++    logits = torch.rand(1, max(int(visible[0]), 1), generator=gen)
++    (tokens,) = _selected_tokens_reference(logits, visible.to(torch.int32), positions)
++    if context <= BUDGET + CR - 1:
++        assert tokens == set(range(context))
++    else:
++        assert len(tokens) == BUDGET + context % CR
++        assert tokens < set(range(context))
++
++
++@pytest.mark.parametrize("first", [2044, 2045, 2046, 2047])
++def test_boundary_speculative_rows_straddle_2051(first):
++    """Eight verify rows across the boundary: rows at or below 2,051 visible
++    tokens attend everything; later rows of the same step select."""
++    rows = torch.arange(first, first + K + 1)
++    seq = torch.full_like(rows, first + K + 1)
++    visible = torch.minimum((rows + 1) // CR, seq // CR).to(torch.int32)
++    logits = torch.rand(len(rows), int(visible.max()))
++    sets = _selected_tokens_reference(logits, visible, rows)
++    for pos, tokens in zip(rows.tolist(), sets):
++        if pos + 1 <= BUDGET + CR - 1:
++            assert tokens == set(range(pos + 1)), pos
++        else:
++            assert len(tokens) == BUDGET + (pos + 1) % CR, pos
++
++
++@requires_gpu
++@pytest.mark.parametrize("decode_query_len", [1, K + 1])
++@pytest.mark.parametrize("context", [2049, 2051, 2052, 2056])
++def test_boundary_sparse_attention_equals_dense_through_2051(
++    monkeypatch, decode_query_len, context
++):
++    """Production decode selection + expansion + sparse attention on one card.
++    Rows with <= 2,051 visible tokens must match dense causal attention; rows
++    past it must match the sparse reference over their own selection."""
++    from tests.models.qwen4_exp.test_qsa_reference import (
++        _qsa_sparse_paged_attention_reference,
++    )
++    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++    monkeypatch.setenv("B70_QSA_TOPK", "torch")
++    dev = torch.device(_GPU)
++    torch.manual_seed(context + decode_query_len)
++    heads, kv_heads, hd, idx_heads, idx_hd = 6, 1, 256, 4, 128
++    page = 64
++    pages = math.ceil((context + 1) / page) + 1
++    rows = decode_query_len
++    positions = torch.arange(context - rows, context, device=dev)
++    kv = torch.randn(pages, page, kv_heads, 2 * hd, dtype=torch.bfloat16, device=dev)
++    k_cache, v_cache = kv.split(hd, dim=-1)
++    block_table = torch.randperm(pages, device=dev)[None].to(torch.int32)
++    comp_page = page // CR
++    comp = torch.randn(pages, comp_page, 1, idx_hd, dtype=torch.bfloat16, device=dev)
++    q_idx = torch.randn(rows, idx_heads, idx_hd, dtype=torch.bfloat16, device=dev)
++    visible = torch.minimum(
++        (positions + 1) // CR, torch.tensor(context, device=dev) // CR
++    ).to(torch.int32)
++    blocks = torch.empty(rows, BUDGET // CR, dtype=torch.int32, device=dev)
++    qi.qsa_select_paged_decode(
++        q_idx, comp, block_table, visible, BUDGET, CR, rows, blocks
++    )
++    logical = torch.empty(rows, BUDGET + CR - 1 + 1, dtype=torch.int32, device=dev)
++    qi.expand_qsa_block_indices(blocks, positions, visible, CR, BUDGET, logical)
++    q = torch.randn(rows, heads, hd, dtype=torch.bfloat16, device=dev)
++    gate = torch.zeros_like(q)  # sigmoid(0) = 1/2 on both sides
++    t2r = torch.zeros(rows, dtype=torch.int32, device=dev)
++    actual = qsa_ops.qsa_sparse_paged_attention(
++        q,
++        k_cache,
++        v_cache,
++        logical,
++        block_table,
++        t2r,
++        use_prefill_config=False,
++        output_gate=gate,
++    )
++    for row, pos in enumerate(positions.tolist()):
++        sel = logical[row, : BUDGET + CR - 1]
++        sel_set = set(x for x in sel.tolist() if x >= 0)
++        if pos + 1 <= BUDGET + CR - 1:
++            assert sel_set == set(range(pos + 1))
++            dense = torch.arange(pos + 1, device=dev, dtype=torch.int32)
++            idx = torch.full((1, BUDGET + CR - 1), -1, dtype=torch.int32, device=dev)
++            idx[0, : pos + 1] = dense
++        else:
++            assert len(sel_set) == BUDGET + (pos + 1) % CR
++            idx = sel[None]
++        expected = (
++            _qsa_sparse_paged_attention_reference(
++                q[row : row + 1],
++                k_cache,
++                v_cache,
++                idx,
++                block_table,
++                t2r[:1],
++                hd**-0.5,
++            )
++            * 0.5
++        )
++        torch.testing.assert_close(
++            actual[row : row + 1], expected, rtol=2e-2, atol=2e-2
++        )
++
++
++# --------------------------------------------------------------------------
++# Test 5: selector identity under exact ties.
++# --------------------------------------------------------------------------
++
++
++def _tie_logits(rows, width, visible, positive, gen):
++    """ReLU-shaped scores: ``positive`` columns > 0, the rest exactly 0."""
++    logits = torch.zeros(rows, width)
++    for r in range(rows):
++        cols = torch.randperm(int(visible[r]), generator=gen)[:positive]
++        logits[r, cols] = torch.rand(len(cols), generator=gen) + 0.01
++    logits[:, int(visible.max()) :] = 123.0  # garbage beyond visible
++    return logits
++
++
++@pytest.mark.parametrize("positive", [0, 100, 511, 512, 600])
++def test_native_det_repair_reproduces_torch_exactly(monkeypatch, positive):
++    """An adversarial 'native' that resolves ties toward the HIGHEST column
++    and returns its picks unsorted; native_det must turn it into the torch
++    selector's output, element for element. The rows with fewer positive
++    scores than k are exactly the tie rows."""
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++    k = 512
++    gen = torch.Generator().manual_seed(positive)
++    visible = torch.tensor([700, 512, 300, 1000, 513], dtype=torch.int32)
++    logits = _tie_logits(5, 1024, visible, positive, gen)
++
++    def adversarial(logits, visible_blocks, block_topk, out):
++        rows, width = logits.shape
++        cols = torch.arange(width, dtype=torch.int64)
++        for r in range(rows):
++            v = int(visible_blocks[r])
++            key = (
++                logits[r, :v].double() * 4096 + cols[:v].double() / 4096
++            )  # high col wins
++            n = min(block_topk, v)
++            pick = torch.topk(key, n).indices
++            pick = pick[torch.randperm(n, generator=gen)]
++            out[r, :n] = pick.to(torch.int32)
++            out[r, n:] = -1
++
++    monkeypatch.setenv("B70_QSA_TOPK", "native_det")
++    monkeypatch.setattr(qi, "_qsa_topk_native", adversarial)
++    got = torch.empty(5, k, dtype=torch.int32)
++    qi._topk(logits, visible, 4 * k, 4, got, torch.empty(0, dtype=torch.uint8))
++    want = torch.empty_like(got)
++    qi._qsa_topk_torch(logits, visible, k, want)
++    assert torch.equal(got, want)
++
++    raw = torch.empty_like(got)
++    adversarial(logits, visible, k, raw)
++    tied = qsa_debug.boundary_tie_rows(logits, visible, raw, k)
++    assert tied.tolist() == [(int(v) > k and positive < k) for v in visible]
++
++
++def test_torch_selector_breaks_ties_to_the_lower_column():
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++    logits = torch.zeros(1, 700)
++    out = torch.empty(1, 512, dtype=torch.int32)
++    qi._qsa_topk_torch(logits, torch.tensor([700]), 512, out)
++    assert out[0].tolist() == list(range(512))
++
++
++@requires_gpu
++@pytest.mark.parametrize("positive", [0, 200, 600])
++def test_selector_identity_native_torch_native_det(monkeypatch, positive):
++    """All-zero or partly-zero indexer scores with distinct V per token.
++    Torch and native_det must agree exactly (ids and attention output) across
++    repeated launches and a graph replay. Native is compared too: a mismatch is
++    reported as XFAIL ('native tie order differs'), not hidden."""
++    from tests.models.qwen4_exp.test_qsa_reference import (
++        _qsa_sparse_paged_attention_reference,
++    )
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qi
++
++    if not hasattr(torch.ops._C, "top_k_per_row_decode"):
++        pytest.skip("native top-k op not registered")
++    dev = torch.device(_GPU)
++    rows, k, width = 8, 512, 1024
++    gen = torch.Generator().manual_seed(positive)
++    visible = torch.tensor([900] * rows, dtype=torch.int32)
++    logits = _tie_logits(rows, width, visible, positive, gen).to(dev)
++    visible = visible.to(dev)
++
++    def select(mode):
++        monkeypatch.setenv("B70_QSA_TOPK", mode)
++        out = torch.empty(rows, k, dtype=torch.int32, device=dev)
++        qi._topk(
++            logits,
++            visible,
++            4 * k,
++            4,
++            out,
++            torch.empty(1 << 20, dtype=torch.uint8, device=dev),
++        )
++        return out
++
++    t = select("torch")
++    for _ in range(3):
++        assert torch.equal(select("native_det"), t)
++    natives = [select("native") for _ in range(3)]
++    native_repeatable = all(torch.equal(natives[0], n) for n in natives[1:])
++
++    # Graph replay of the native selector (decode path is graph-captured).
++    Graph, graph_ctx, sync = _graph_api()
++    monkeypatch.setenv("B70_QSA_TOPK", "native")
++    out_g = torch.empty(rows, k, dtype=torch.int32, device=dev)
++    ws = torch.empty(1 << 20, dtype=torch.uint8, device=dev)
++    qi._topk(logits, visible, 4 * k, 4, out_g, ws)
++    g = Graph()
++    with graph_ctx(g):
++        qi._topk(logits, visible, 4 * k, 4, out_g, ws)
++    g.replay()
++    sync()
++    replay_equal = torch.equal(out_g, natives[0])
++
++    # Attention consequence: distinct V per token; same multiset of scores
++    # but different blocks gives different output.
++    hd, page = 256, 64
++    pages = (4 * width) // page + 1
++    kv = torch.randn(pages, page, 1, 2 * hd, dtype=torch.bfloat16, device=dev)
++    k_cache, v_cache = kv.split(hd, dim=-1)
++    table = torch.arange(pages, device=dev, dtype=torch.int32)[None]
++    q = torch.randn(1, 6, hd, dtype=torch.bfloat16, device=dev)
++
++    def attend(blocks_row):
++        tok = (
++            (
++                blocks_row[blocks_row >= 0].long()[:, None] * 4
++                + torch.arange(4, device=dev)
++            )
++            .flatten()
++            .to(torch.int32)
++        )
++        idx = torch.full((1, 4 * k + 3), -1, dtype=torch.int32, device=dev)
++        idx[0, : tok.numel()] = tok
++        return _qsa_sparse_paged_attention_reference(
++            q,
++            k_cache,
++            v_cache,
++            idx,
++            table,
++            torch.zeros(1, dtype=torch.int32, device=dev),
++            hd**-0.5,
++        )
++
++    differ_rows = [
++        r
++        for r in range(rows)
++        if not torch.equal(torch.sort(natives[0][r]).values, torch.sort(t[r]).values)
++    ]
++    attn_delta = max(
++        (
++            float((attend(natives[0][r]) - attend(t[r])).abs().max())
++            for r in differ_rows
++        ),
++        default=0.0,
++    )
++    print(
++        f"QSA-Q selector: positive={positive} native_repeatable={native_repeatable} "
++        f"native_graph_replay_equal={replay_equal} rows_native_set_differs="
++        f"{len(differ_rows)}/{rows} max_attention_delta={attn_delta:.4g}"
++    )
++    assert native_repeatable and replay_equal
++    if differ_rows:
++        pytest.xfail(
++            f"native tie order differs from torch on {len(differ_rows)} rows "
++            f"(max attention delta {attn_delta:.3g})"
++        )
++
++
++def test_ring_hook_runs_inside_the_metadata_builder(monkeypatch):
++    """B70_QSA_DEBUG_RING is wired into QSAMetadataBuilder.build."""
++    monkeypatch.setattr(qsa_debug, "RING_MODE", "raise")
++    monkeypatch.setattr(qsa_debug, "_ring_contracts", {})
++    sim = _Sim(
++        _RefOps,
++        torch.device("cpu"),
++        num_reqs=1,
++        cap=16,
++        comp_page=8,
++        max_groups=32,
++        seed=21,
++    )
++    sim.step([(0, 6, None)])  # positions 0..5
++    sim.committed[0] += [sim.key() for _ in range(4)]  # pretend 6..9 ran elsewhere
++    with pytest.raises(qsa_debug.QSARingContractError, match="missing"):
++        sim.step([(0, 1, None)])  # starts at 10, ring stops at 5
++
++
++def test_dump_hook_writes_logical_rows(tmp_path, monkeypatch):
++    monkeypatch.setattr(qsa_debug, "DUMP_DIR", str(tmp_path))
++    monkeypatch.setattr(qsa_debug, "DUMP_LAYERS", frozenset({3}))
++    sim = _Sim(
++        _RefOps,
++        torch.device("cpu"),
++        num_reqs=1,
++        cap=16,
++        comp_page=8,
++        max_groups=32,
++        seed=22,
++    )
++    _, comp_meta = sim.step([(0, 37, None)])
++    selected = torch.arange(37 * 4, dtype=torch.int32).view(37, 4)
++    qsa_debug.dump_prefill_state(
++        "model.layers.3.self_attn.indexer.k_cache", comp_meta, sim.comp, selected
++    )
++    qsa_debug.dump_prefill_state(
++        "model.layers.4.self_attn.indexer.k_cache", comp_meta, sim.comp, selected
++    )
++    (f,) = list(tmp_path.glob("qsa-L03-*.pt"))
++    d = torch.load(f, weights_only=False)
++    (req,) = d["requests"]
++    assert req["seq_len"] == 37 and req["compressed"].shape == (9, D)
++    truth = torch.stack(sim.committed[0][:36]).float().view(9, CR, D).mean(1)
++    assert torch.equal(req["compressed"], truth)
++    assert req["last_row_selected"].tolist() == selected[36].tolist()
+diff --git a/tools/b70_qsa/qsa_engine_lifecycle.py b/tools/b70_qsa/qsa_engine_lifecycle.py
+new file mode 100644
+index 0000000000..6f41219ae6
+--- /dev/null
++++ b/tools/b70_qsa/qsa_engine_lifecycle.py
+@@ -0,0 +1,310 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++"""B70-QSA-Q test 2: prefix / offload lifecycle of a running sparse engine.
++
++Drives a dev engine over HTTP and compares, for the same token prompt reached
++through different cache paths, (a) the greedy continuation with top-5
++logprobs and (b) the QSA compressed-key rows the engine dumps for that prompt
++(``B70_QSA_DEBUG_DUMP``). Paths:
++
++  cold        fresh cache_salt, nothing cached
++  gpu_hit     same salt again: GPU prefix hit
++  cpu_reload  after filler traffic evicts the GPU copy: CPU-tier reload
++  junction    a prompt sharing an unaligned prefix with the cold one, vs its
++              own cold run
++  cancel      a streamed request cancelled after its first chunk, its slot
++              reused, then the prompt again
++  interleave  a long decode runs while a new prompt goes cold, then hits
++
++Engine env for this script (all default off):
++  B70_QSA_DEBUG_DUMP=<dir>  B70_QSA_DEBUG_DUMP_LAYERS=0,23,47
++  B70_QSA_DEBUG_RING=warn   (check `journalctl -u ... | grep B70-QSA-DEBUG`)
++  B70_QSA_TOPK=torch        (selection must be deterministic to compare)
++
++Run it twice, once against the def with "disable_eagle_block_drop": true in
++--speculative-config and once without, and pass --label accordingly. The
++EAGLE trailing-block drop reaches every KV group on our tree (the DFlash draft
++group is not flagged is_eagle_group), QSA ring and compressed groups included.
++Exit status is non-zero if any comparison fails.
++"""
++
++import argparse
++import json
++import re
++import threading
++import time
++import urllib.request
++import uuid
++from pathlib import Path
++
++import torch
++
++
++def post(base, path, body, timeout=1800):
++    req = urllib.request.Request(
++        base + path,
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++    )
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.loads(r.read())
++
++
++def get(base, path):
++    with urllib.request.urlopen(base + path, timeout=60) as r:
++        return r.read().decode()
++
++
++METRIC = re.compile(
++    r"^(vllm:(?:prefix_cache_\w+|external_prefix_cache_\w+|"
++    r"prompt_tokens_by_source\w*))(\{[^}]*\})?\s+([0-9.eE+-]+)$"
++)
++
++
++def metrics(base):
++    out = {}
++    for line in get(base, "/metrics").splitlines():
++        m = METRIC.match(line)
++        if m:
++            labels = re.sub(r'(model_name|engine)="[^"]*",?', "", m.group(2) or "")
++            out[m.group(1) + labels] = float(m.group(3))
++    return out
++
++
++def delta(after, before):
++    return {
++        k: after[k] - before.get(k, 0.0) for k in after if after[k] - before.get(k, 0.0)
++    }
++
++
++class Engine:
++    def __init__(self, base, dump_dir):
++        self.base, self.dump = base, Path(dump_dir)
++        self.model = json.loads(get(base, "/v1/models"))["data"][0]["id"]
++
++    def tokens(self, n, seed):
++        words = []
++        i = 0
++        while len(words) < n * 2:
++            words.append(
++                f"Record {seed}-{i}: item {i * 7919 % 10007} weighs "
++                f"{i * 104729 % 997} units and sits beside shelf {i % 61}."
++            )
++            i += 1
++        ids = post(
++            self.base, "/tokenize", {"model": self.model, "prompt": " ".join(words)}
++        )["tokens"]
++        assert len(ids) >= n, (len(ids), n)
++        return ids[:n]
++
++    def complete(self, ids, salt, max_tokens=24):
++        before_files = set(self.dump.glob("qsa-L*.pt")) if self.dump.exists() else set()
++        before = metrics(self.base)
++        body = {
++            "model": self.model,
++            "prompt": ids,
++            "max_tokens": max_tokens,
++            "temperature": 0.0,
++            "logprobs": 5,
++            "cache_salt": salt,
++            "ignore_eos": True,
++        }
++        res = post(self.base, "/v1/completions", body)
++        time.sleep(0.5)
++        files = sorted(set(self.dump.glob("qsa-L*.pt")) - before_files)
++        choice = res["choices"][0]
++        lp = choice["logprobs"]
++        return {
++            "tokens": lp["tokens"],
++            "top": [
++                sorted(d.items(), key=lambda kv: -kv[1]) for d in lp["top_logprobs"]
++            ],
++            "metrics": delta(metrics(self.base), before),
++            "dumps": self.load_dumps(files, len(ids)),
++        }
++
++    @staticmethod
++    def load_dumps(files, seq_len):
++        found = {}
++        for f in files:
++            d = torch.load(f, weights_only=False)
++            for r in d["requests"]:
++                if r["seq_len"] == seq_len:
++                    found[d["layer"]] = r  # last matching step wins
++        return found
++
++
++def compare_tokens(base, cand, margin=0.1):
++    for i, (a, b) in enumerate(zip(base["tokens"], cand["tokens"])):
++        if a == b:
++            continue
++        top = base["top"][i]
++        near = len(top) > 1 and top[0][1] - top[1][1] < margin
++        in_top = b in [t for t, _ in top]
++        return {
++            "exact": False,
++            "first_divergence": i,
++            "near_tie": near,
++            "candidate_in_base_top5": in_top,
++            "ok": near and in_top,
++        }
++    ok = len(base["tokens"]) == len(cand["tokens"])
++    return {"exact": ok, "ok": ok}
++
++
++def compare_dumps(base, cand, hit_tokens=0, atol=0.05):
++    out, ok = {}, True
++    if not base["dumps"] or not cand["dumps"]:
++        return {"ok": False, "why": "no dump for this prompt (engine env?)"}
++    for layer, b in base["dumps"].items():
++        c = cand["dumps"].get(layer)
++        if c is None:
++            out[layer] = "missing"
++            ok = False
++            continue
++        rb, rc = b["compressed"], c["compressed"]
++        if rb.shape != rc.shape:
++            out[layer] = f"shape {tuple(rb.shape)} vs {tuple(rc.shape)}"
++            ok = False
++            continue
++        diff = (rb - rc).abs().amax(dim=1)
++        g = hit_tokens // 4
++        bad = (diff > atol).nonzero().flatten().tolist()
++        zero_rows = int((rc.abs().amax(dim=1) == 0).sum())
++        sb = set(b["last_row_selected"].tolist()) - {-1}
++        sc = set(c["last_row_selected"].tolist()) - {-1}
++        jac = len(sb & sc) / max(1, len(sb | sc))
++        out[layer] = {
++            "rows": rb.shape[0],
++            "max_diff_reused_prefix": float(diff[:g].max()) if g else None,
++            "max_diff_all": float(diff.max()),
++            "rows_over_atol": bad[:10],
++            "num_rows_over_atol": len(bad),
++            "all_zero_rows": zero_rows,
++            "last_row_selection_jaccard": round(jac, 4),
++        }
++        ok = ok and not bad and zero_rows == 0
++    out["ok"] = ok
++    return out
++
++
++def hit_tokens(m):
++    """Cached prompt tokens from the per-source counter, if exposed."""
++    total = 0.0
++    for k, v in m.items():
++        if "prompt_tokens_by_source" in k and ("cache" in k or "external" in k):
++            total += v
++    return int(total)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--base", default="http://127.0.0.1:8001")
++    ap.add_argument("--dump-dir", required=True)
++    ap.add_argument("--label", required=True)
++    ap.add_argument("--prompt-tokens", type=int, default=6150)  # not 832-aligned
++    ap.add_argument("--junction-tokens", type=int, default=4101)
++    ap.add_argument(
++        "--evict-tokens",
++        type=int,
++        default=420000,
++        help="filler volume; must exceed the engine's GPU KV tokens",
++    )
++    ap.add_argument("--filler-tokens", type=int, default=12000)
++    ap.add_argument("--out", default=None)
++    ap.add_argument("--skip", default="", help="comma list of paths to skip")
++    a = ap.parse_args()
++    eng = Engine(a.base, a.dump_dir)
++    skip = set(a.skip.split(","))
++    salt = f"qsaq-{uuid.uuid4().hex[:8]}"
++    P = eng.tokens(a.prompt_tokens, 1)
++    report = {"label": a.label, "prompt_tokens": len(P), "paths": {}}
++
++    def record(name, base, cand, expect_hit=True):
++        h = hit_tokens(cand["metrics"])
++        entry = {
++            "metrics": cand["metrics"],
++            "hit_tokens_reported": h,
++            "tokens": compare_tokens(base, cand),
++            "dumps": compare_dumps(base, cand, h),
++        }
++        if expect_hit and not cand["metrics"]:
++            entry["warning"] = "no prefix-cache metric moved; did the hit happen?"
++        report["paths"][name] = entry
++        print(
++            name,
++            json.dumps({k: v for k, v in entry.items() if k != "metrics"}, default=str)[
++                :600
++            ],
++            flush=True,
++        )
++
++    cold = eng.complete(P, salt)
++    report["paths"]["cold"] = {
++        "metrics": cold["metrics"],
++        "dump_layers": sorted(cold["dumps"]),
++    }
++    if "gpu_hit" not in skip:
++        record("gpu_hit", cold, eng.complete(P, salt))
++    if "cpu_reload" not in skip:
++        n = 0
++        while n < a.evict_tokens:
++            eng.complete(
++                eng.tokens(a.filler_tokens, 1000 + n),
++                f"fill-{uuid.uuid4().hex}",
++                max_tokens=1,
++            )
++            n += a.filler_tokens
++        record("cpu_reload", cold, eng.complete(P, salt))
++    if "junction" not in skip:
++        J = P[: a.junction_tokens] + eng.tokens(1500, 2)
++        j_cold = eng.complete(J, f"{salt}-jcold")
++        record("junction", j_cold, eng.complete(J, salt))
++    if "cancel" not in skip:
++        body = {
++            "model": eng.model,
++            "prompt": eng.tokens(30000, 3),
++            "max_tokens": 200,
++            "stream": True,
++            "cache_salt": f"{salt}-cancel",
++        }
++        req = urllib.request.Request(
++            a.base + "/v1/completions",
++            data=json.dumps(body).encode(),
++            headers={"Content-Type": "application/json"},
++        )
++        with urllib.request.urlopen(req, timeout=1800) as r:
++            r.readline()  # first chunk, then drop the connection
++        record("cancel_then_hit", cold, eng.complete(P, salt))
++    if "interleave" not in skip:
++        Q = eng.tokens(a.prompt_tokens + 401, 4)
++        stop = threading.Event()
++
++        def long_decode():
++            while not stop.is_set():
++                eng.complete(eng.tokens(2000, 5), f"{salt}-bg", max_tokens=400)
++
++        t = threading.Thread(target=long_decode, daemon=True)
++        t.start()
++        time.sleep(2)
++        q_cold = eng.complete(Q, f"{salt}-q")
++        q_hit = eng.complete(Q, f"{salt}-q")
++        stop.set()
++        record("interleave_hit", q_cold, q_hit)
++    fails = [
++        k
++        for k, v in report["paths"].items()
++        if isinstance(v, dict)
++        and "tokens" in v
++        and not (v["tokens"]["ok"] and v["dumps"].get("ok"))
++    ]
++    report["failed"] = fails
++    text = json.dumps(report, indent=1, default=str)
++    if a.out:
++        Path(a.out).write_text(text)
++    print("FAILED:" if fails else "ALL OK", fails)
++    raise SystemExit(1 if fails else 0)
++
++
++if __name__ == "__main__":
++    main()

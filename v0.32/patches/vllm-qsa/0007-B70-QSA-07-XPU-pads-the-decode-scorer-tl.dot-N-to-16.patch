@@ -1,0 +1,40 @@
+From d92021e91ca87951257154faa31c29717796c648 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 20:24:41 +0000
+Subject: [PATCH 07/26] B70-QSA-07: XPU pads the decode scorer tl.dot N to 16
+ by default
+
+Intel Triton 3.8.0+xpu rejects tl.dot with N < 16 at compile time
+("Input shapes should have M >= 1, N >= 16 and K >= 16"); a plain decode
+has N = 4, so test_qsa_decode_selection_correctness and
+test_qsa_split_selection_correctness failed to compile on B70 (G1 2026-10-25).
+The existing B70_QSA_MIN_DOT_N padding (masked rows) is now 16 by default on
+XPU; the variable still raises it. CUDA unchanged.
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 262e5321ac..386ea0dfd3 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -23,13 +23,14 @@ _DECODE_BLOCK_N = 64
+ def _min_dot_n() -> int:
+     """B70-QSA: floor for the decode scorer's tl.dot N (query rows x heads).
+ 
+-    1 compiles the original kernel. Intel Triton has no dot minimum: N < 16
+-    (4 at a plain decode) falls back from DPAS to FMA, correct but slower.
+-    B70_QSA_MIN_DOT_N (XPU only, e.g. 16) pads N into DPAS range for the
+-    tuning sweep; padded rows are masked.
++    1 compiles the original kernel (CUDA). Intel Triton 3.8.0+xpu rejects
++    tl.dot with N < 16 at compile time ("Input shapes should have M >= 1,
++    N >= 16 and K >= 16"; measured on B70, G1 2026-10-25), and a plain decode
++    has N = 4. So XPU pads N to 16 by default; padded rows are masked.
++    B70_QSA_MIN_DOT_N (XPU only) overrides, e.g. 32 for the tuning sweep.
+     """
+     if current_platform.is_xpu():
+-        return max(1, int(os.environ.get("B70_QSA_MIN_DOT_N", "1")))
++        return max(16, int(os.environ.get("B70_QSA_MIN_DOT_N", "16")))
+     return 1
+ 
+ 

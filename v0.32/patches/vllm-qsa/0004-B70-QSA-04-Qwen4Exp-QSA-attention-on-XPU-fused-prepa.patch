@@ -1,0 +1,163 @@
+From 5ee621efbca66256ea53d05c35b43d6144523973 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 19:53:38 +0000
+Subject: [PATCH 04/26] B70-QSA-04: Qwen4Exp QSA attention on XPU: fused
+ prepare, portable unfused path
+
+- use_fused_qk_norm_rope_gate accepts XPU, as Qwen3NextAttention already does
+  (the same Triton fused_qk_rmsnorm_rope_gate); with the 128/64 indexer shape
+  this also enables the fused qsa_prepare launch (indexer norm/RoPE/ring store/
+  compression + main QK-norm/RoPE/gate + main K/V write) on XPU.
+- B70_QSA_FUSED_PREPARE=0 forces the unfused kernels (A/B, fallback).
+- Unfused path off CUDA: gemma_rmsnorm via the GemmaRMSNorm module instead of
+  flashinfer, RoPE via forward_native instead of forward_cuda (vllm_flash_attn).
+- QSAIndexer._metadata ran a host torch.equal whenever positions were not
+  is_cuda, which includes XPU: a sync inside graph capture. Now CPU-only.
+- One-time log line with the chosen paths.
+---
+ vllm/models/qwen4_exp/nvidia/indexer_qsa.py | 34 +++++++++++++++++----
+ vllm/models/qwen4_exp/nvidia/qsa.py         | 19 +++++++++++-
+ 2 files changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+index c8ffa0dbfb..4e67d892f3 100644
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
++from vllm.platforms import current_platform
+ 
+ from ..common.qsa_cache import (
+     QSACompressedKeyCache,
+@@ -53,7 +54,14 @@ def apply_qsa_rope(
+         )
+         return tensor.reshape(shape)
+ 
+-    rotated = rotary_emb.apply_rotary_emb.forward_cuda(
++    # B70-QSA: forward_cuda imports vllm_flash_attn (CUDA-only); other
++    # platforms take the exact torch reference (unfused path only).
++    apply = (
++        rotary_emb.apply_rotary_emb.forward_cuda
++        if current_platform.is_cuda()
++        else rotary_emb.apply_rotary_emb.forward_native
++    )
++    rotated = apply(
+         tensor[..., :rotary_dim],
+         cos,
+         sin,
+@@ -61,6 +69,18 @@ def apply_qsa_rope(
+     return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
+ 
+ 
++def _qsa_gemma_rmsnorm(
++    norm: GemmaRMSNorm, x: torch.Tensor, weight: torch.Tensor, eps: float
++) -> torch.Tensor:
++    """Gemma RMSNorm: flashinfer on CUDA, the module's own dispatch elsewhere."""
++    if current_platform.is_cuda():
++        from flashinfer.norm import gemma_rmsnorm
++
++        return gemma_rmsnorm(x, weight, eps)
++    # B70-QSA: XPU/ROCm-less path, same GemmaRMSNorm math as the dense model.
++    return norm(x)
++
++
+ def _supports_fused_pre_indexer(
+     rotary_emb: nn.Module,
+     head_dim: int,
+@@ -225,7 +245,9 @@ class QSAIndexer(nn.Module):
+         )
+         if raw_split != compressed_split:
+             raise RuntimeError("QSA side-cache metadata batch splits disagree")
+-        if not raw.logical_positions.is_cuda and (
++        # B70-QSA: host-only consistency check. `not is_cuda` also matched
++        # XPU tensors, where torch.equal syncs and breaks graph capture.
++        if raw.logical_positions.device.type == "cpu" and (
+             not torch.equal(raw.logical_positions, compressed.logical_positions)
+         ):
+             raise RuntimeError("QSA side-cache metadata positions disagree")
+@@ -342,10 +364,9 @@ class QSAIndexer(nn.Module):
+             )
+         else:
+             # Unfused reference path
+-            from flashinfer.norm import gemma_rmsnorm
+-
+             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
+-            q = gemma_rmsnorm(
++            q = _qsa_gemma_rmsnorm(
++                self.q_layernorm,
+                 q.reshape(-1, self.index_head_dim),
+                 self.q_layernorm.weight,
+                 self.q_layernorm.variance_epsilon,
+@@ -375,7 +396,8 @@ class QSAIndexer(nn.Module):
+                 self.compress_ratio,
+                 rope_position_cache,
+             )
+-            compressed_keys = gemma_rmsnorm(
++            compressed_keys = _qsa_gemma_rmsnorm(
++                self.k_layernorm,
+                 pooled.reshape(-1, self.index_head_dim),
+                 self.k_layernorm.weight,
+                 self.k_layernorm.variance_epsilon,
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 9fb36673a5..2bd10ae1c8 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from collections.abc import Callable, Iterable
+ from typing import ClassVar, cast
+ 
+@@ -16,6 +17,7 @@ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheConfig, CacheDType
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention.attention import (
+     set_default_quant_scales,
+ )
+@@ -63,6 +65,8 @@ from ..common.qsa_cache import QSAForwardMetadata
+ from . import model
+ from .indexer_qsa import QSAIndexer
+ 
++logger = init_logger(__name__)
++
+ 
+ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
+     """Pack sharded Q/gate, K, V and replicated indexer Q/K in one GEMM."""
+@@ -450,10 +454,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             torch.float16,
+             torch.bfloat16,
+         )
++        # B70-QSA: XPU runs the same Triton fused_qk_rmsnorm_rope_gate that
++        # Qwen3NextAttention already enables there (qwen3_next.py).
+         self.use_fused_qk_norm_rope_gate = (
+             self.attn_output_gate
+             and getattr(self.rotary_emb, "is_neox_style", False)
+-            and current_platform.is_cuda()
++            and (current_platform.is_cuda() or current_platform.is_xpu())
+             and supports_dtype
+             and (text_only or supports_mrope)
+         )
+@@ -504,6 +510,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+                 self.kv_cache_torch_dtype != torch.uint8
+                 or current_platform.has_device_capability(89)
+             )
++            # B70-QSA: B70_QSA_FUSED_PREPARE=0 forces the unfused kernels
++            # (A/B and fallback if the fused launch misbehaves on a backend).
++            and os.environ.get("B70_QSA_FUSED_PREPARE", "1") != "0"
++        )
++        logger.info_once(
++            "B70-QSA: Qwen4Exp QSA attention on %s: fused_qk_norm_rope_gate=%s "
++            "fused_qsa_prepare=%s kv_cache_dtype=%s",
++            current_platform.device_name,
++            self.use_fused_qk_norm_rope_gate,
++            self.use_fused_qsa_prepare,
++            self.kv_cache_dtype,
+         )
+         self.fuse_indexer_projection = vllm_config.lora_config is None
+         if self.fuse_indexer_projection:

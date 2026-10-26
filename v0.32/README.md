@@ -4,8 +4,8 @@ The current line (configuration validated on 2026-10-24): vLLM **v0.32.0** with 
 from the 0.30 line, the 0.32-specific fixes below, and two of our upstream vLLM fixes cherry-picked. Speculative
 decoding is **DFlash2 with 7 draft tokens** (incoai's 0.6B block-diffusion drafter), async scheduling, 8 sequences,
 4096-token prefill chunks, a 128 GiB host-RAM KV tier in a private pinned pool and the INT8 PLE table on NVMe. This
-release is the **dense** attention variant (the checkpoint's QSA indexer is dropped); the sparse variant has its own
-slot below ([Sparse attention](#sparse-attention-qsa-in-preparation)).
+release is the **dense** attention variant (the checkpoint's QSA indexer is dropped); the sparse variant
+is described below ([Sparse attention](#sparse-attention-qsa), added in 0.32.0-b70.2: working, experimental, slower than dense).
 
 | | |
 |---|---|
@@ -249,21 +249,76 @@ The commands we ran, with our paths replaced by placeholders. Not run end to end
 Chat template: the examples use the checkpoint's own template. We serve a lightly modified one (thinking switches off
 on `enable_thinking=false` or a "none/off" effort); it is not included.
 
-## Sparse attention (QSA): in preparation
+## Sparse attention (QSA)
 
-Placeholder. The release above is the dense variant: the serve config drops the QSA indexer keys and the loaders skip
-the `self_attn.indexer` tensors, so the full-attention layers attend over the whole context. A sparse variant keeps the indexer and
-runs QSA on the vLLM Triton kernels. Nothing here is released or measured yet; this section, and the files below, will
-be filled when it is:
+**Status: working, experimental, slower than dense on multi-stream.** Release 0.32.0-b70.2 adds a second attention
+variant on top of the dense one. The checkpoint's QSA indexer is kept and the full-attention layers attend over the
+indexer's selection (a 2,048-token budget) with Triton kernels, instead of over the whole context. It boots on 4× B70,
+answers correctly, passes the gates and the long-context needles, and its output matches dense up to the selection
+budget. It is slower than dense: 0.74–0.81× on prefill and one-stream decode, 0.46–0.53× at 4–8 concurrent streams, with
+17 % less GPU KV (329K against 397K tokens). The dense series ([`patches/vllm/`](patches/vllm/), the release above) is
+unchanged from 0.32.0-b70.1 and stays the recommended configuration when throughput matters.
 
-| path | what it will hold |
+| | dense | sparse QSA | sparse / dense |
+|---|---|---|---|
+| decode, 1 stream (tok/s) | 169.3 | 125.0 | 0.74 |
+| decode, 4 concurrent (total tok/s) | 306.2 | 161.2 | 0.53 |
+| decode, 8 streams (total tok/s) | 605.5 | 281.4 / 279.7 | 0.46 |
+| prefill 8K / 32K / 131K (tok/s) | 6,305 / 6,114 / 4,641 | 5,096 / 4,635 / 3,456 | 0.81 / 0.76 / 0.74 |
+| GPU KV cache (tokens) | 397,309 | 329,287 | 0.83 |
+
+Same harness and host, one engine at a time, single runs, both with the patched oneCCL plugin
+([`serve-plugin.env`](engines/serve-plugin.env) / [`qsa-serve.env`](engines/qsa-serve.env)). Fidelity (identical to dense
+up to 2K tokens; beyond that about 1.7–2× dense's own run-to-run KL on a 12K-token document), the kernel-level
+comparison with Intel's SYCL kernel (labelled as kernel level), the gates, and what is not measured are in
+[docs/measurements/v0.32-qsa.md](../docs/measurements/v0.32-qsa.md).
+
+**What is in the add-on.** [`patches/vllm-qsa/`](patches/vllm-qsa/) is 26 patches, applied on top of
+[`patches/vllm/`](patches/vllm/) (that is, on fork tag `v0.32.0-b70.1`, `103f2f2eb9`); the fork branch is
+[`b70/v0.32.0-qsa-release`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-qsa-release). `scripts/check-series.sh --qsa`
+fails if the directory differs from a fresh export of it. Every patch is authored `Lumnus`; 0001 is the upstream
+vllm-project/vllm#60602 cherry-pick.
+
+| patches | what |
 |---|---|
-| `v0.32/patches/vllm-qsa/` | the sparse add-on series, on top of `v0.32/patches/vllm/` |
-| `v0.32/engines/qsa-serve.args`, `v0.32/engines/qsa-serve.env` | the sparse engine files, paired like `serve.args` / `serve.env` |
-| `v0.32/engines/serve-config-qsa.json` | the serve config that keeps the indexer keys |
-| `docs/measurements/v0.32-qsa.md` | sparse against dense on this line, same harness |
+| 0001–0009 | bring-up: FP8 QSA main KV on Ampere (upstream #60602, B70-QSA-01); block top-k on XPU with one dispatch function per indexer kernel; the sparse GQA and side-cache kernels and Qwen4Exp QSA attention (fused prepare, portable unfused path) on XPU; the raw-key ring widened to a whole group; kernel tests running on XPU; the decode scorer pads `tl.dot` N to 16 (Triton 3.8.0 refuses N < 16 at compile time); a chunked torch top-k (it ran out of memory on a long prefill) |
+| 0010–0014, 0020–0023, 0025 | tuning and measurement: one launch-override hook (`B70_QSA_TUNE`) for every QSA Triton kernel, step-trace wrapping for module-level functions, an XPU microbench and sweep, profiler bucket summary, `B70_QSA_EAGER_BREAK=0` (graph-capture arm), all-row checking against the torch reference, and the fixes the first sweeps exposed |
+| 0015, 0016, 0024 | `attn2` (`B70_QSA_ATTN_IMPL=attn2`): a sparse GQA kernel with no register spills on Xe2, its comparison bench, and its defaults from the sweep (tile 32 × 8 chunks, 256 GRF, one warp; the kernel refuses two warps at tile ≥ 32, where the IGC compiler crashes) |
+| 0017–0019, 0022 | qualification: off-by-default hooks for the QSA side caches, `B70_QSA_TOPK=native_det` (the native top-k with the torch selector's output), 148 side-cache state-contract tests and an engine lifecycle driver |
+| 0026 | a one-time log line naming the sparse attention implementation in use |
 
-Until then, use the dense release above.
+Off by default: `attn2` (`B70_QSA_ATTN_IMPL`, default `splitk`, the first kernel), `native_det` (`B70_QSA_TOPK`, default
+`auto`), the tuning hook, the graph-capture arm, the debug and dump hooks. The engine file turns on `attn2` and `native_det`.
+
+**Run it.** Build as in [Build and run](#build-and-run), with the add-on applied after the dense series:
+
+```bash
+git clone -b b70/v0.32.0-qsa-release https://github.com/Lumnus/vllm.git vllm-b70-0.32   # instead of the v0.32.0-b70.1 tag in step 2
+# or, in a clone of the dense tag:  git am v0.32/patches/vllm-qsa/*.patch
+```
+
+Make a second serve dir the same way as step 7, but copy [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json)
+over its `config.json` (the dense config plus `indexer_n_heads`, `indexer_kv_heads`, `indexer_head_dim`,
+`indexer_budget`, `indexer_compress_ratio` in `text_config`, so the 39 indexer tensors load; same JSON otherwise), then
+use [`engines/qsa-serve.args`](engines/qsa-serve.args) (the same flags as the dense `serve.args`) with
+[`engines/qsa-serve.env`](engines/qsa-serve.env). The first start compiles the QSA Triton kernels cold and takes
+longer than the dense one (7 min in our first boot, ~5 min with a warm cache).
+
+**Known issues (sparse).**
+
+1. **Slower than dense, most at multi-stream** (above). The cost sits in the indexer scorer and top-k, which grow with
+   rows × context; the tuned scorer configurations the sweeps found are not yet the defaults, and the deterministic
+   top-k falls back to a full-width torch sort at the full page-table width.
+2. **KV capacity −17 %** against dense (QSA side caches, the raw-key ring; vLLM warns that the QSA state backend's
+   `kernel_block_size=16` is not fully optimised).
+3. **Both variants are run-to-run nondeterministic from about token 512**, so bit-level comparison gates fail on either;
+   fidelity was measured with KL against a same-engine floor instead.
+4. **Prefill at 262K**: the first Triton kernel, run on Intel's main-branch Triton, beats `attn2` there (15.6 against
+   17.6 ms per layer, kernel level); the release uses Triton 3.8.0.
+5. **No multi-day run**, no task-level quality comparison with dense, one host, Intel AutoRound only
+   ([measurements, what this does not show](../docs/measurements/v0.32-qsa.md#5-what-this-does-not-show)).
+6. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); do not serve it.
+   `native_det` is the qualified native mode.
 
 ## Known issues (0.32)
 

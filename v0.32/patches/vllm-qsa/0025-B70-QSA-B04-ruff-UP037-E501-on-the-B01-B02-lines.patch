@@ -1,0 +1,39 @@
+From ccda610301e3da5dc42a9c92d855b219856d4247 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:49:34 +0000
+Subject: [PATCH 25/26] B70-QSA-B04: ruff (UP037, E501) on the B01/B02 lines
+
+---
+ benchmarks/kernels/bench_qwen4_qsa_xpu.py          | 2 +-
+ vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py | 5 ++++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/benchmarks/kernels/bench_qwen4_qsa_xpu.py b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+index b12b3719db..25810a21f3 100644
+--- a/benchmarks/kernels/bench_qwen4_qsa_xpu.py
++++ b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+@@ -442,7 +442,7 @@ def ref_logits(p: Problem, rows: list[int]) -> torch.Tensor:
+     return out
+ 
+ 
+-def _check_rows(p: "Problem", sample: int, extra: set[int]) -> list[int]:
++def _check_rows(p: Problem, sample: int, extra: set[int]) -> list[int]:
+     """Rows to check. B70_BENCH_CHECK_ROWS=all checks every row against the torch
+     reference (slow; for correctness runs); an integer N samples N rows."""
+     want = os.environ.get("B70_BENCH_CHECK_ROWS", "")
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+index f40ea52de8..ca8a118087 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py
+@@ -119,7 +119,10 @@ def _load() -> dict[str, dict[str, Any]]:
+             logger.warning_once("B70-QSA: B70_QSA_TUNE ignored off XPU")
+             parsed = {}
+         if parsed:
+-            logger.info_once("B70-QSA: XPU launch overrides active: %s", json.dumps(parsed, sort_keys=True))
++            logger.info_once(
++                "B70-QSA: XPU launch overrides active: %s",
++                json.dumps(parsed, sort_keys=True),
++            )
+         _overrides = parsed
+     return _overrides
+ 

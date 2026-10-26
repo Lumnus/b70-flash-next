@@ -1,0 +1,51 @@
+From 87fa1476dd11f417787a39379e41affc1a4f4eab Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 25 Oct 2026 23:40:04 +0000
+Subject: [PATCH 20/26] B70-QSA-B01: bench B70_BENCH_CHECK_ROWS=all|N checks
+ every row (or N rows) against the torch reference
+
+The default samples 4 attention / 6 selection rows; C2 found prefill-scorer configs that pass the sample and select wrong. Correctness runs set all.
+---
+ benchmarks/kernels/bench_qwen4_qsa_xpu.py | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/benchmarks/kernels/bench_qwen4_qsa_xpu.py b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+index 8a6596c7b0..3278618329 100644
+--- a/benchmarks/kernels/bench_qwen4_qsa_xpu.py
++++ b/benchmarks/kernels/bench_qwen4_qsa_xpu.py
+@@ -442,12 +442,19 @@ def ref_logits(p: Problem, rows: list[int]) -> torch.Tensor:
+     return out
+ 
+ 
++def _check_rows(p: "Problem", sample: int, extra: set[int]) -> list[int]:
++    """Rows to check. B70_BENCH_CHECK_ROWS=all checks every row against the torch
++    reference (slow; for correctness runs); an integer N samples N rows."""
++    want = os.environ.get("B70_BENCH_CHECK_ROWS", "")
++    if want == "all":
++        return list(range(p.rows))
++    n = int(want) if want else sample
++    return sorted(extra | {int(x) for x in torch.linspace(0, p.rows - 1, n).tolist()})
++
++
+ def check_selection(p: Problem, sample: int = 6) -> dict:
+     """Selected-set check that tolerates exact score ties (compares score multisets)."""
+-    rows = sorted(
+-        {0, p.rows - 1, p.rows // 2}
+-        | {int(x) for x in torch.linspace(0, p.rows - 1, sample).tolist()}
+-    )
++    rows = _check_rows(p, sample, {0, p.rows - 1, p.rows // 2})
+     worst = 0.0
+     bad = 0
+     for r, s in zip(rows, ref_logits(p, rows)):
+@@ -471,10 +478,7 @@ def check_selection(p: Problem, sample: int = 6) -> dict:
+ 
+ 
+ def check_attention(p: Problem, sample: int = 4) -> dict:
+-    rows = sorted(
+-        {0, p.rows - 1}
+-        | {int(x) for x in torch.linspace(0, p.rows - 1, sample).tolist()}
+-    )
++    rows = _check_rows(p, sample, {0, p.rows - 1})
+     worst = 0.0
+     for r in rows:
+         lg = p.logical[r, :SEL_WIDTH]
