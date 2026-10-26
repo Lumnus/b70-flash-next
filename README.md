@@ -46,6 +46,39 @@ Single runs on an idle engine; this harness is not the one behind the 0.30 per-b
 intermediate 0.30 perf line, and the caveats: [v0.32/README.md](v0.32/README.md#numbers). How to build and run it:
 [v0.32/README.md](v0.32/README.md#build-and-run).
 
+## Quick start (0.32, current line)
+
+The short path; every step with its pinned commits and checks is in [v0.32/README.md](v0.32/README.md#build-and-run).
+These are the commands we ran with our paths replaced by placeholders; the sequence has not been run end to end in this
+form from a clean clone.
+
+1. **Host.** 4× B70 on the xe driver, compute-runtime 26.35.39758.10, oneAPI DPC++ 2026.1.1 for the native builds.
+2. **vLLM and the Python environment** (torch 2.14.0+xpu, oneCCL 2022.1.2 from pip):
+   ```bash
+   git clone -b v0.32.0-b70.1 https://github.com/Lumnus/vllm.git vllm-b70-0.32
+   uv venv --python 3.12 /opt/b70/venv
+   uv pip install --python /opt/b70/venv/bin/python --index-strategy unsafe-best-match \
+       --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/xpu/ \
+       -r vllm-b70-0.32/requirements/xpu.txt torch==2.14.0+xpu oneccl==2022.1.2 auto-round-lib==0.16.0 transformers==5.17.0
+   VLLM_TARGET_DEVICE=xpu uv pip install --python /opt/b70/venv/bin/python --no-build-isolation -e vllm-b70-0.32
+   ```
+3. **Kernels.** vllm-xpu-kernels `release/0.1.15.4` + our PRs #660, #658, #662, built with oneDNN on, then our Python
+   patches from [`v0.32/patches/vllm-xpu-kernels-py/`](v0.32/patches/vllm-xpu-kernels-py/) (build steps 3–4).
+4. **wu1ff's native libraries** from B70-LLM-Controller release `qwen3.8-flash-next-v1.0.5`, plus `libgdn_index64.so`
+   with our patch, and the Level Zero peer-residency shim (build step 5).
+5. **Weights.** Intel AutoRound @ `4c67bf68` (without the 102.4 GB PLE shard), devan's `ple_table_qwen4exp.pt`, the
+   INT8 PLE table (`tools/build_int8_ple.py build`), the snapshot (`tools/intel_snapshot.py snapshot`), a serve dir
+   with [`engines/serve-config-intel-autoround.json`](engines/serve-config-intel-autoround.json) as its `config.json`, and
+   the drafter `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` (build step 7).
+6. **Serve.**
+   ```bash
+   set -a; . v0.32/engines/serve.env; set +a
+   mapfile -t args < <(grep -v '^#' v0.32/engines/serve.args | sed '/^$/d' | sed 's/^\(--[^ ]*\) \(.*\)$/\1\n\2/')
+   LD_LIBRARY_PATH=/opt/b70/venv/lib /opt/b70/venv/bin/vllm serve /models/qwen3.8-flash-next/serve-dir "${args[@]}"
+   ```
+   The venv's own oneAPI runtime must come first on `LD_LIBRARY_PATH`. The first start compiles cold; ours take ~4 min.
+   `serve-plugin.env` instead of `serve.env` adds ~2 % GPU KV after building the optional oneCCL plugin (build step 6).
+
 ## The 0.30 line (stable fallback)
 
 **Release [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), 2026-10-07.** Both
@@ -304,7 +337,7 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 
 ## Quick start (0.30, source tree)
 
-For the current line, follow [v0.32/README.md](v0.32/README.md#build-and-run). For the 0.30 fallback:
+The stable fallback. For the current line, see [Quick start (0.32)](#quick-start-032-current-line).
 
 ```bash
 git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next
