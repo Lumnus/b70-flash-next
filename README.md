@@ -132,9 +132,11 @@ workloads.
 
 Two calibrated 4-bit checkpoints run on this stack and both are validated; a third, round-to-nearest one is the
 reference, and a fourth variant (Minachist's recalibrated experts in Intel's checkpoint) is supported. **We recommend
-Intel AutoRound, and it is what we serve** on both lines. Only Intel has been measured on the 0.32 line; the comparison
-and the per-build tables below were measured on the 0.30 line (MTP k=3, kernels b70.2/b70.3), with a different harness
-from the 0.32 table at the top. The two calibrated builds are close; the reasons for the order:
+Intel AutoRound, and it is what we serve.** Only Intel has been measured on the current 0.32 line (its numbers are in
+the Intel section below and in the table at the top). Everything else in this section, including the Intel-vs-AWQ
+comparison, was measured on the 0.30.0-b70.2 recipe (MTP k=3, 16 slots, kernels b70.2/b70.3) with a different harness;
+those numbers are much lower than the 0.32 line's because that recipe has no DFlash2, no async scheduling and 1024-token
+prefill chunks, not because of the weights. The two calibrated builds are close; the reasons for the order:
 
 1. **Speed is a tie, Intel slightly ahead at one stream.** Measured side by side, Intel decodes 2.8 % faster at one
    short stream (90.4 vs 87.9 tok/s) and 5 % faster at one 16K stream (89.8 vs 85.0), and the two are level at 4 to 10
@@ -154,12 +156,27 @@ All of them serve the same INT8 PLE table from NVMe, built from devan's BF16 PLE
 ([docs/ple-int8.md](docs/ple-int8.md)). Details: [docs/weights.md](docs/weights.md),
 [docs/measurements/b70.2.md](docs/measurements/b70.2.md).
 
-Throughput below: single runs on an idle engine, thinking off, 400 (short) or 256 (16K) generated tokens per request;
-"prefill" = prompt tokens over time to first token; differences under ~10 % are noise.
-
-### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (recommended; what we serve on both lines)
+### Intel AutoRound — `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68` (recommended; what we serve)
 
 AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MTP and the rest BF16.
+
+**On the current line, 0.32.0-b70.1** (DFlash2 K=7, async, 8 slots, 4096-token chunks; greedy, thinking off; single runs
+on an idle engine; method in [v0.32/README.md](v0.32/README.md#numbers)):
+
+| | |
+|---|---|
+| decode, 1 stream | **169.3 tok/s** |
+| decode, 4 concurrent / 8 streams | 306.2 / 605.5 tok/s total |
+| prefill 8K / 32K / 131K | 6,305 / 6,114 / 4,641 tok/s |
+| GPU KV cache | 388,872 tokens (397,309 with the optional oneCCL plugin), plus the 128 GiB host-RAM tier |
+| agent-session replay (243 requests) | 268 s, TTFT p50 / p90 2.13 / 4.71 s, 0 preemptions |
+| quality | MMLU 300 / TruthfulQA 200 paired against the 0.30 perf line: no difference detected (not an equivalence bound) |
+| host RAM | 35–39 GiB MemAvailable while serving on our 256 GB host |
+| endurance | no multi-day run on 0.32 yet |
+
+**On the 0.30.0-b70.2 recipe** (MTP k=3, 16 slots; the stable fallback). These rows are the Intel-vs-AWQ comparison;
+single runs on an idle engine, thinking off, 400 (short) or 256 (16K) generated tokens per request; "prefill" = prompt
+tokens over time to first token; differences under ~10 % are noise:
 
 | | |
 |---|---|
@@ -180,7 +197,8 @@ AutoRound (tuned rounding and clipping), int4 routed experts; attention, GDN, MT
 
 ### AWQ — `wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16` @ `0939125` (validated alternative)
 
-AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16.
+AWQ (llm-compressor, calibrated), int4 routed experts only; the rest BF16. Not measured on the 0.32 line; every row
+below is from the 0.30.0-b70.2 recipe (MTP k=3, 16 slots), the same as Intel's second table.
 
 | | |
 |---|---|
@@ -234,7 +252,7 @@ the 0.30.0-b70.2 recipe (MTP) or on 0.32.
 ### devan — `devan-carlin/Qwen3.8-Flash-Next-W4A16` @ `40b8f18d` (reference)
 
 Most likely round-to-nearest; int4 routed experts **and** the full-attention projections. Most of
-[docs/measurements/](docs/measurements/README.md) is measured on it (8 slots, earlier settings).
+[docs/measurements/](docs/measurements/README.md) is measured on it (0.30 line, 8 slots, earlier settings; not on 0.32).
 
 | | |
 |---|---|
@@ -244,7 +262,7 @@ Most likely round-to-nearest; int4 routed experts **and** the full-attention pro
 | coding (same set) | 39/50 (AWQ 48/50, p 0.015); knowledge level with AWQ |
 | token-level distance to Intel | KL 0.20, prose top-1 77 % |
 
-**Benchmark status.** The Intel and AWQ speed rows are not on the same kernels: Intel's are from the b70.2 kernels, AWQ's from b70.3. AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
+**Benchmark status (0.30 tables).** The Intel and AWQ speed rows are not on the same kernels: Intel's are from the b70.2 kernels, AWQ's from b70.3. AWQ's with-MTP speed rows are measured on the b70.3 kernels with B70-0030 (2026-10-04, one run
 each; the first short one-stream cell after boot ran cold at 68.6 tok/s, the repeat gave 87.9); Intel's speed rows are
 from the b70.2 kernels (2026-10-02, same harness), and Intel on b70.3 is not re-benched (b70.3 changes only the
 CPU → GPU KV load path, which these cells do not use). AWQ's without-MTP rows come from an earlier matrix on stock
@@ -395,6 +413,11 @@ Fixes from this work, posted upstream on 2026-10-25 (open as of that day). The 0
 | vLLM [#63563](https://github.com/vllm-project/vllm/issues/63563) → [#63564](https://github.com/vllm-project/vllm/pull/63564) | Model Runner V2: bound prompt-logprobs chunks by `max_num_reqs` |
 | vLLM [#63565](https://github.com/vllm-project/vllm/issues/63565) → [#63566](https://github.com/vllm-project/vllm/pull/63566) | KV offload: pin a shared-prefix junction when a sparse group cuts the offload hit |
 | oneCCL [#228](https://github.com/uxlfoundation/oneCCL/issues/228) → [#229](https://github.com/uxlfoundation/oneCCL/pull/229) | legacy plugin: device USM that `msync()` sees as host takes the GPU path |
+
+Issues filed the same day, without a PR yet: vLLM [#63620](https://github.com/vllm-project/vllm/issues/63620) (hybrid
+models: padding rows of replayed graphs point recurrent state at the shared null block; a scratch-block fix is
+offered) and [#63621](https://github.com/vllm-project/vllm/issues/63621) (XPU KV offload: the registered host region is
+not recognised as USM, so every CPU→GPU load is staged; the caller change follows vllm-xpu-kernels #662).
 
 ## Credits
 
