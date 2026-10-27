@@ -1,7 +1,7 @@
 # Example engines (0.30 line)
 
-These are the 0.30 line's engines. The current line's engine files are in [v0.32/engines/](../v0.32/engines/)
-([v0.32/README.md](../v0.32/README.md)); the two serve configs here are shared with it.
+These are the 0.30 line's engines ([the 0.30 page](../README.md)). The current line's engine files are in [v0.32/engines/](../../v0.32/engines/)
+([v0.32/README.md](../../v0.32/README.md)); the two serve configs here are shared with it.
 
 Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
 KV size to your host.
@@ -28,15 +28,15 @@ MODELS=/srv/models CACHE=/srv/cache MODEL=awq engines/run-example.sh s16-kv128-m
 
 ## The serving recipe (`s16-kv128-mtp3`, 0.30.0-b70.2; the model is a parameter)
 
-We run it from a source tree, not the image (README, Quick start). One code tree and one set of flags; the weights are
+We run it from a source tree, not the image ([the 0.30 page, Quick start](../README.md#quick-start)). One code tree and one set of flags; the weights are
 chosen with `MODEL=intel-autoround` (recommended: `tools/intel_snapshot.py`, `serve-config-intel-autoround.json`) or
 `MODEL=awq` (snapshot from `tools/awq_snapshot.py`, `serve-config-awq.json`). The configuration: MTP k=3, 16 slots,
 util 0.88, 262K context, 128 GiB CPU tier, INT8 PLE from NVMe, kernels b70.3. On Intel it ran 8 days 6 h in one engine
-without an error, on AWQ 3 days 16 h (README, Endurance). AWQ weights and snapshot: step 1 of "The b70.1 serving recipe" below. Intel
+without an error, on AWQ 3 days 16 h ([the 0.30 page, Endurance](../README.md#endurance)). AWQ weights and snapshot: step 1 of "The b70.1 serving recipe" below. Intel
 differs only in the weights step (Intel specifics, point 1); points 2 to 5 hold for both.
 
-0. **Code.** Fork branch `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), exported to `patches/`. What was validated where:
-   README, "Validation status" (Intel ran its endurance on the release code except the flag-file directory, AWQ on an earlier branch; the differences are listed
+0. **Code.** Fork branch `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), exported to `../patches/`. What was validated where:
+   [the 0.30 page, Validation status](../README.md#validation-status) (Intel ran its endurance on the release code except the flag-file directory, AWQ on an earlier branch; the differences are listed
    in known issues item 12).
 
 Intel specifics (point 1 only; points 2 to 5 are common):
@@ -72,7 +72,7 @@ chat template (note 1) and a host-RAM guard.
    tools/awq_snapshot.py snapshot /srv/models/qwen3.8-flash-next/AWQ-W4A16 \
        /srv/models/qwen3.8-flash-next/W4A16/ple_table_qwen4exp.pt /srv/models/qwen3.8-flash-next/AWQ-W4A16-snapshot
    ```
-   Why, and how the AWQ serve config differs: [docs/weights.md](../docs/weights.md).
+   Why, and how the AWQ serve config differs: [docs/weights.md](../../docs/weights.md).
 2. **16 slots, power-of-two graphs.** `serve-s16.args`: `--max-num-seqs 16`, capture sizes `[1,2,4,8,16,256,512,1024]`,
    `--gpu-memory-utilization 0.85`. Keep capture sizes to powers of two ([known issues](../docs/known-issues.md)).
 3. **Sampling.** Server default temperature 0.7 (`--override-generation-config`), no server presence penalty
@@ -80,7 +80,7 @@ chat template (note 1) and a host-RAM guard.
 4. **CPU KV tier.** `--kv-offloading-backend native`, 128 GiB = 32 GiB per rank. One pinned host allocation of ~31 GiB
    or more is refused by the driver; patch 0018 splits the pool into equal chunks, so no driver debug keys are
    needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so on b70.1 we ran
-   `KV_OFFLOADING_SIZE=64`. On b70.2, kernels b70.3 (or 0031) keep host memory flat under KV reload load (README, "The host-RAM KV tier"). Keep the size a power of two (total / 4).
+   `KV_OFFLOADING_SIZE=64`. On b70.2, kernels b70.3 (or 0031) keep host memory flat under KV reload load ([the 0.30 page, The host-RAM KV tier](../README.md#the-host-ram-kv-tier-030-measurements)). Keep the size a power of two (total / 4).
 5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, `B70_OFFLOAD_GDN_BACKSTEP=1` (docs/offload-fix.md).
 
 ## PLE table: RAM or NVMe
@@ -94,7 +94,7 @@ The INT8 PLE table is 48.9 GiB. Two ways to serve it, chosen with one switch:
 | needs | the table on a fast local NVMe (the native reader compiles with the image's `gcc`) | nothing extra |
 
 Both need `B70_PLE_INT8=1` and `B70_PLE_INT8_PATH`. Use NVMe when the freed ~39 GiB buys you more CPU KV tier; keep it in
-RAM when the host has the room. Details: [docs/ple-nvme.md](../docs/ple-nvme.md).
+RAM when the host has the room. Details: [docs/ple-nvme.md](../../docs/ple-nvme.md).
 
 ## Notes
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # make-tree.sh — produce a vLLM source tree for a release, and verify it.
 #
-#   scripts/make-tree.sh <release|ref> <dir> [--from-patches]
+#   v0.30/scripts/make-tree.sh <release|ref> <dir> [--from-patches]
 #
 #   <release|ref>   a release of this repo's series (0.30.0-b70.1 -> fork branch b70/v0.30.0; 0.30.0-b70.2 and later ->
 #                   the fork tag v<release>, else branch b70/v0.30.0-stable), or any fork branch/tag/commit
 #   <dir>           target directory (must not exist)
-#   --from-patches  do not clone the fork branch; apply this repo's patches/ onto a clean v0.30.0
+#   --from-patches  do not clone the fork branch; apply v0.30/patches/ onto a clean v0.30.0
 #                   (ced6857afa) checkout instead
 #
 # Either way the result is checked the same way: every file the series touches must carry the sha256 recorded
-# in image/verify-overlay.sh ("final" set). A clone is also checked against a --from-patches build.
+# in v0.30/image/verify-overlay.sh ("final" set). A clone is also checked against a --from-patches build.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
@@ -55,7 +55,7 @@ else
   apply_series "$ref_tree/t"
   diff -rq --exclude=.git "$ref_tree/t/vllm" "$dir/vllm" \
     && echo "vllm/ equals this repo's patches/ applied to $BASE" \
-    || { echo "vllm/ differs from patches/ applied to $BASE (run scripts/check-series.sh)" >&2; exit 1; }
+    || { echo "vllm/ differs from patches/ applied to $BASE (run v0.30/scripts/check-series.sh)" >&2; exit 1; }
 fi
 
 # hash check against image/verify-overlay.sh: every wu1ff-layer and b70-series file must carry its "final" sha256

@@ -54,6 +54,14 @@ One release (no intermediate b70.4 builds were published).
   `tools/check-trunk-tree.sh` applies all three and requires the tree to equal the trunk exactly; `--no-hotcold` (with
   `--hotcold-count`, `--hotcold-tip`, `--hotcold-extra`) keeps the old mode that allows the trunk's hot/cold commits.
   `serve-config-qsa.json` re-indented to the dense file's style (JSON-equal).
+- **Layout: the 0.30 line moved to `v0.30/`.** Everything that belongs only to the 0.30.0-b70.2 line left the repository
+  root: `patches/`, `engines/`, `image/`, `scripts/`, the 0.30 known issues and measurements are now `v0.30/patches/`,
+  `v0.30/engines/`, `v0.30/image/`, `v0.30/scripts/`, `v0.30/docs/known-issues.md`, `v0.30/docs/measurements/`, and
+  `docs/line-0.30.md` is `v0.30/README.md`. The root holds the cover, `CHANGELOG.md`, `RELEASE-NOTES-b70.4.md`,
+  `PROVENANCE.md`, `NOTICE`, `LICENSE`, the cross-line `docs/` (switches, weights, kernels, offload fix, PLE INT8 and NVMe,
+  the 0.32 sparse-against-dense measurements) and `tools/`. `v0.32/` is unchanged. The 0.30 scripts run from `v0.30/`
+  (`v0.30/scripts/check-series.sh`; the image builds with `v0.30/` as the context). File contents are unchanged apart
+  from links; paths in the entries below name the layout of their release.
 - Release notes: [RELEASE-NOTES-b70.4.md](RELEASE-NOTES-b70.4.md).
 
 ## 0.32.0-b70.3 — 2026-10-26: sparse attention (QSA) brought near dense speed; dense engine args

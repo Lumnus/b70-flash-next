@@ -1,6 +1,6 @@
 # Runtime switches (`B70_*`) of the 0.30 series
 
-This page covers the 0.30 series in `patches/`. The 0.32 line carries most of these switches as ports, plus its own;
+This page covers the 0.30 series in `v0.30/patches/`. The 0.32 line carries most of these switches as ports, plus its own;
 its engine files ([v0.32/engines/preset-4card.env](../v0.32/engines/preset-4card.env)) explain each one inline, and
 [v0.32/README.md](../v0.32/README.md#the-series) lists the series.
 

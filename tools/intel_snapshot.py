@@ -17,10 +17,10 @@ to its layout (docs/weights.md):
         index (written filtered), shard 16 and *.bak; link ple_table_qwen4exp.pt to the given devan table (the boot
         cross-check reference that PLE_TABLE_PATH and the INT8 table are built from). Links are relative: keep the
         three paths on one volume. Shard 16 does not have to be downloaded at all.
-    intel_snapshot.py serve-config <engines/serve-config-awq.json> <intel config.json> <out.json>
+    intel_snapshot.py serve-config <v0.30/engines/serve-config-awq.json> <intel config.json> <out.json>
         the AWQ serve config (dense-QSA text_config) with quantization_config replaced by the checkpoint's auto-round
         block; refuses unless the two configs differ only by indexer_* keys and the quantization block. The output is
-        byte-identical to engines/serve-config-intel-autoround.json (sha256 checked).
+        byte-identical to v0.30/engines/serve-config-intel-autoround.json (sha256 checked).
 
 Nothing in the download is modified. Standard library only.
 """

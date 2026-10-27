@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# check-series.sh — fail unless patches/vllm/ and patches/vllm-tests/ equal a fresh export of the fork branch.
+# check-series.sh — fail unless v0.30/patches/vllm/ and v0.30/patches/vllm-tests/ equal a fresh export of the fork branch.
 #
-#   scripts/check-series.sh [--git-dir DIR] [--ref REF]      (same defaults as export-series.sh)
+#   v0.30/scripts/check-series.sh [--git-dir DIR] [--ref REF]      (same defaults as export-series.sh)
 #
-# Run it before tagging a release and before building an image: the image is built from patches/, the fork
+# Run it before tagging a release and before building an image: the image is built from v0.30/patches/, the fork
 # branch is where the code lives, and the two must not drift.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)

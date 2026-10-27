@@ -1,5 +1,4 @@
-.git
 vllm-src
 docs
-tools
 engines
+scripts

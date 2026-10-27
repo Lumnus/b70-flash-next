@@ -1,8 +1,8 @@
 # b70-flash-next — vLLM v0.30.0 (XPU) for Qwen3.8-Flash-Next on 4x Intel Arc Pro B70.
 #
-# Build from the REPOSITORY ROOT (the patches live in ../patches):
+# Build from v0.30/ (the 0.30 line directory: the patches live in ../patches, next to image/):
 #
-#   docker buildx build -f image/Dockerfile -t b70-flash-next:0.30.0-b70.1 \
+#   cd v0.30 && docker buildx build -f image/Dockerfile -t b70-flash-next:0.30.0-b70.1 \
 #     --build-arg GIT_SHA=0.30.0-b70.1 --build-arg SOURCE_SHA=$(git rev-parse HEAD) .
 #
 # = official vLLM v0.30.0 XPU image (pinned by digest)
@@ -16,7 +16,7 @@
 #
 # Runtime contract is wu1ff's, unchanged: ENTRYPOINT /opt/b70-flashnext/prepare-serve.sh, WORKDIR /opt/venv,
 # no ENV added, same paths. With no B70_* variable set the image behaves as wu1ff's pack image.
-# Provenance, hashes and the per-patch table: PROVENANCE.md.
+# Provenance, hashes and the per-patch table: ../PROVENANCE.md.
 #
 # Every image reference below is public (docker.io, ghcr.io). To pull through a private mirror, pass the SAME
 # digest under the mirror's name: --build-arg BASE_IMAGE=<mirror>/vllm/vllm-openai-xpu@sha256:fc0e112a… and/or
@@ -86,7 +86,7 @@ RUN --mount=type=bind,source=image/verify-overlay.sh,target=/tmp/verify-overlay.
 
 # b70 series (patches/vllm/*-b70-*.patch), applied only AFTER gate 1 has passed, so that gate keeps
 # proving "wu1ff's overlay, unchanged". Filename order under LC_ALL=C: 0006 0007 0008 0009 0010 0012 0013 0013b
-# 0014a..0014f. Every feature is default-OFF behind an env var (docs/switches.md), so the image behaves as
+# 0014a..0014f. Every feature is default-OFF behind an env var (../docs/switches.md), so the image behaves as
 # wu1ff's unless the deployment opts in.
 # Build-time gate 2 (verify-overlay.sh final): every file the series touches carries its recorded full-stack
 # sha256 (B70-<last patch>), wu1ff files it does not touch are still wu1ff's, binaries unchanged. Then every

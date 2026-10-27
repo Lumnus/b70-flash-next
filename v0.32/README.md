@@ -27,7 +27,7 @@ Everything else is a parameter of the same engine ([Parameters](#parameters)), d
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
 | status | gates, quality, speed and an agent-session replay measured ([Presets](#presets), [Parameters](#parameters)). No multi-day endurance run on 0.32 yet. No container image. |
 
-The 0.30.0-b70.2 recipe in the repository root stays as it was and is the stable fallback line.
+The 0.30.0-b70.2 recipe is in [`v0.30/`](../v0.30/README.md), unchanged, and is the stable fallback line.
 
 ## Presets
 
@@ -72,7 +72,7 @@ each was measured at.
 
 | parameter | where | default | other values | measured at |
 |---|---|---|---|---|
-| **attention** | the serve dir's `config.json`, plus three `B70_QSA_*` keys in the env | **sparse (QSA)**: [`serve-config-qsa.json`](engines/serve-config-qsa.json) with `B70_QSA_ATTN_IMPL=attn2`, `B70_QSA_TOPK=native_det`, `B70_QSA_TOPK_SELECT_IMPL=triton` (both presets) | **dense**: [`serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) in the serve dir and the three keys removed. Working, measured below | sparse: [Presets](#presets). Dense, b70.3 build (0.1.15.4 environment, 8 slots, patched plugin): one stream 169.3 tok/s, 4 / 8 streams 306.2 / 605.5, prefill 8K / 32K / 131K 6,305 / 6,114 / 4,641, KV 397,309. Dense, 12 slots (0.1.15.4 environment): KV 385,685, one stream 169.9, 4 streams 297, 8 streams 639, agent replay 232 s. **Dense at 12 slots not re-measured on 0.1.16.2.** Sparse against dense on the same engine code: [Sparse attention](#sparse-attention-qsa) |
+| **attention** | the serve dir's `config.json`, plus three `B70_QSA_*` keys in the env | **sparse (QSA)**: [`serve-config-qsa.json`](engines/serve-config-qsa.json) with `B70_QSA_ATTN_IMPL=attn2`, `B70_QSA_TOPK=native_det`, `B70_QSA_TOPK_SELECT_IMPL=triton` (both presets) | **dense**: [`v0.30/engines/serve-config-intel-autoround.json`](../v0.30/engines/serve-config-intel-autoround.json) in the serve dir and the three keys removed. Working, measured below | sparse: [Presets](#presets). Dense, b70.3 build (0.1.15.4 environment, 8 slots, patched plugin): one stream 169.3 tok/s, 4 / 8 streams 306.2 / 605.5, prefill 8K / 32K / 131K 6,305 / 6,114 / 4,641, KV 397,309. Dense, 12 slots (0.1.15.4 environment): KV 385,685, one stream 169.9, 4 streams 297, 8 streams 639, agent replay 232 s. **Dense at 12 slots not re-measured on 0.1.16.2.** Sparse against dense on the same engine code: [Sparse attention](#sparse-attention-qsa) |
 | **cards** | `--tensor-parallel-size`, `draft_tensor_parallel_size`, `ZE_AFFINITY_MASK` | 4 | 2 (the 2-card preset) | both: [Presets](#presets) |
 | **drafter** | `--speculative-config` | DFlash2, K = 7 (incoai's drafter), both presets | MTP (`"method":"mtp"`, k = 3; the MTP draft-prefill patch 0021 and the uniform-drafts guard 0026 are in the series) | DFlash K = 7: every 0.32 number. MTP: only on the 0.30.0-b70.2 line (107.5 tok/s at one stream, 16 slots); not measured on 0.32 |
 | **expert offload (hot/cold)** | `B70_MOE_HOTCOLD=1`, `B70_MOE_COLD_EXPERTS=N` (cold experts per layer per rank, of 128 at TP4 and 256 at TP2) and the keys of the hot/cold block in `preset-2card.env` | off (4-card) | on with N = 145 (2-card) | off: the 4-card preset. On, N = 145 at TP2: the 2-card preset. At TP4 (N = 16, before the capture fix, prefetch off): booted at KV 471,821 tokens; no speed or fidelity number |
@@ -90,7 +90,7 @@ Launch-time changes that are not parameters: the kernels, the patches and the on
 Three configurations measured with the same harness on the same host, one after another, on an idle engine (each
 timed cell waits for 20 s with no running or waiting requests). Single runs unless noted; read differences under
 ~5 % as noise: 0.32 matches the 0.30 perf line, and the gain over 0.30.0-b70.2 is the DFlash2/async/bundle stack, which
-runs on both. These are **not** comparable with the per-build tables in [docs/line-0.30.md](../docs/line-0.30.md#models), which use a different
+runs on both. These are **not** comparable with the per-build tables in [v0.30/README.md](../v0.30/README.md#models), which use a different
 harness (the b70.2 Intel row there reads 90.4 tok/s at one stream; this harness reads 107.5 for a closely matching
 configuration). The 0.32 column is dense attention at 8 slots on the 0.1.15.4 kernel build (the b70.1 code). The current presets' numbers are in [Presets](#presets).
 
@@ -354,11 +354,11 @@ file against these steps; the sequence has not been run end to end in this form 
 
 7. **Weights.** Intel AutoRound @ `4c67bf68` without the 102.4 GB PLE shard, devan's `ple_table_qwen4exp.pt`, the INT8
    table from `tools/build_int8_ple.py`, and the snapshot from `tools/intel_snapshot.py` (as for 0.30, see
-   [engines/README.md](../engines/README.md)). Make a serve dir: symlink every snapshot file into it and copy
+   [v0.30/engines/README.md](../v0.30/engines/README.md)). Make a serve dir: symlink every snapshot file into it and copy
    [`engines/serve-config-qsa.json`](engines/serve-config-qsa.json) (sparse attention, both presets' default) over its
    `config.json` (the dense config plus `indexer_n_heads`, `indexer_kv_heads`, `indexer_head_dim`, `indexer_budget`,
    `indexer_compress_ratio` in `text_config`, so the 39 indexer tensors load), or, for dense attention,
-   [`engines/serve-config-intel-autoround.json`](../engines/serve-config-intel-autoround.json) (byte-identical to the one we
+   [`v0.30/engines/serve-config-intel-autoround.json`](../v0.30/engines/serve-config-intel-autoround.json) (byte-identical to the one we
    serve). The drafter: `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` into `/models/qwen3.8-flash-next/DFlash2`. For the
    2-card preset, the hot/cold rankings seed: `configs/static_hot_cache_rankings.json` from
    [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090) @ `4dca58f` (Apache-2.0;
@@ -492,7 +492,7 @@ first start compiles the QSA Triton kernels cold (7 min in our first boot, ~5 mi
 4. **GPU idles ~3 ms per step in the PLE sync at one stream.** A device→host probe takes 25 µs in isolation. Open.
 5. **Only Intel AutoRound weights were measured on 0.32.** The AWQ build should work (vLLM 0.32 accepts it natively), but
    it was not booted on this line.
-6. **AWQ / 0.30 items still apply** where the code is shared: card hangs after a GT reset ([docs/known-issues.md](../docs/known-issues.md)
+6. **AWQ / 0.30 items still apply** where the code is shared: card hangs after a GT reset ([v0.30/docs/known-issues.md](../v0.30/docs/known-issues.md)
    item 1), liveness must generate, and pinned memory escapes container limits.
 7. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the burst gate and
    a token compare (garbage and divergence check, not an equivalence test) before serving.

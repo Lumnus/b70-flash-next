@@ -7,11 +7,11 @@ Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Fou
 | **`0.1.16.2` + our #660/#662, + `libgdn_index64`** | torch 2.14, oneAPI 2026.1.1 (the current 0.32 line, b70.4) | upstream `6b30c9b` (the source of the PyPI 0.1.16.2 wheel) + [`v0.32/patches/vllm-xpu-kernels/`](../v0.32/patches/vllm-xpu-kernels/) (#660, #662), FlashAttention-2, MQA-logits and Xe3P off, oneDNN on; the attention libraries from the PyPI wheel; our `libgdn_index64.so` ([`v0.32/patches/libgdn-index64/`](../v0.32/patches/libgdn-index64/)) for the 64-bit GDN conv-state offset (#658 is merged upstream on main only); the astra Python modules from [`v0.32/patches/vllm-xpu-kernels-py/`](../v0.32/patches/vllm-xpu-kernels-py/) | **the current line's kernels**; recipe in [v0.32/README.md](../v0.32/README.md#build-and-run) steps 3–5 |
 | `release/0.1.15.4` + our PRs (retired in b70.4) | torch 2.14, oneAPI 2026.1.1 (the 0.32 line through b70.3) | upstream `release/0.1.15.4` (`ddf336d`) + vllm-xpu-kernels #660, #658, #662 from their pull refs, oneDNN on, plus wu1ff's Python hunks | served through b70.3; the replay, long-prefill and sparse-against-dense numbers of b70.1–b70.4 were taken on it |
 | **`0.1.14.1+b70.3`** | torch 2.13, oneAPI 2026.0 (the 0.30 stable fallback line) | tag [`v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3) on branch `b70/v0.1.14` = upstream tag `0.1.14.1` (`6d92b1bf`) + 7 commits | the 0.30 line's kernels (served 2026-10-03 to 2026-10-23); wheel attached to the [0.30.0-b70.2 release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) |
-| `0.1.15.4+b70.1` | torch 2.14, oneAPI 2026.1 (the edge line) | [`b70/v0.1.15`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.15) @ `69b823f9` = upstream `release/0.1.15.4` + the 64-bit fix | ran on the edge line; not recommended (known issues item 5) |
+| `0.1.15.4+b70.1` | torch 2.14, oneAPI 2026.1 (the edge line) | [`b70/v0.1.15`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.15) @ `69b823f9` = upstream `release/0.1.15.4` + the 64-bit fix | ran on the edge line; not recommended ([known issues](../v0.30/docs/known-issues.md) item 5) |
 
 ## 0.1.14.1+b70.3: the series
 
-`patches/vllm-xpu-kernels/b70.3/`, one file per commit, exported with `git format-patch 0.1.14.1..v0.1.14.1+b70.3`.
+`v0.30/patches/vllm-xpu-kernels/b70.3/`, one file per commit, exported with `git format-patch 0.1.14.1..v0.1.14.1+b70.3`.
 `git am` of the seven files on upstream tag `0.1.14.1` gives exactly the tag's tree.
 
 | # | commit | what | why we need it |
@@ -22,7 +22,7 @@ Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Fou
 | 4 | `d00fbf7` | upstream #563: top-k/top-p sampler with an unaligned vocab size | sampler correctness |
 | 5 | `5fcc722` | upstream #578: negative expert ids in the XPU MoE remap | with expert parallelism, padding routes read `expert_map[-1]` out of bounds |
 | 6 | `e68951b` | upstream #586: initialise `atomic_buffer` to 0 | Xe2 grouped-GEMM tile-counter race (our MoE path) |
-| 7 | `493364a` | **B70-K1**: `swap_blocks_batch` copies H2D straight from pinned (USM host) sources | every CPU→GPU KV load used to be staged through a pinned buffer the size of the load, which torch keeps in its host cache: host memory grew under a 128 GiB CPU KV tier until our RAM guard stopped the engine. Measured with it: +0.058 GiB per rank once, then flat; 19.6–19.9 GB/s (was 8–12); no guard stop ([measurements](measurements/b70.2.md) §3). `VLLM_XPU_H2D_BATCH_STAGING=1` restores staging |
+| 7 | `493364a` | **B70-K1**: `swap_blocks_batch` copies H2D straight from pinned (USM host) sources | every CPU→GPU KV load used to be staged through a pinned buffer the size of the load, which torch keeps in its host cache: host memory grew under a 128 GiB CPU KV tier until our RAM guard stopped the engine. Measured with it: +0.058 GiB per rank once, then flat; 19.6–19.9 GB/s (was 8–12); no guard stop ([measurements](../v0.30/docs/measurements/b70.2.md) §3). `VLLM_XPU_H2D_BATCH_STAGING=1` restores staging |
 
 Commits 2–6 are cherry-picks of upstream merges (`-x`, so each carries its upstream commit id); credit goes to their
 authors. B70-K1 changes the op's contract for pinned sources: the caller keeps the source unchanged until the copies
@@ -50,5 +50,5 @@ is 64-bit with commit 1, and logs the fallback once (0032). Keep `B70_OFFLOAD_H2
 5. **In use.** Edge-line engines without it died with `DEVICE_LOST` on all four cards; with it they did not, and fail
    differently (known issues item 5).
 
-`patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` is the b70.1 form of commit 1, kept because
+`v0.30/patches/vllm-xpu-kernels/0001-gdn-causal-conv1d-int64-state-offset.patch` is the b70.1 form of commit 1, kept because
 patch 0005 refers to it.

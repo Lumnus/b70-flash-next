@@ -1,6 +1,6 @@
 # preset-4card.args — `vllm serve` flags of the 4-card preset, 0.32.0-b70.4 (tensor parallel 4 + expert parallel, DFlash2 K=7,
 # 12 slots, 128 GiB host-RAM KV tier, sparse attention by default). One flag and its value per line. Pair with preset-4card.env
-# and a serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../engines/serve-config-intel-autoround.json
+# and a serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../v0.30/engines/serve-config-intel-autoround.json
 # (dense); every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration served and validated on
 # 2026-10-26 (fork tag v0.32.0-b70.4, the 0.1.16.2 environment; numbers in v0.32/README.md "Presets"). Run: v0.32/README.md "Build and run" step 8.
 --served-model-name qwen38-flash-next

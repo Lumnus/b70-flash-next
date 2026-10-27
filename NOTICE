@@ -8,14 +8,14 @@ Third-party material
 ====================
 
 1. wu1ff / B70-LLM-Controller (MIT) — https://github.com/wu1ff/B70-LLM-Controller
-   - image/files/opt/b70-flashnext/serve-config.json and image/files/opt/b70-flashnext/prepare-serve.sh are
-     wu1ff's files, unchanged (byte-identical, checked by image/verify-overlay.sh).
-   - patches/vllm/0001–0005 are wu1ff's Python changes to vLLM v0.30.0, re-derived as unified diffs from the
+   - v0.30/image/files/opt/b70-flashnext/serve-config.json and v0.30/image/files/opt/b70-flashnext/prepare-serve.sh are
+     wu1ff's files, unchanged (byte-identical, checked by v0.30/image/verify-overlay.sh).
+   - v0.30/patches/vllm/0001–0005 are wu1ff's Python changes to vLLM v0.30.0, re-derived as unified diffs from the
      whole-file overlays in wu1ff's pack image (ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:85512b52…). Applying
      them reproduces wu1ff's files byte-for-byte.
    - The image build copies two binaries from that public image by digest (libgdn_index64.so and the Level Zero
      peer-residency shim). They are not stored in this repository and are covered by wu1ff's license.
-   - patches/vllm-xpu-kernels/0001 is a source form of the fix wu1ff ships only as the prebuilt
+   - v0.30/patches/vllm-xpu-kernels/0001 is a source form of the fix wu1ff ships only as the prebuilt
      libgdn_index64.so, reconstructed from wu1ff's published description.
 
    wu1ff's license text:
@@ -43,19 +43,19 @@ Third-party material
      SOFTWARE.
 
 2. vLLM (Apache-2.0) — https://github.com/vllm-project/vllm
-   The patches in patches/vllm/ and patches/vllm-tests/ modify vLLM v0.30.0 and are distributed under vLLM's
+   The patches in v0.30/patches/vllm/ and v0.30/patches/vllm-tests/ modify vLLM v0.30.0 and are distributed under vLLM's
    license. Patch 0014e is a backport of vLLM commit f12fe10c5c (vllm-project/vllm#51787, by its authors).
 
 3. vllm-xpu-kernels (Apache-2.0) — https://github.com/vllm-project/vllm-xpu-kernels
-   patches/vllm-xpu-kernels/ modifies it and is distributed under its license. patches/vllm-xpu-kernels/b70.3/0002–0006
+   v0.30/patches/vllm-xpu-kernels/ modifies it and is distributed under its license. v0.30/patches/vllm-xpu-kernels/b70.3/0002–0006
    are upstream commits (vllm-project/vllm-xpu-kernels #600, #564, #563, #578, #586) cherry-picked, by their
    authors.
 
 4. Model weights and data are not included. The configurations target the checkpoints
    Intel/Qwen3.8-Flash-Next-W4A16-AutoRound (revision 4c67bf68), wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 (revision 0939125)
    and devan-carlin/Qwen3.8-Flash-Next-W4A16 (revision 40b8f18d) on Hugging Face, each under its own license terms
-   (Qwen3.8-Flash-Next: qwen-community-1.0). image/files/opt/b70-flashnext/serve-config.json is derived from devan's
-   config.json; engines/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
+   (Qwen3.8-Flash-Next: qwen-community-1.0). v0.30/image/files/opt/b70-flashnext/serve-config.json is derived from devan's
+   config.json; v0.30/engines/serve-config-intel-autoround.json carries the Intel checkpoint's quantization block.
 
 5. Patch 0022 ports vllm-project/vllm#55506 (Apache-2.0, by its authors) to v0.30.0.
 

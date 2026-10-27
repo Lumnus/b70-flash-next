@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """awq_snapshot.py — make a serve snapshot of wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 for this image.
 
-The image's entrypoint (image/files/opt/b70-flashnext/prepare-serve.sh, wu1ff's) expects a snapshot directory with
+The image's entrypoint (v0.30/image/files/opt/b70-flashnext/prepare-serve.sh, wu1ff's) expects a snapshot directory with
 `ple_table_qwen4exp.pt` and `model.safetensors.index.json`, and replaces `config.json` with its serve config. The AWQ
 checkpoint differs from devan-carlin/Qwen3.8-Flash-Next-W4A16 in three ways that matter here (docs/weights.md):
 

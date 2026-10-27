@@ -28,7 +28,7 @@ Pinned-memory notes (torch 2.13 on XPU):
 
 ## The offload fix (0014)
 
-See [../offload-fix.md](../offload-fix.md) for the band test. Summary: unpatched, "same document, new question"
+See [../offload-fix.md](../../../docs/offload-fix.md) for the band test. Summary: unpatched, "same document, new question"
 revisits whose last full block reaches into the question miss forever (0/3, then 0/3); with `B70_OFFLOAD_JUNCTION=1`
 they miss once and then hit (0/3, then 3/3); adding `B70_OFFLOAD_GDN_BACKSTEP=1` makes the first revisit hit too (3/3,
 3/3) for +3.8 % CPU-tier bytes per document.

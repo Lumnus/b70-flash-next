@@ -1,8 +1,8 @@
 # Known issues
 
-Each item: symptoms → cause → workaround. These are the 0.30 line's issues (written for 0.30.0-b70.2, reviewed
+Each item: symptoms → cause → workaround. These are the 0.30 line's issues ([the 0.30 page](../README.md); written for 0.30.0-b70.2, reviewed
 2026-10-25); items 1, 2 and 3 apply to the 0.32 line too. The 0.32 line's own issues:
-[v0.32/README.md](../v0.32/README.md#known-issues-032).
+[v0.32/README.md](../../v0.32/README.md#known-issues-032).
 
 ## 1. A card keeps timing out driver jobs after a GT reset
 
@@ -81,13 +81,13 @@ Each item: symptoms → cause → workaround. These are the 0.30 line's issues (
   scheduling (vLLM's default) leaves residual NaN; the leading candidate is a staging-buffer reuse race.
 - **Workaround (the 0.30.0-b70.2 recipe, 0/90 bad bursts).** `--no-async-scheduling`, and cudagraph capture sizes at every multiple
   of 1+k up to `max-num-seqs`×(1+k) (4, 8, …, 64 for k=3 and 16 slots), so a uniform spec-decode step is never padded
-  (`engines/serve-s16-mtp3.args`). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
+  (`v0.30/engines/serve-s16-mtp3.args`). The cost: concurrent long-prompt TTFT ~35–40 % worse than without MTP. The proper
   fixes (padding rows that write nothing; the race) are work in progress.
 - **Structured output.** Grammar-trimmed drafts give a row of fewer than 1+k tokens, which the stock 0.1.14 GDN kernel
   rejects (the engine crashes on the first `json_schema` request). Fixed by upstream vllm-xpu-kernels #600, which is in
   our 0.1.14.1+b70.2/b70.3 builds; 0026 (on by default) avoids it with stock kernels.
 - **On the 0.32 line** speculative decoding is DFlash2 with async scheduling on, and its burst gate passes (0/150;
-  [v0.32/README.md](../v0.32/README.md#numbers)); this item is about MTP on 0.30.
+  [v0.32/README.md](../../v0.32/README.md#numbers-0320-b701-how-the-line-was-validated)); this item is about MTP on 0.30.
 - **A quality note.** In hands-on use, games built through a multi-agent orchestrator came out slightly buggier with MTP
   on than off. Rejection sampling should leave the output distribution unchanged, so a real difference would point to
   numerics. A paired MTP on/off evaluation on one engine has not been run yet.
@@ -129,7 +129,7 @@ mode file) falls back to the `official` variant and, before 0032, logged that wa
 ## 12. The release branch: Intel validated on the release code except the flag-file directory, AWQ on an earlier branch
 
 From 0.30.0-b70.2 there is one release branch, `b70/v0.30.0-stable` (tag `v0.30.0-b70.2`), and the model is a serving
-parameter (`engines/s16-kv128-mtp3.env` + `engines/models/awq.env` or `engines/models/intel-autoround.env`). The branch
+parameter (`v0.30/engines/s16-kv128-mtp3.env` + `v0.30/engines/models/awq.env` or `v0.30/engines/models/intel-autoround.env`). The branch
 carries the union of the two lines we tested on, with one copy of each fix. It has **not yet been booted on a GPU**.
 
 **AWQ** (`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`, the validated alternative) was validated on an earlier branch of
@@ -138,7 +138,7 @@ boots on the first pass (first token 363 s after start); the K1 load line appear
 1–10 streams has 0 bad outputs, the burst gate 0 of 90, the structured-output gate 36 ok + 18 plain ok with the engine
 alive; host memory is flat under two six-session replays (xe host +0.32 GiB total over the run, ~480 GB and ~355 GB of
 offload loads); 0 tracebacks, 0 `DEVICE_LOST`. It then ran **3 days 16 hours in one engine** (2026-10-04 to 2026-10-07,
-~52,500 requests, 0 errors, 0 aborts; [line-0.30.md, Endurance](line-0.30.md#endurance)), ended by a planned restart. Speeds and quality: [line-0.30.md, Models](line-0.30.md#models) and
+~52,500 requests, 0 errors, 0 aborts; [the 0.30 page, Endurance](../README.md#endurance)), ended by a planned restart. Speeds and quality: [the 0.30 page, Models](../README.md#models) and
 [measurements](measurements/b70.2.md).
 
 That earlier branch (0001–0027 as here, and 0029b) differs from the release branch in code that **runs for AWQ** in
@@ -160,10 +160,10 @@ these places, listed plainly:
 We expect none of these to change AWQ's behaviour, but the release branch has not yet been run on AWQ.
 
 **Intel AutoRound** (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`) served on an earlier branch with the same series
-(up to 0031, without the path change above) on kernels b70.2 and b70.3, for hours at a time ([line-0.30.md, Models](line-0.30.md#models)). A
+(up to 0031, without the path change above) on kernels b70.2 and b70.3, for hours at a time ([the 0.30 page, Models](../README.md#models)). A
 multi-day stability run of Intel followed from 2026-10-07, on that branch plus 0032, i.e. the release code except for
 the flag-file directory: about 15 days of serving, the longest engine 8 days 6 hours with 0 errors, and one crash (a
-GPU device-lost on 2026-10-13 under a long memory-store re-ingest, cause unknown; [line-0.30.md, Endurance](line-0.30.md#endurance)). **Intel is
+GPU device-lost on 2026-10-13 under a long memory-store re-ingest, cause unknown; [the 0.30 page, Endurance](../README.md#endurance)). **Intel is
 validated** and is the build we serve and recommend.
 
 Also not measured: AWQ at 48K prompts on b70.3; token-level identity of the direct copy against staging on AWQ; the

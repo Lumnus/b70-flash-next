@@ -1,7 +1,7 @@
 # preset-2card.args — `vllm serve` flags of the 2-card preset, 0.32.0-b70.4 (tensor parallel 2 + expert parallel, DFlash2 K=7 with the
 # draft at TP2, 4 slots, 64 GiB host-RAM KV tier, 262,144-token context, sparse attention by default). It uses two cards so the other
 # pair stays free for any other model. One flag and its value per line. Pair with preset-2card.env (cards, hot/cold expert offload) and a
-# serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../engines/serve-config-intel-autoround.json (dense);
+# serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../v0.30/engines/serve-config-intel-autoround.json (dense);
 # every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration measured on 2026-10-26 (fork tag
 # v0.32.0-b70.4, the 0.1.16.2 environment; numbers in v0.32/README.md "Presets"). Run: v0.32/README.md "Build and run" step 8.
 --served-model-name qwen38-flash-next

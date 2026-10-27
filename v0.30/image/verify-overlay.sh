@@ -6,7 +6,7 @@
 #   wu1ff  — after patches 0001–0005 only. Every file wu1ff's pack image (ghcr.io/wu1ff/qwen38-flashnext-b70@sha256:
 #            85512b52…) adds on top of official vllm/vllm-openai-xpu:v0.30.0 must be byte-identical to wu1ff's copy
 #            (PY_FILES + ABS_FILES). Equality here = no functional difference from wu1ff. Hashes taken from wu1ff's
-#            extracted layers on 2026-09-28 (per-file layer digests in PROVENANCE.md).
+#            extracted layers on 2026-09-28 (per-file layer digests in ../PROVENANCE.md).
 #   final  — (default) after the b70 series 0006–0032. Every file the b70 series touches must carry the sha256
 #            recorded for the full stack (B70_FILES; tag = last patch that touches it, UPSTREAM = touched then
 #            restored to v0.30.0). Every wu1ff file the b70 series does not touch must still be wu1ff's. The two
