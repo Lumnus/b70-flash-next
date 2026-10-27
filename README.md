@@ -93,7 +93,7 @@ pinned pool per rank (`B70_OFFLOAD_PRIVATE_PINNED=1`), copied to the GPU directl
 memory does not count against a container memory limit: watch the host's MemAvailable, and lower `--kv-offloading-size` with
 less RAM. What each preset takes and leaves free: [v0.32/README.md](v0.32/README.md#host-ram). The deeper measurement of the same mechanism (prompt-token reuse under real
 agent use, host-RAM vs GPU-pool split, load bandwidth) was taken on the 0.30 line:
-[docs/line-0.30.md](v0.30/README.md#the-host-ram-kv-tier-030-measurements).
+[v0.30/README.md](v0.30/README.md#the-host-ram-kv-tier-030-measurements).
 
 ## Quick start (0.32, current line)
 
@@ -191,7 +191,7 @@ beyond 2K and must not be served. Against dense, its build history, what is in t
 2. **A stricter token compare**: the greedy compare checks for garbage, not equivalence; the gate rows will be re-run with
    the stricter one.
 
-The 0.30 line's open items: [docs/line-0.30.md](v0.30/README.md#work-in-progress-on-the-030-line-not-in-the-series).
+The 0.30 line's open items: [v0.30/README.md](v0.30/README.md#work-in-progress-on-the-030-line-not-in-the-series).
 
 ## The 0.30 line (stable fallback)
 
