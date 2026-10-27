@@ -15,7 +15,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=ced6857afa0ea7b2e3f0846a62e1394e90f15607
 URL=https://github.com/Lumnus/vllm.git
-[ $# -ge 2 ] || { sed -n 2,14p "$0"; exit 2; }
+[ $# -ge 2 ] || { sed -n 2,13p "$0"; exit 2; }
 rel=$1; dir=$2; mode=${3:-clone}
 [ ! -e "$dir" ] || { echo "$dir exists" >&2; exit 1; }
 case "$rel" in

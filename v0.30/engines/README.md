@@ -1,7 +1,7 @@
 # Example engines (0.30 line)
 
 These are the 0.30 line's engines ([the 0.30 page](../README.md)). The current line's engine files are in [v0.32/engines/](../../v0.32/engines/)
-([v0.32/README.md](../../v0.32/README.md)); the two serve configs here are shared with it.
+([v0.32/README.md](../../v0.32/README.md)); `serve-config-intel-autoround.json` here is also the 0.32 line's dense serve config.
 
 Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
 KV size to your host.

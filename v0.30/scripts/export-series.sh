@@ -7,7 +7,7 @@
 #              https://github.com/Lumnus/vllm.git)
 #   --ref      branch, tag or commit (default: b70/v0.30.0-stable, the one release branch from 0.30.0-b70.2 on; a
 #              remote-tracking name like origin/b70/v0.30.0-stable works)
-#   --out      where to write ((default: v0.30/patches/))
+#   --out      where to write (default: v0.30/patches/)
 #
 # Every commit on BASE..REF must have a key in v0.30/patches/series.txt; an unknown commit is an error, so the
 # series cannot silently grow or shrink. Output is byte-reproducible for a given commit graph.
@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
     --git-dir) gd=$2; shift 2 ;;
     --ref) ref=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
-    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,13p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

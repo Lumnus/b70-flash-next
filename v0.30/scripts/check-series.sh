@@ -6,6 +6,7 @@
 # Run it before tagging a release and before building an image: the image is built from v0.30/patches/, the fork
 # branch is where the code lives, and the two must not drift.
 set -euo pipefail
+case "${1:-}" in -h|--help) sed -n 2,7p "$0"; exit 0 ;; esac
 here=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 "$here/scripts/export-series.sh" "$@" --out "$tmp" >/dev/null
