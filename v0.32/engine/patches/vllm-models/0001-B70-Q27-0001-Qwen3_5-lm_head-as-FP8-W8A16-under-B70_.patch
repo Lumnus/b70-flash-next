@@ -1,0 +1,125 @@
+From 89814245d988cf34df23253256893989d34516cc Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 01:09:34 +0000
+Subject: [PATCH 1/8] B70-Q27-0001: Qwen3_5 lm_head as FP8 W8A16 under
+ B70_HEAD_FP8=1
+
+Wire the qwen4_exp B70-0048/0053 helper (maybe_prepare_head_fp8) into the dense
+Qwen3.5/3.8 classes: Qwen3_5ForCausalLMBase.forward / compute_logits /
+compute_logits_local and Qwen3_5ForConditionalGeneration.forward call
+_b70_qwen35_head_fp8, which converts the BF16 lm_head shard to FP8 E4M3 (row
+scale) behind lm_head.quant_method at the first eager forward and releases the
+BF16 shard. A DFlash2/MTP drafter that shares the lm_head module reads the same
+FP8 quant_method.
+
+Gates: env B70_HEAD_FP8=1, XPU (helper), language model isinstance
+Qwen3_5ForCausalLMBase; skipped with a warning when tied, non-BF16, PP-missing
+or head_dtype-overridden. Qwen4Exp (Flash-Next) classes never reach it:
+Qwen4ExpForCausalLM is not a Qwen3_5ForCausalLMBase and
+Qwen4ExpForConditionalGeneration overrides forward. Boot line:
+'B70 head FP8: Qwen3_5 lm_head <rows> x <k> -> fp8 w8a16'.
+---
+ vllm/model_executor/models/qwen3_5.py | 56 +++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index f105948f92..23fe27d589 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -24,6 +24,7 @@
+ # limitations under the License.
+ """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
+ 
++import os
+ from collections.abc import Iterable
+ from typing import ClassVar
+ 
+@@ -108,6 +109,57 @@ from .utils import (
+ logger = init_logger(__name__)
+ 
+ 
++def _b70_qwen35_head_fp8(lm: nn.Module) -> None:
++    """B70-Q27-0001: B70_HEAD_FP8=1 (XPU) reads the Qwen3.5/3.8 lm_head as FP8 W8A16.
++
++    Reuses the qwen4_exp helper (B70-0048/0053): at the first eager forward the
++    BF16 shard becomes an FP8 E4M3 copy (one scale per vocab row) behind
++    lm_head.quant_method, and the BF16 shard is released. A drafter sharing the
++    lm_head module (DFlash2 / MTP, get_target_lm_head) uses the same quant_method.
++    Only for a Qwen3_5ForCausalLMBase language model; env unset -> one flag check.
++    """
++    if getattr(lm, "_b70_head_fp8_checked", False):
++        return
++    if os.environ.get("B70_HEAD_FP8", "0") != "1" or not isinstance(
++        lm, Qwen3_5ForCausalLMBase
++    ):
++        lm._b70_head_fp8_checked = True
++        return
++    head = getattr(lm, "lm_head", None)
++    weight = getattr(head, "weight", None)
++    head_dtype = getattr(getattr(lm, "logits_processor", None), "head_dtype", None)
++    why = None
++    if head is None or isinstance(head, PPMissingLayer):
++        why = "no lm_head on this rank"
++    elif getattr(lm.config, "tie_word_embeddings", False) or head is getattr(
++        lm.model, "embed_tokens", None
++    ):
++        why = "lm_head tied to embed_tokens"
++    elif (
++        not isinstance(weight, torch.Tensor)
++        or weight.dim() != 2
++        or weight.dtype != torch.bfloat16
++    ):
++        why = "lm_head is not a plain BF16 weight"
++    elif head_dtype is not None and head_dtype != weight.dtype:
++        why = f"head_dtype override {head_dtype}"
++    if why is not None:
++        lm._b70_head_fp8_checked = True
++        logger.warning_once("B70 head FP8: Qwen3_5 lm_head left BF16 (%s)", why)
++        return
++    shape = tuple(weight.shape)
++    from vllm.models.qwen4_exp.nvidia.b70_fp8_head import (
++        B70Fp8Head,
++        maybe_prepare_head_fp8,
++    )
++
++    maybe_prepare_head_fp8(lm)
++    if isinstance(getattr(head, "quant_method", None), B70Fp8Head):
++        logger.info_once(
++            "B70 head FP8: Qwen3_5 lm_head %d x %d -> fp8 w8a16", shape[0], shape[1]
++        )
++
++
+ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
+     def get_hf_config(self):
+         return self.ctx.get_hf_config(Qwen3_5Config)
+@@ -378,6 +430,7 @@ class Qwen3_5ForCausalLMBase(
+         inputs_embeds: torch.Tensor | None = None,
+         **kwargs: object,
+     ):
++        _b70_qwen35_head_fp8(self)
+         hidden_states = self.model(
+             input_ids, positions, intermediate_tensors, inputs_embeds
+         )
+@@ -427,12 +480,14 @@ class Qwen3_5ForCausalLMBase(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
++        _b70_qwen35_head_fp8(self)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def compute_logits_local(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
++        _b70_qwen35_head_fp8(self)
+         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -589,6 +644,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         if intermediate_tensors is not None:
+             inputs_embeds = None
+ 
++        _b70_qwen35_head_fp8(self.language_model)
+         hidden_states = self.language_model.model(
+             input_ids=input_ids,
+             positions=positions,

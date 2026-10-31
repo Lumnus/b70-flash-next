@@ -1,0 +1,687 @@
+From 6d4f1c99a9ee1e2748da54be99bcb77bf5cbde0d Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 02:21:57 +0000
+Subject: [PATCH 6/8] B70-Q27-0006: DFlash2 shortlist draft vocab
+ (B70_DFLASH_DRAFT_VOCAB)
+
+B70_DFLASH_DRAFT_VOCAB=<token id file> gives the DFlash2 drafter of a Qwen3_5 target
+its own small head: the target lm_head rows of a token shortlist, used only for the
+drafter's candidate top-k. The target keeps its full-vocab head (B70_HEAD_FP8
+included) and verifies against the full distribution, so the output distribution is
+unchanged: DFlash2's q is already supported on the K candidates only and the walk and
+the rejection read the same cached scores; the shortlist only changes which K ids.
+
+Rows are balanced over TP ranks (position i -> rank i % tp), exchanged once at load
+over the TP gloo group from the BF16 shards; under B70_HEAD_FP8=1 on XPU the copy is
+FP8 W8A16 with the target's per-row recipe. One-time log "B70 DFlash draft vocab: <n>
+tokens". Unset -> nothing built, stock compute_candidates. LiLiCorr and non-Qwen3_5
+targets (Flash-Next Qwen4Exp) are off. Idea: steveseguin/b70-optimization-lab R294.
+
+CPU tests: closed-form single-position exactness (20 cases), two-position block
+chi-square (shortlist p=0.39, full-vocab p=0.35, inconsistent-q negative control
+chi2=23680), head == full-vocab top-k on the shortlist at TP1/TP2 (gloo), off paths.
+---
+ .../test_b70_dflash_draft_vocab.py            | 380 ++++++++++++++++++
+ vllm/model_executor/models/qwen3_dflash2.py   |   8 +
+ .../gpu/spec_decode/dflash2/draft_vocab.py    | 219 ++++++++++
+ .../gpu/spec_decode/dflash2/speculator.py     |  15 +
+ 4 files changed, 622 insertions(+)
+ create mode 100644 tests/v1/spec_decode/test_b70_dflash_draft_vocab.py
+ create mode 100644 vllm/v1/worker/gpu/spec_decode/dflash2/draft_vocab.py
+
+diff --git a/tests/v1/spec_decode/test_b70_dflash_draft_vocab.py b/tests/v1/spec_decode/test_b70_dflash_draft_vocab.py
+new file mode 100644
+index 0000000000..c110d06293
+--- /dev/null
++++ b/tests/v1/spec_decode/test_b70_dflash_draft_vocab.py
+@@ -0,0 +1,380 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-Q27-0006: CPU proofs for the DFlash2 shortlist draft head
++(B70_DFLASH_DRAFT_VOCAB).
++
++1. Exactness of the verification math with a shortlist draft (draft probs 0 outside the
++   shortlist and outside the K candidates): the single-position output distribution,
++   computed in closed form with the rejection kernel's own formulas, equals the target;
++   and a Monte Carlo run of the two-position block (Markov candidate walk, standard
++   rejection, residual resample, bonus, next step from the resampled context) matches
++   the target joint by chi-square.
++2. The shortlist head returns the full-vocab top-k restricted to the shortlist (the same
++   k values bit for bit; among tied bf16 values either id), at TP1 and at TP2 (two
++   gloo CPU processes: the balanced row exchange and the all-gather merge).
++3. Env unset / non-Qwen3_5 target (Flash-Next Qwen4Exp) -> no head; compute_candidates
++   takes the stock call. No device is opened: everything runs on CPU tensors.
++"""
++
++import os
++import tempfile
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.multiprocessing as mp
++from vllm.v1.worker.gpu.spec_decode.dflash2 import draft_vocab as dv
++
++NEG_INF = float("-inf")
++
++
++# ---- 1. sampling math ---
++# The verification below mirrors
++# vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:
++#   q from draft_logits / temp with logsumexp over the vocab, -inf rows give q = 0
++#   (_compute_local_logits_stats_kernel, _compute_global_logprobs_and_logsumexp);
++#   accept iff log p(x) > log u + log q(x) (_rejection_kernel, standard branch);
++# residual logits: ratio = exp(log q - log p); where(ratio < 1, log p + log1p(-ratio),
++# -inf)
++# (_resample_kernel), then a Gumbel argmax over the residual (_seeded_resample_argmax).
++# The draft side mirrors dflash2/speculator.py: candidates = top-K of the (shortlist)
++# head,
++# a Markov walk over K with scores[prev, :] (_selector_walk_kernel), and the realized
++# scores
++# cached at the K candidate ids, -inf elsewhere (_cache_draft_logits_kernel).
++
++
++def _logsoftmax(x):
++    return torch.log_softmax(x, dim=-1)
++
++
++def _residual_logits(logp, logq):
++    ratio = torch.exp(logq - logp)
++    return torch.where(
++        ratio < 1.0, logp + torch.log1p(-ratio), torch.full_like(logp, NEG_INF)
++    )
++
++
++def _draft_row(vocab, cand_ids, cand_scores):
++    """draft_logits row as the cache kernel leaves it: K scores, -inf elsewhere."""
++    row = torch.full((vocab,), NEG_INF, dtype=torch.float64)
++    row[cand_ids] = cand_scores
++    return row
++
++
++def _output_dist(p_logits, draft_row, temp):
++    """Closed-form output distribution of one verified position (kernel formulas)."""
++    logp = _logsoftmax(p_logits / temp)
++    logq = _logsoftmax(draft_row / temp)
++    p, q = logp.exp(), logq.exp()
++    accept = torch.where(q > 0, torch.minimum(q, p), torch.zeros_like(q))
++    res = _residual_logits(logp, logq)
++    res_mass = torch.exp(res).sum()
++    rej = 1.0 - accept.sum()
++    out = accept.clone()
++    if res_mass > 0:
++        out += rej * torch.exp(res) / res_mass
++    return out, p
++
++
++def _shortlist_candidates(head_logits, shortlist, k):
++    masked = torch.full_like(head_logits, NEG_INF)
++    masked[shortlist] = head_logits[shortlist]
++    vals, ids = torch.topk(masked, k)
++    return ids, vals
++
++
++@pytest.mark.parametrize("seed", range(20))
++def test_single_position_exact(seed):
++    g = torch.Generator().manual_seed(seed)
++    vocab, k, temp = 64, 6, [0.7, 1.0, 1.3][seed % 3]
++    shortlist = torch.randperm(vocab, generator=g)[:24]
++    p_logits = torch.randn(vocab, generator=g, dtype=torch.float64) * 2.5
++    # Edge cases: a target-impossible token inside the shortlist, heavy target mass
++    # outside it.
++    p_logits[shortlist[0]] = NEG_INF
++    outside = [t for t in range(vocab) if t not in set(shortlist.tolist())]
++    p_logits[outside[seed % len(outside)]] += 4.0
++    head = torch.randn(vocab, generator=g, dtype=torch.float64) * 2.0
++    head[shortlist[0]] += 10.0  # the draft proposes the token the target forbids
++    ids, unary = _shortlist_candidates(head, shortlist, k)
++    scores = unary + torch.randn(k, generator=g, dtype=torch.float64)
++    row = _draft_row(vocab, ids, scores)
++    out, p = _output_dist(p_logits, row, temp)
++    assert set(ids.tolist()) <= set(shortlist.tolist())
++    assert torch.all(
++        row[[t for t in range(vocab) if t not in set(ids.tolist())]] == NEG_INF
++    )
++    torch.testing.assert_close(out, p, atol=1e-12, rtol=0)
++
++
++def _gumbel_argmax(logits, g):
++    u = torch.rand(logits.shape, generator=g, dtype=torch.float64).clamp_min(1e-300)
++    return torch.argmax(logits - torch.log(-torch.log(u)), dim=-1)
++
++
++@pytest.mark.parametrize("mode", ["shortlist", "full_vocab", "inconsistent_q"])
++def test_two_position_block_chi_square(mode):
++    """Joint of the first two emitted tokens == p1(y1) p2(y2|y1) under the full step
++    loop.
++    full_vocab is the stock candidate pool; inconsistent_q is a negative control whose
++    acceptance ratio reads a q other than the one the walk sampled (unary scores without
++    the
++    edge term), which must fail."""
++    g = torch.Generator().manual_seed(1234)
++    vocab, k, temp, n = 16, 4, 0.8, 400_000
++    shortlist = torch.tensor([0, 1, 2, 3, 5, 8, 9, 12, 13])
++    if mode == "full_vocab":
++        shortlist = torch.arange(vocab)
++    p1_logits = torch.randn(vocab, generator=g, dtype=torch.float64) * 1.5
++    p1_logits[14] += 1.5  # mass outside the shortlist
++    p2_logits = torch.randn(vocab, vocab, generator=g, dtype=torch.float64) * 1.5
++    p2_logits[:, 2] = NEG_INF  # p2 never emits 2; the draft may still propose it
++    logp1 = _logsoftmax(p1_logits / temp)
++    logp2 = _logsoftmax(p2_logits / temp)
++    # Drafter: a noisy copy of the target (so drafts are often accepted and position 2
++    # is
++    # exercised), head logits per (context, block position), edge scores over K x K that
++    # carry the dependence on the previous candidate, as the selector does.
++    p2_fin = p2_logits.clamp_min(-3.0)
++
++    def noise(*shape):
++        return torch.randn(*shape, generator=g, dtype=torch.float64) * 0.7
++
++    head_ctx0 = torch.stack([p1_logits + noise(vocab), p2_fin.mean(0) + noise(vocab)])
++    head_ctx0[1, 2] += 2.0  # the draft proposes a token p2 forbids
++    head_ctx1 = p2_fin + noise(vocab, vocab)
++
++    c1, u1 = _shortlist_candidates(head_ctx0[0], shortlist, k)
++    c2, u2 = _shortlist_candidates(head_ctx0[1], shortlist, k)
++    edges = p2_fin[c1][:, c2] - p2_fin.mean(0)[c2][None, :] + noise(k, k)
++    q1_row = _draft_row(vocab, c1, u1)
++    # Step 1 draft: x1 index i ~ softmax(u1/T), x2 index j ~ softmax((u2 + edges[i])/T).
++    i = _gumbel_argmax((u1 / temp).expand(n, k), g)
++    s2 = u2[None, :] + edges[i]
++    j = _gumbel_argmax(s2 / temp, g)
++    x1, x2 = c1[i], c2[j]
++    lq1 = _logsoftmax(q1_row / temp)
++    # Position 1.
++    u = torch.rand(n, generator=g, dtype=torch.float64)
++    acc1 = logp1[x1] > torch.log(u) + lq1[x1]
++    y1 = torch.where(
++        acc1, x1, _gumbel_argmax(_residual_logits(logp1, lq1).expand(n, vocab), g)
++    )
++    # Position 2 after an accept: verify x2 against p2(.|x1) with q2 = the realized row.
++    q2_rows = torch.full((n, vocab), NEG_INF, dtype=torch.float64)
++    q2_rows.scatter_(
++        1, c2.expand(n, k), u2.expand(n, k) if mode == "inconsistent_q" else s2
++    )
++    lq2 = _logsoftmax(q2_rows / temp)
++    lp2_y1 = logp2[y1]
++    u = torch.rand(n, generator=g, dtype=torch.float64)
++    acc2 = (
++        lp2_y1.gather(1, x2[:, None])[:, 0]
++        > torch.log(u) + lq2.gather(1, x2[:, None])[:, 0]
++    )
++    y2_block = torch.where(acc2, x2, _gumbel_argmax(_residual_logits(lp2_y1, lq2), g))
++    # After a reject at position 1: the next step drafts from context y1 and verifies
++    # its
++    # first draft against p2(.|y1).
++    ids_ctx1 = torch.stack(
++        [_shortlist_candidates(head_ctx1[t], shortlist, k)[0] for t in range(vocab)]
++    )
++    un_ctx1 = torch.stack(
++        [_shortlist_candidates(head_ctx1[t], shortlist, k)[1] for t in range(vocab)]
++    )
++    cc, uu = ids_ctx1[y1], un_ctx1[y1]
++    ii = _gumbel_argmax(uu / temp, g)
++    xx = cc.gather(1, ii[:, None])[:, 0]
++    qq_rows = torch.full((n, vocab), NEG_INF, dtype=torch.float64)
++    qq_rows.scatter_(1, cc, uu)
++    lqq = _logsoftmax(qq_rows / temp)
++    u = torch.rand(n, generator=g, dtype=torch.float64)
++    acc3 = (
++        lp2_y1.gather(1, xx[:, None])[:, 0]
++        > torch.log(u) + lqq.gather(1, xx[:, None])[:, 0]
++    )
++    y2_next = torch.where(acc3, xx, _gumbel_argmax(_residual_logits(lp2_y1, lqq), g))
++    y2 = torch.where(acc1, y2_block, y2_next)
++
++    joint = (logp1[:, None] + logp2).exp()
++    expected = (joint * n).flatten()
++    observed = torch.bincount(y1 * vocab + y2, minlength=vocab * vocab).double()
++    keep = expected >= 5
++    other = (expected[~keep].sum(), observed[~keep].sum())
++    exp_c = torch.cat([expected[keep], other[0][None]])
++    obs_c = torch.cat([observed[keep], other[1][None]])
++    chi2 = ((obs_c - exp_c) ** 2 / exp_c).sum()
++    df = exp_c.numel() - 1
++    pval = torch.special.gammaincc(torch.tensor(df / 2.0), chi2 / 2.0).item()
++    print(
++        f"two-position [{mode}] chi-square {chi2.item():.1f} df {df} p {pval:.3g} "
++        f"accept1 {acc1.double().mean():.3f} accept2|1 {acc2[acc1].double().mean():.3f}"
++    )
++    if mode == "inconsistent_q":
++        assert pval < 1e-6
++        return
++    assert observed[expected == 0].sum() == 0, "emitted a target-impossible pair"
++    assert pval > 1e-3
++    assert observed.sum() == n
++
++
++# ---- 2. the head itself ---
++
++
++class _Proc:
++    def __init__(self, scale=1.0, soft_cap=None):
++        self.scale, self.soft_cap = scale, soft_cap
++
++
++def _ref_topk(full_w, hidden, shortlist, k, proc):
++    logits = torch.nn.functional.linear(hidden, full_w)
++    masked = torch.full_like(logits, NEG_INF)
++    masked[:, shortlist] = logits[:, shortlist]
++    v, i = torch.topk(masked, k, dim=-1)
++    v = v.float() * proc.scale
++    if proc.soft_cap is not None:
++        v = torch.tanh(v / proc.soft_cap) * proc.soft_cap
++    return i, v
++
++
++def _fake_lm_head(full_w, tp_size, tp_rank):
++    vocab = full_w.shape[0]
++    per = vocab // tp_size
++    start, end = tp_rank * per, (tp_rank + 1) * per
++    return SimpleNamespace(
++        weight=full_w[start:end].clone(),
++        shard_indices=SimpleNamespace(
++            org_vocab_start_index=start, org_vocab_end_index=end
++        ),
++        tp_size=tp_size,
++        org_vocab_size=vocab,
++    )
++
++
++def _tp_worker(rank, world, port, path, out):
++    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", str(port)
++    torch.distributed.init_process_group("gloo", rank=rank, world_size=world)
++    import vllm.distributed as vd
++    import vllm.distributed.parallel_state as ps
++
++    group = torch.distributed.group.WORLD
++    ps.get_tp_group = lambda: SimpleNamespace(cpu_group=group)
++    ps.get_tensor_model_parallel_world_size = lambda: world
++    ps.get_tensor_model_parallel_rank = lambda: rank
++
++    def all_gather(t, dim=-1):
++        parts = [torch.empty_like(t) for _ in range(world)]
++        torch.distributed.all_gather(parts, t.contiguous(), group=group)
++        return torch.cat(parts, dim=dim)
++
++    vd.tensor_model_parallel_all_gather = all_gather
++    dv.target_is_qwen3_5 = lambda m: True
++    g = torch.Generator().manual_seed(7)
++    vocab, hidden, k = 512, 64, 16
++    full_w = torch.randn(vocab, hidden, generator=g).to(torch.bfloat16)
++    x = torch.randn(10, hidden, generator=g).to(torch.bfloat16)
++    os.environ[dv.ENV] = path
++    draft = SimpleNamespace(lm_head=_fake_lm_head(full_w, world, rank))
++    head = dv.maybe_build_draft_vocab_head(draft, object(), k)
++    proc = _Proc(scale=0.5, soft_cap=30.0)
++    ids, vals = head.get_top_k_tokens(proc, x, k)
++    shortlist = dv.read_draft_vocab(path, vocab)
++    # Rows are the exact target rows of this rank's balanced share.
++    mine = dv.rank_assignment(shortlist, world, rank)
++    assert head.ids.tolist() == mine
++    assert torch.equal(head.weight, full_w[mine])
++    ref_i, ref_v = _ref_topk(full_w, x, shortlist, k, proc)
++    # bf16 logits tie often, and top-k among ties is not unique, so the check is: the
++    # same
++    # k values as the reference, every returned id in the shortlist and unique, and each
++    # returned id's own full-head logit (after scale / soft cap) equal to its returned
++    # value.
++    same_vals = torch.equal(vals.sort(-1).values, ref_v.sort(-1).values)
++    full = torch.nn.functional.linear(x, full_w).float() * proc.scale
++    full = torch.tanh(full / proc.soft_cap) * proc.soft_cap
++    own = torch.equal(full.gather(1, ids), vals)
++    in_list = set(ids.flatten().tolist()) <= set(shortlist)
++    unique = all(len(set(r)) == k for r in ids.tolist())
++    print(
++        f"rank {rank}: values equal {same_vals}, ids score their values {own}, "
++        f"in shortlist {in_list}, unique {unique}, "
++        f"id sets equal {torch.equal(ids.sort(-1).values, ref_i.sort(-1).values)}"
++    )
++    out[rank] = (same_vals and own and in_list and unique, len(mine))
++    torch.distributed.destroy_process_group()
++
++
++def _write_ids(ids):
++    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
++        f.write("\n".join(map(str, ids)) + "\n")
++    return f.name
++
++
++@pytest.mark.parametrize("world", [1, 2])
++def test_head_matches_full_vocab_topk_on_shortlist(world):
++    # Skewed list (mostly low ids, as the frequency list is) to exercise the balanced
++    # split.
++    g = torch.Generator().manual_seed(3)
++    low = torch.randperm(256, generator=g)[:150].tolist()
++    high = (256 + torch.randperm(256, generator=g)[:30]).tolist()
++    path = _write_ids(low + high)
++    out = mp.Manager().dict()
++    port = 29500 + (os.getpid() % 1000)
++    mp.spawn(_tp_worker, args=(world, port, path, out), nprocs=world, join=True)
++    for r in range(world):
++        ok, n = out[r]
++        assert ok, f"rank {r} top-k differs from the full-vocab reference"
++    sizes = [out[r][1] for r in range(world)]
++    assert max(sizes) - min(sizes) <= 1 and sum(sizes) == 180
++
++
++# ---- 3. off paths ---
++
++
++def test_env_unset_builds_nothing(monkeypatch):
++    monkeypatch.delenv(dv.ENV, raising=False)
++    assert dv.maybe_build_draft_vocab_head(object(), object(), 16) is None
++
++
++def test_flash_next_target_is_off(monkeypatch, tmp_path):
++    from vllm.model_executor.models.qwen3_5 import (
++        Qwen3_5ForCausalLM,
++        Qwen3_5ForCausalLMBase,
++        Qwen3_5ForConditionalGeneration,
++    )
++    from vllm.models.qwen4_exp.nvidia.model import (
++        Qwen4ExpForCausalLM,
++        Qwen4ExpForConditionalGeneration,
++    )
++
++    for cls in (Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration):
++        assert not issubclass(cls, Qwen3_5ForCausalLMBase)
++    fn_lm = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
++    assert not dv.target_is_qwen3_5(SimpleNamespace(get_language_model=lambda: fn_lm))
++    q_lm = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
++    assert dv.target_is_qwen3_5(SimpleNamespace(get_language_model=lambda: q_lm))
++    assert hasattr(Qwen3_5ForConditionalGeneration, "get_language_model")
++    p = tmp_path / "ids.txt"
++    p.write_text("1 2 3\n")
++    monkeypatch.setenv(dv.ENV, str(p))
++    assert (
++        dv.maybe_build_draft_vocab_head(
++            object(), SimpleNamespace(get_language_model=lambda: fn_lm), 16
++        )
++        is None
++    )
++
++
++def test_compute_candidates_stock_call_without_head():
++    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
++
++    calls = []
++    stub = SimpleNamespace(
++        lm_head="LM_HEAD",
++        model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16)),
++        candidate_logits_processor=SimpleNamespace(
++            get_top_k_tokens=lambda *a: calls.append(a) or ("ids", "vals")
++        ),
++    )
++    assert DFlash2Qwen3ForCausalLM.compute_candidates(stub, "H") == ("ids", "vals")
++    assert calls == [("LM_HEAD", "H", 16)]
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index 861a7c5412..ea3392921e 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -408,6 +408,14 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        # B70-Q27-0006: B70_DFLASH_DRAFT_VOCAB -> the shortlist head (draft_vocab.py).
++        head = self.__dict__.get("_b70_draft_vocab_head")
++        if head is not None:
++            return head.get_top_k_tokens(
++                self.candidate_logits_processor,
++                hidden_states,
++                self.model.candidate_selector.top_k,
++            )
+         return self.candidate_logits_processor.get_top_k_tokens(
+             self.lm_head, hidden_states, self.model.candidate_selector.top_k
+         )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/draft_vocab.py b/vllm/v1/worker/gpu/spec_decode/dflash2/draft_vocab.py
+new file mode 100644
+index 0000000000..f8b118ec58
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/draft_vocab.py
+@@ -0,0 +1,219 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-Q27-0006: a reduced draft vocabulary for the DFlash2 drafter on Qwen3_5 targets.
++
++B70_DFLASH_DRAFT_VOCAB=<file of token ids, whitespace separated> gives the DFlash2
++drafter its own small head: the target lm_head rows of a token shortlist (e.g. 67,263 of
++248,320), used only for the drafter's candidate top-k (compute_candidates). The target
++keeps its full-vocab head, B70_HEAD_FP8 included, and verifies every draft against the
++full distribution. Idea and list: steveseguin/b70-optimization-lab R294 (Unlicense).
++
++Exactness: DFlash2's proposal distribution is already supported on its top-k candidates
++only (draft_logits holds the realized scores at the K candidate ids and -inf elsewhere,
++CandidateSampler). The shortlist only changes which K ids are candidates; the walk and
++the rejection sampler read the same cached scores, so q stays one consistent
++distribution and standard rejection with residual max(p - q, 0) over the full vocab
++keeps the output exact.
++
++Rows are spread evenly over the TP ranks (shortlist position i -> rank i % tp), not by
++vocab shard: the frequency list sits mostly in the low ids, so by-shard rank 0 would
++read 58K rows and rank 1 9K. Rows are exchanged once at load over the TP CPU (gloo)
++group, from the BF16 shards (before B70_HEAD_FP8 releases them at the first forward).
++Under B70_HEAD_FP8=1 on XPU the copy is FP8 W8A16 with the target's own per-row recipe
++(b70_fp8_head_of), so a shortlisted row scores exactly as the target's FP8 row would.
++
++Env unset -> nothing is built; compute_candidates takes the stock path. Only for a
++DFlash2 drafter whose target language model is a Qwen3_5ForCausalLMBase (Flash-Next's
++Qwen4Exp targets are left alone)."""
++
++import os
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV = "B70_DFLASH_DRAFT_VOCAB"
++_CHUNK_ROWS = 4096
++
++
++def read_draft_vocab(path: str, vocab_size: int) -> list[int]:
++    """Sorted unique token ids from a whitespace-separated file; each in [0, vocab)."""
++    with open(path) as f:
++        ids = sorted({int(t) for t in f.read().split()})
++    if not ids:
++        raise ValueError(f"{ENV}: {path} holds no token ids")
++    if ids[0] < 0 or ids[-1] >= vocab_size:
++        raise ValueError(
++            f"{ENV}: ids out of range [0, {vocab_size}): {ids[0]}..{ids[-1]}"
++        )
++    return ids
++
++
++def rank_assignment(ids: list[int], tp_size: int, tp_rank: int) -> list[int]:
++    """Shortlist positions i with i % tp_size == tp_rank: disjoint, balanced (+-1)."""
++    return ids[tp_rank::tp_size]
++
++
++def target_is_qwen3_5(target_model: nn.Module) -> bool:
++    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
++
++    lm = (
++        target_model.get_language_model()
++        if hasattr(target_model, "get_language_model")
++        else target_model
++    )
++    return isinstance(lm, Qwen3_5ForCausalLMBase)
++
++
++class B70DraftVocabHead(nn.Module):
++    """This rank's shortlist rows of the target lm_head and their global ids."""
++
++    def __init__(self, weight: torch.Tensor, ids: torch.Tensor, n_total: int):
++        super().__init__()
++        self.weight = nn.Parameter(weight, requires_grad=False)
++        self.register_buffer("ids", ids, persistent=False)
++        self.n_total = n_total
++        self.fp8 = None
++
++    def maybe_fp8(self) -> None:
++        if os.environ.get("B70_HEAD_FP8", "0") != "1":
++            return
++        from vllm.platforms import current_platform
++
++        if not current_platform.is_xpu():
++            return
++        from vllm.models.qwen4_exp.nvidia.b70_fp8_head import b70_fp8_head_of
++
++        self.fp8 = b70_fp8_head_of(self, release_bf16=True)
++
++    def project(self, x: torch.Tensor) -> torch.Tensor:
++        if self.fp8 is not None:
++            return self.fp8.apply(self, x)
++        return F.linear(x, self.weight)
++
++    def get_top_k_tokens(
++        self, processor, hidden_states: torch.Tensor, k: int
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """LogitsProcessor.get_top_k_tokens over the shortlist: local top-k, global ids,
++        TP all-gather of k values + ids, global top-k, then scale / soft cap on the
++        k."""
++        from vllm.distributed import tensor_model_parallel_all_gather
++        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
++
++        logits = self.project(hidden_states)
++        values, local = torch.topk(logits, k, dim=-1)
++        ids = self.ids[local]
++        if get_tensor_model_parallel_world_size() > 1:
++            values = tensor_model_parallel_all_gather(values, dim=-1)
++            ids = tensor_model_parallel_all_gather(ids, dim=-1)
++            values, selected = torch.topk(values, k, dim=-1)
++            ids = ids.gather(-1, selected)
++        values = values.float()
++        if processor.scale != 1.0:
++            values = values * processor.scale
++        if processor.soft_cap is not None:
++            values = torch.tanh(values / processor.soft_cap) * processor.soft_cap
++        return ids, values
++
++
++def _gather_rows(
++    lm_head: nn.Module, mine: list[int], all_ids: list[int], tp_size: int, tp_rank: int
++) -> torch.Tensor:
++    """BF16 rows for `mine` from the vocab-sharded lm_head: each chunk of shortlist rows
++    is
++    filled by its owning rank (zeros elsewhere) and summed over the TP CPU group. x + 0
++    is
++    exact, so every row arrives bit-identical."""
++    weight = lm_head.weight
++    hidden = weight.shape[1]
++    si = lm_head.shard_indices
++    start, end = si.org_vocab_start_index, si.org_vocab_end_index
++    if tp_size == 1:
++        idx = torch.tensor([t - start for t in mine], device=weight.device)
++        return weight.index_select(0, idx).contiguous()
++    from vllm.distributed.parallel_state import get_tp_group
++
++    cpu_group = get_tp_group().cpu_group
++    out = torch.empty((len(mine), hidden), dtype=weight.dtype, device=weight.device)
++    filled = 0
++    for c in range(0, len(all_ids), _CHUNK_ROWS):
++        chunk = all_ids[c : c + _CHUNK_ROWS]
++        buf = torch.zeros((len(chunk), hidden), dtype=torch.float32)
++        own = [j for j, t in enumerate(chunk) if start <= t < end]
++        if own:
++            rows = torch.tensor([chunk[j] - start for j in own], device=weight.device)
++            buf[torch.tensor(own)] = weight.index_select(0, rows).float().cpu()
++        torch.distributed.all_reduce(buf, group=cpu_group)
++        keep = [j for j in range(len(chunk)) if (c + j) % tp_size == tp_rank]
++        out[filled : filled + len(keep)] = buf[torch.tensor(keep)].to(
++            device=weight.device, dtype=weight.dtype
++        )
++        filled += len(keep)
++    assert filled == len(mine)
++    return out
++
++
++def maybe_build_draft_vocab_head(
++    draft_model: nn.Module, target_model: nn.Module, top_k: int
++) -> B70DraftVocabHead | None:
++    """Called once from DFlash2Speculator.load_draft_model, on every TP rank."""
++    path = os.environ.get(ENV, "").strip()
++    if not path:
++        return None
++    if not target_is_qwen3_5(target_model):
++        logger.warning_once(
++            "B70 DFlash draft vocab: target %s is not a Qwen3_5 model; off",
++            type(target_model).__name__,
++        )
++        return None
++    lm_head = getattr(draft_model, "lm_head", None)
++    weight = getattr(lm_head, "weight", None)
++    if (
++        not isinstance(weight, torch.Tensor)
++        or weight.dim() != 2
++        or weight.numel() == 0
++        or weight.dtype != torch.bfloat16
++        or getattr(lm_head, "shard_indices", None) is None
++    ):
++        logger.warning_once(
++            "B70 DFlash draft vocab: the shared lm_head is not a plain BF16 "
++            "vocab-parallel weight (already FP8, or quantized); off"
++        )
++        return None
++    from vllm.distributed.parallel_state import (
++        get_tensor_model_parallel_rank,
++        get_tensor_model_parallel_world_size,
++    )
++
++    tp_size = get_tensor_model_parallel_world_size()
++    tp_rank = get_tensor_model_parallel_rank()
++    if getattr(lm_head, "tp_size", tp_size) != tp_size:
++        raise ValueError(f"{ENV}: lm_head TP {lm_head.tp_size} != TP group {tp_size}")
++    vocab = lm_head.org_vocab_size
++    ids = read_draft_vocab(path, vocab)
++    mine = rank_assignment(ids, tp_size, tp_rank)
++    if len(mine) < top_k:
++        raise ValueError(
++            f"{ENV}: {len(mine)} rows on TP rank {tp_rank} < selector_top_k {top_k}"
++        )
++    with torch.no_grad():
++        rows = _gather_rows(lm_head, mine, ids, tp_size, tp_rank)
++    head = B70DraftVocabHead(
++        rows, torch.tensor(mine, dtype=torch.int64, device=weight.device), len(ids)
++    )
++    head.maybe_fp8()
++    logger.info_once("B70 DFlash draft vocab: %d tokens", len(ids))
++    logger.info(
++        "B70 DFlash draft vocab: TP rank %d/%d scores %d rows (%s, %.0f MB) of %d; "
++        "target lm_head stays full vocab (%d)",
++        tp_rank,
++        tp_size,
++        len(mine),
++        "fp8 w8a16" if head.fp8 is not None else str(rows.dtype),
++        (head.fp8.w8.numel() if head.fp8 is not None else rows.numel() * 2) / 1e6,
++        len(ids),
++        vocab,
++    )
++    return head
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index bb14621129..d9f868ff15 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -197,6 +197,21 @@ class DFlash2Speculator(DFlashSpeculator):
+             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
+         )
+ 
++    def load_draft_model(self, target_model, target_attn_layer_names):
++        model = super().load_draft_model(target_model, target_attn_layer_names)
++        if type(self) is not DFlash2Speculator:  # LiLiCorr and other subclasses
++            return model
++        # B70-Q27-0006: B70_DFLASH_DRAFT_VOCAB=<ids file> -> a shortlist draft head
++        # (Qwen3_5 targets only). Kept out of the module tree: not a submodule.
++        from vllm.v1.worker.gpu.spec_decode.dflash2.draft_vocab import (
++            maybe_build_draft_vocab_head,
++        )
++
++        head = maybe_build_draft_vocab_head(model, target_model, self.top_k)
++        if head is not None:
++            model.__dict__["_b70_draft_vocab_head"] = head
++        return model
++
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # fp32 so the walk and the rejection that checks it read the same
+         # distribution; -inf because the cache kernel writes only the K

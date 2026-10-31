@@ -1,0 +1,841 @@
+From 9d52b84363a8dd2b02d17d419241d8838ea8e313 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 02:11:07 +0000
+Subject: [PATCH 3/5] [B70][XPU] Native per-token int8 act quant + oneDNN int8
+ W8A8 GEMM
+
+_C::dynamic_per_token_scaled_int8_quant: one work-group per token row,
+absmax reduce then quantize, bit-exact mirror of vLLM's
+xpu_ops.dynamic_per_token_int8_quant_ref (scale rounded to the input
+dtype, round-half-even, precise fp under icpx fast-math).
+
+_xpu_C::int8_scaled_mm: port of vllm-xpu-kernels#196 narrowed to the
+symmetric Int8ScaledMM path (s8 x s8 -> f16/bf16, per-token or
+per-tensor A scale, per-channel or per-tensor B scale, bias). Per-token
+scale as a oneDNN src-scale attribute (groups {1,K}); falls back to a
+binary_mul post-op (bias moved behind it) when oneDNN reports it
+unimplemented, or with B70_INT8_GEMM_SCALE_MODE=postop.
+---
+ CMakeLists.txt                           |   1 +
+ csrc/ops.h                               |   5 +
+ csrc/quantization/int8/int8_quant.cpp    | 195 +++++++++++++++++++
+ csrc/quantization/int8/int8_quant_math.h |  45 +++++
+ csrc/torch_bindings.cpp                  |   9 +
+ csrc/xpu/onednn/int8_gemm_w8a8.h         | 228 +++++++++++++++++++++++
+ csrc/xpu/onednn/onednn_ext.h             |  52 ++++++
+ csrc/xpu/onednn/onednn_matmul.cpp        |  52 ++++++
+ csrc/xpu/onednn/onednn_stub.cpp          |  10 +
+ csrc/xpu/ops.h                           |  10 +
+ csrc/xpu/torch_bindings.cpp              |   7 +
+ tests/test_b70_int8_native.py            |  60 ++++++
+ 12 files changed, 674 insertions(+)
+ create mode 100644 csrc/quantization/int8/int8_quant.cpp
+ create mode 100644 csrc/quantization/int8/int8_quant_math.h
+ create mode 100644 csrc/xpu/onednn/int8_gemm_w8a8.h
+ create mode 100644 tests/test_b70_int8_native.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 997d657ed8..3b06d2a45e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -596,6 +596,7 @@ if(BASIC_KERNELS_ENABLED)
+       "csrc/fused_qknorm_rope.cpp"
+       "csrc/torch_bindings.cpp"
+       "csrc/quantization/fp8/fp8_quant.cpp"
++      "csrc/quantization/int8/int8_quant.cpp"
+       "csrc/quantization/fp4/mxfp4_quant.cpp"
+       "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cpp"
+       "csrc/quantization/fused_kernels/fused_silu_mul_mxfp4_quant.cpp"
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 5d3770d39c..8e1a9faf65 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -236,6 +236,11 @@ void static_scaled_fp8_quant(
+ void dynamic_scaled_fp8_quant(
+     torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scale);
+ 
++// B70: dynamic per-token symmetric int8 activation quant (matches
++// vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref).
++void dynamic_per_token_scaled_int8_quant(
++    torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scales);
++
+ void dynamic_per_token_scaled_fp8_quant(
+     torch::Tensor& out,
+     torch::Tensor const& input,
+diff --git a/csrc/quantization/int8/int8_quant.cpp b/csrc/quantization/int8/int8_quant.cpp
+new file mode 100644
+index 0000000000..61a2ca5754
+--- /dev/null
++++ b/csrc/quantization/int8/int8_quant.cpp
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: Apache-2.0
++// B70 (Lumnus): native dynamic per-token symmetric int8 activation quant.
++//
++// One work-group per token row: pass 1 reduces |x| to the row absmax
++// (reduce_over_group), every work-item derives the same scale, pass 2
++// re-reads the row (L1/L3-resident: K <= 17408 bf16 = 34 KiB) and writes
++// int8. Math lives in int8_quant_math.h and matches
++// vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref exactly.
++#include <ATen/ATen.h>
++#include <ATen/DeviceGuard.h>
++#include <sycl/sycl.hpp>
++
++#include "dispatch_utils.h"
++#include "ops.h"
++#include "utils.h"
++
++#include "quantization/int8/int8_quant_math.h"
++
++#pragma float_control(precise, on, push)
++
++namespace vllm {
++
++template <typename scalar_t, typename scale_t, int VEC>
++class dynamic_per_token_int8_quant_kernel {
++ private:
++  int8_t* out;
++  scale_t* scale;
++  scalar_t const* input;
++  const int64_t in_row_stride;
++  const int hidden_size;
++
++  struct alignas(sizeof(scalar_t) * VEC) in_vec_t {
++    scalar_t v[VEC];
++  };
++  struct alignas(VEC) out_vec_t {
++    int8_t v[VEC];
++  };
++
++ public:
++  dynamic_per_token_int8_quant_kernel(
++      int8_t* out_,
++      scale_t* scale_,
++      scalar_t const* input_,
++      int64_t in_row_stride_,
++      int hidden_size_)
++      : out(out_),
++        scale(scale_),
++        input(input_),
++        in_row_stride(in_row_stride_),
++        hidden_size(hidden_size_) {}
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int tid = item.get_local_id(0);
++    const int nthr = item.get_local_range(0);
++    const int64_t row = item.get_group(0);
++
++    scalar_t const* row_in = input + row * in_row_stride;
++    int8_t* row_out = out + row * static_cast<int64_t>(hidden_size);
++
++    float absmax = 0.0f;
++    if constexpr (VEC > 1) {
++      const int nvec = hidden_size / VEC;
++      auto const* vin = reinterpret_cast<in_vec_t const*>(row_in);
++      for (int i = tid; i < nvec; i += nthr) {
++        in_vec_t x = vin[i];
++#pragma unroll
++        for (int j = 0; j < VEC; ++j) {
++          absmax = int8q::max_f(
++              absmax, int8q::abs_f(static_cast<float>(x.v[j])));
++        }
++      }
++    } else {
++      for (int i = tid; i < hidden_size; i += nthr) {
++        absmax = int8q::max_f(
++            absmax, int8q::abs_f(static_cast<float>(row_in[i])));
++      }
++    }
++    absmax = sycl::reduce_over_group(
++        item.get_group(), absmax, sycl::maximum<float>());
++
++    const float s = int8q::token_scale_from_absmax<scalar_t>(absmax);
++    if (tid == 0) {
++      scale[row] = static_cast<scale_t>(s);
++    }
++
++    if constexpr (VEC > 1) {
++      const int nvec = hidden_size / VEC;
++      auto const* vin = reinterpret_cast<in_vec_t const*>(row_in);
++      auto* vout = reinterpret_cast<out_vec_t*>(row_out);
++      for (int i = tid; i < nvec; i += nthr) {
++        in_vec_t x = vin[i];
++        out_vec_t q;
++#pragma unroll
++        for (int j = 0; j < VEC; ++j) {
++          q.v[j] = int8q::quantize_one(static_cast<float>(x.v[j]), s);
++        }
++        vout[i] = q;
++      }
++    } else {
++      for (int i = tid; i < hidden_size; i += nthr) {
++        row_out[i] = int8q::quantize_one(static_cast<float>(row_in[i]), s);
++      }
++    }
++  }
++};
++
++}  // namespace vllm
++
++#pragma float_control(pop)
++
++namespace {
++
++template <typename scalar_t, typename scale_t, int VEC>
++void launch_int8_quant(
++    sycl::queue& queue,
++    torch::Tensor& out,
++    torch::Tensor const& input,
++    torch::Tensor& scales,
++    int64_t num_tokens,
++    int64_t in_row_stride,
++    int hidden_size) {
++  int wg = 256;
++  const int work = VEC > 1 ? hidden_size / VEC : hidden_size;
++  while (wg > 32 && wg / 2 >= work) wg /= 2;
++  sycl::range<1> grid(num_tokens);
++  sycl::range<1> block(wg);
++  queue.submit([&](sycl::handler& cgh) {
++    auto kernel = vllm::dynamic_per_token_int8_quant_kernel<scalar_t, scale_t, VEC>(
++        out.data_ptr<int8_t>(),
++        reinterpret_cast<scale_t*>(scales.data_ptr()),
++        reinterpret_cast<scalar_t const*>(input.data_ptr()),
++        in_row_stride,
++        hidden_size);
++    cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
++  });
++}
++
++}  // namespace
++
++// out:    int8, contiguous, same shape as input
++// input:  [..., K] fp32/fp16/bf16; last dim contiguous; 2-D may carry a row
++//         stride, higher ranks must be contiguous
++// scales: numel == num_tokens, float32 or input.dtype; value is the scale
++//         rounded to input.dtype (exactly what the reference returns)
++void dynamic_per_token_scaled_int8_quant(
++    torch::Tensor& out, torch::Tensor const& input, torch::Tensor& scales) {
++  TORCH_CHECK(input.dim() >= 1, "int8 quant: input must have rank >= 1");
++  TORCH_CHECK(out.scalar_type() == at::ScalarType::Char, "int8 quant: out must be int8");
++  TORCH_CHECK(out.is_contiguous(), "int8 quant: out must be contiguous");
++  TORCH_CHECK(out.sizes() == input.sizes(), "int8 quant: out/input shape mismatch");
++  TORCH_CHECK(input.stride(-1) == 1, "int8 quant: input last dim must be contiguous");
++  const int64_t hidden64 = input.size(-1);
++  TORCH_CHECK(hidden64 > 0 && hidden64 <= INT32_MAX, "int8 quant: bad hidden size");
++  const int hidden_size = static_cast<int>(hidden64);
++  const int64_t num_tokens = input.numel() / hidden_size;
++  int64_t in_row_stride = hidden_size;
++  if (input.dim() == 2) {
++    in_row_stride = input.stride(0);
++  } else {
++    TORCH_CHECK(input.is_contiguous(), "int8 quant: rank > 2 input must be contiguous");
++  }
++  TORCH_CHECK(scales.is_contiguous() && scales.numel() == num_tokens,
++              "int8 quant: scales must be contiguous with one entry per token");
++  const bool scale_f32 = scales.scalar_type() == at::ScalarType::Float;
++  TORCH_CHECK(scale_f32 || scales.scalar_type() == input.scalar_type(),
++              "int8 quant: scales dtype must be float32 or the input dtype");
++  if (num_tokens == 0) return;
++
++  const at::DeviceGuard device_guard(input.device());
++  auto& queue = vllm::xpu::vllmGetQueue();
++
++  VLLM_DISPATCH_FLOATING_TYPES(
++      input.scalar_type(), "dynamic_per_token_scaled_int8_quant", [&] {
++        constexpr int VEC = 16 / sizeof(scalar_t);
++        const uintptr_t in_addr = reinterpret_cast<uintptr_t>(input.data_ptr());
++        const uintptr_t out_addr = reinterpret_cast<uintptr_t>(out.data_ptr());
++        const bool vec_ok = hidden_size % VEC == 0 && in_row_stride % VEC == 0 &&
++                            in_addr % 16 == 0 && out_addr % VEC == 0;
++        if (scale_f32) {
++          if (vec_ok)
++            launch_int8_quant<scalar_t, float, VEC>(
++                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
++          else
++            launch_int8_quant<scalar_t, float, 1>(
++                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
++        } else {
++          if (vec_ok)
++            launch_int8_quant<scalar_t, scalar_t, VEC>(
++                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
++          else
++            launch_int8_quant<scalar_t, scalar_t, 1>(
++                queue, out, input, scales, num_tokens, in_row_stride, hidden_size);
++        }
++      });
++}
+diff --git a/csrc/quantization/int8/int8_quant_math.h b/csrc/quantization/int8/int8_quant_math.h
+new file mode 100644
+index 0000000000..78fabb9361
+--- /dev/null
++++ b/csrc/quantization/int8/int8_quant_math.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: Apache-2.0
++// B70 (Lumnus): scalar math of the dynamic per-token symmetric int8 quant.
++//
++// Bit-for-bit mirror of vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref
++// (use_sym_quant=True, bits=8):
++//   absmax = max(|min(row)|, |max(row)|)                 (exact in fp32)
++//   scale  = clamp(absmax / 127, min=1e-5)               (fp32, IEEE div)
++//   scale  = scale.to(input.dtype)                       (RNE to bf16/fp16)
++//   q      = clamp(round_half_even(x_fp32 / scale_fp32), -128, 127)
++// Header-only and free of SYCL so the same code is compiled into the device
++// kernel and into the host-side CPU reference test.
++#pragma once
++
++#include <cstdint>
++
++// icpx defaults to -ffp-model=fast; a reciprocal-multiply or a contracted
++// op here would break the exact match with the reference.
++#pragma float_control(precise, on, push)
++
++namespace vllm {
++namespace int8q {
++
++template <typename scalar_t>
++inline float token_scale_from_absmax(float absmax) {
++  float s = absmax / 127.0f;
++  // torch.clamp(min=1e-5): NaN stays NaN.
++  s = (s < 1e-5f) ? 1e-5f : s;
++  // scale.to(input.dtype): round to nearest even in the activation dtype.
++  return static_cast<float>(static_cast<scalar_t>(s));
++}
++
++inline int8_t quantize_one(float x, float scale) {
++  float q = __builtin_rintf(x / scale);  // torch.round = half to even
++  q = q < -128.0f ? -128.0f : q;
++  q = q > 127.0f ? 127.0f : q;
++  return static_cast<int8_t>(q);
++}
++
++inline float abs_f(float x) { return __builtin_fabsf(x); }
++inline float max_f(float a, float b) { return a > b ? a : b; }
++
++}  // namespace int8q
++}  // namespace vllm
++
++#pragma float_control(pop)
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 33f4ed4876..ca31b9e7a2 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -202,6 +202,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "()");
+   ops.impl("dynamic_scaled_fp8_quant", torch::kXPU, &dynamic_scaled_fp8_quant);
+ 
++  // B70: dynamic-per-token symmetric INT8 quant (one scale per row).
++  ops.def(
++      "dynamic_per_token_scaled_int8_quant(Tensor! result, Tensor input, "
++      "Tensor! scale) -> ()");
++  ops.impl(
++      "dynamic_per_token_scaled_int8_quant",
++      torch::kXPU,
++      &dynamic_per_token_scaled_int8_quant);
++
+   // Compute dynamic-per-token FP8 quantized tensor and scaling factor.
+   ops.def(
+       "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
+diff --git a/csrc/xpu/onednn/int8_gemm_w8a8.h b/csrc/xpu/onednn/int8_gemm_w8a8.h
+new file mode 100644
+index 0000000000..a8a3e42da6
+--- /dev/null
++++ b/csrc/xpu/onednn/int8_gemm_w8a8.h
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++//
++// B70 (Lumnus): W8A8 int8 GEMM through oneDNN, ported from
++// vllm-project/vllm-xpu-kernels#196 (tianmu-li, int8_gemm_w8a8) and narrowed
++// to what vLLM's symmetric Int8ScaledMM path needs:
++//   out[m, n] = a_scale[m] * b_scale[n] * sum_k a[m, k] * b[k, n] + bias[n]
++//   a: s8 [m, k] (row stride allowed), per-token [m] or per-tensor [1] f32 scale
++//   b: s8 [k, n], either the NT view of a contiguous [n, k] (vLLM's w_q.t())
++//      or contiguous [k, n]; per-channel [n] or per-tensor [1] f32 scale
++//   out: f16 or bf16 [m, n], optional bias [n] (f32/f16/bf16)
++//
++// Per-token activation scale, two ways:
++//   1. src_attr (default): oneDNN src scales with mask (M, K) and groups
++//      {1, K}, i.e. one scale per row — the attr shape int4_gemm_w4a8 already
++//      uses for its s8 per-token activations on this oneDNN.
++//   2. post_op: weight scales via attr, then a binary_mul post-op by a {m, 1}
++//      f32 tensor, then the bias as a binary_add post-op (oneDNN adds the
++//      matmul bias before post-ops, so the bias must move behind the multiply).
++// Mode 1 is tried first; if oneDNN reports it unimplemented the process
++// switches to mode 2 for good (logged once). B70_INT8_GEMM_SCALE_MODE=postop
++// forces mode 2.
++#pragma once
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include <c10/xpu/XPUStream.h>
++#include <dnnl.hpp>
++#include <torch/torch.h>
++
++#include "onednn_ext.h"
++#include "onednn_runtime.h"
++
++namespace oneDNN {
++
++enum class w8a8_scale_mode : int { src_attr = 0, post_op = 1 };
++
++static inline std::atomic<int>& w8a8_scale_mode_flag() {
++  static std::atomic<int> flag([] {
++    const char* e = std::getenv("B70_INT8_GEMM_SCALE_MODE");
++    return (e && std::strcmp(e, "postop") == 0)
++        ? static_cast<int>(w8a8_scale_mode::post_op)
++        : static_cast<int>(w8a8_scale_mode::src_attr);
++  }());
++  return flag;
++}
++
++static inline void w8a8_log_once(const char* msg) {
++  static std::atomic<bool> done{false};
++  if (!done.exchange(true)) {
++    std::fprintf(stderr, "%s\n", msg);
++  }
++}
++
++static inline void dnnl_matmul_w8a8_int8(
++    torch::Tensor& result,           // [m, n] f16/bf16, contiguous
++    const torch::Tensor& mat1,       // [m, k] s8
++    const torch::Tensor& m1_sc,      // f32 [m, 1] or [1]
++    const torch::Tensor& mat2,       // [k, n] s8 (NT view or NN)
++    const torch::Tensor& m2_sc,      // f32 [1, n] or [1]
++    const std::optional<torch::Tensor>& bias) {
++  const int m = mat1.size(0);
++  const int k = mat1.size(1);
++  const int n = mat2.size(1);
++
++  joint_dtypes_t jd;
++  if (result.scalar_type() == at::ScalarType::Half) {
++    jd = joint_dtypes_t::int8;
++  } else if (result.scalar_type() == at::ScalarType::BFloat16) {
++    jd = joint_dtypes_t::int8_bf16;
++  } else {
++    TORCH_CHECK(false, "int8_scaled_mm: out dtype must be f16 or bf16");
++  }
++
++  trans_type_t tt;
++  int64_t ldb;
++  if (mat2.stride(0) == 1 && (n == 1 || mat2.stride(1) >= k)) {
++    tt = trans_type_t::nt;  // [n, k] row-major viewed as [k, n]
++    ldb = mat2.stride(1);
++  } else {
++    TORCH_CHECK(
++        mat2.stride(1) == 1,
++        "int8_scaled_mm: weight must be [k, n] with one unit stride");
++    tt = trans_type_t::nn;
++    ldb = mat2.stride(0);
++  }
++  const int64_t lda = mat1.stride(0);
++  const int64_t ldc = result.stride(0);
++
++  const bool per_token_a = m1_sc.numel() != 1;
++  const bool per_channel_b = m2_sc.numel() != 1;
++  const bias_type_t b_type = get_bias_type(bias, m, n);
++  const bool has_bias = get_shape(b_type) != bias_shape_t::none;
++
++  const int dev_id = c10::xpu::getCurrentXPUStream().device_index();
++  at::Device cur_device = at::Device(at::kXPU, dev_id);
++  auto engine = GpuEngineManager::Instance().get_engine(cur_device);
++  auto& strm = GpuStreamManager::Instance().get_stream();
++
++  auto set_wei_scales = [&](primitive_attr& pattr) {
++    pattr.set_scales(
++        DNNL_ARG_WEIGHTS,
++        per_channel_b ? (1 << 1) : 0,
++        {},
++        memory::data_type::f32);
++  };
++
++  const int sc_key = (per_token_a ? 1 : 0) | (per_channel_b ? 2 : 0);
++
++  // ---- mode 1: per-token src scales as a oneDNN attribute -----------------
++  auto run_src_attr = [&]() {
++    auto f_attr = [&](primitive_attr& pattr) {
++      pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++      if (per_token_a) {
++        pattr.set_scales(
++            DNNL_ARG_SRC, (1 << 0) + (1 << 1), {1, k}, memory::data_type::f32);
++      } else {
++        pattr.set_scales(DNNL_ARG_SRC, 0, {}, memory::data_type::f32);
++      }
++      set_wei_scales(pattr);
++    };
++    auto& mm = matmul_primitive_create_and_cache(
++        jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_key, 0);
++    int arg_off = 0;
++    mm.set_attribute(
++        arg_off++, DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, m1_sc.data_ptr(), [&]() {
++          return make_onednn_memory(
++              get_onednn_md(m1_sc), engine, m1_sc.data_ptr());
++        });
++    mm.set_attribute(
++        arg_off++,
++        DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
++        m2_sc.data_ptr(),
++        [&]() {
++          return make_onednn_memory(
++              get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
++        });
++    std::vector<std::pair<int, void*>> args;
++    args.reserve(6);
++    args.emplace_back(DNNL_ARG_SRC, mat1.data_ptr());
++    args.emplace_back(DNNL_ARG_WEIGHTS, mat2.data_ptr());
++    args.emplace_back(DNNL_ARG_DST, result.data_ptr());
++    if (has_bias) args.emplace_back(DNNL_ARG_BIAS, bias.value().data_ptr());
++    torch::Tensor scratch = at::empty(
++        {static_cast<int64_t>(mm.get_scratchpad_size())},
++        mat1.options().dtype(at::kByte));
++    args.emplace_back(DNNL_ARG_SCRATCHPAD, scratch.data_ptr());
++    mm.execute(strm, engine, std::move(args), arg_off);
++  };
++
++  // ---- mode 2: per-token scale (and bias) as post-ops ----------------------
++  auto run_post_op = [&]() {
++    const memory::desc row_sc_md({m, 1}, memory::data_type::f32, {1, 1});
++    const memory::desc bias_md(
++        {1, n}, get_onednn_bias_data_type(b_type), {n, 1});
++    auto f_attr = [&](primitive_attr& pattr) {
++      pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
++      post_ops po;
++      po.append_binary(algorithm::binary_mul, row_sc_md);
++      if (has_bias) po.append_binary(algorithm::binary_add, bias_md);
++      pattr.set_post_ops(po);
++      set_wei_scales(pattr);
++    };
++    // bias is a post-op here, so the matmul itself is built without one; the
++    // bias type goes into the cache key instead.
++    const bias_type_t no_bias = get_bias_type(std::nullopt, m, n);
++    auto& mm = matmul_primitive_create_and_cache(
++        jd, tt, no_bias, m, n, k, lda, ldb, ldc, dev_id, f_attr,
++        sc_key, static_cast<int>(b_type));
++    int arg_off = 0;
++    mm.set_attribute(
++        arg_off++,
++        DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
++        m2_sc.data_ptr(),
++        [&]() {
++          return make_onednn_memory(
++              get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
++        });
++    mm.set_attribute(
++        arg_off++,
++        DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
++        m1_sc.data_ptr(),
++        [&]() {
++          return make_onednn_memory(row_sc_md, engine, m1_sc.data_ptr());
++        });
++    if (has_bias) {
++      mm.set_attribute(
++          arg_off++,
++          DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1,
++          bias.value().data_ptr(),
++          [&]() {
++            return make_onednn_memory(
++                bias_md, engine, bias.value().data_ptr());
++          });
++    }
++    std::vector<std::pair<int, void*>> args;
++    args.reserve(4);
++    args.emplace_back(DNNL_ARG_SRC, mat1.data_ptr());
++    args.emplace_back(DNNL_ARG_WEIGHTS, mat2.data_ptr());
++    args.emplace_back(DNNL_ARG_DST, result.data_ptr());
++    torch::Tensor scratch = at::empty(
++        {static_cast<int64_t>(mm.get_scratchpad_size())},
++        mat1.options().dtype(at::kByte));
++    args.emplace_back(DNNL_ARG_SCRATCHPAD, scratch.data_ptr());
++    mm.execute(strm, engine, std::move(args), arg_off);
++  };
++
++  if (!per_token_a ||
++      w8a8_scale_mode_flag().load() ==
++          static_cast<int>(w8a8_scale_mode::src_attr)) {
++    try {
++      run_src_attr();
++      return;
++    } catch (const dnnl::error& e) {
++      if (!per_token_a || e.status != dnnl_unimplemented) throw;
++      w8a8_scale_mode_flag().store(static_cast<int>(w8a8_scale_mode::post_op));
++      w8a8_log_once(
++          "B70 int8 GEMM: oneDNN has no per-token src-scale kernel here; "
++          "using the binary_mul post-op path");
++    }
++  }
++  run_post_op();
++}
++
++}  // namespace oneDNN
+diff --git a/csrc/xpu/onednn/onednn_ext.h b/csrc/xpu/onednn/onednn_ext.h
+index 9a29844255..5d1adad437 100644
+--- a/csrc/xpu/onednn/onednn_ext.h
++++ b/csrc/xpu/onednn/onednn_ext.h
+@@ -53,11 +53,33 @@ enum class joint_dtypes_t {
+   f8_e4m3_bf16,
+   mxfp4_bf16,
+   mxfp4_f16,
++  int8_bf16,  // B70: s8 x s8 -> bf16 (int8 = s8 x s8 -> f16)
+ };
+ 
+ template <joint_dtypes_t Ts>
+ struct onednn_types_mapper;
+ 
++// B70: W8A8 int8 GEMM (s8 activations x s8 weights).
++template <>
++struct onednn_types_mapper<joint_dtypes_t::int8> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::s8, memory::data_type::s8, memory::data_type::f16);
++  }
++};
++
++template <>
++struct onednn_types_mapper<joint_dtypes_t::int8_bf16> {
++  static inline std::
++      tuple<memory::data_type, memory::data_type, memory::data_type>
++      get() {
++    return std::make_tuple(
++        memory::data_type::s8, memory::data_type::s8, memory::data_type::bf16);
++  }
++};
++
+ template <>
+ struct onednn_types_mapper<joint_dtypes_t::f16_int4> {
+   static inline std::
+@@ -1168,6 +1190,36 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
+           scale_group_size,
+           zp_group_size,
+           batch_dim);
++    case joint_dtypes_t::int8:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::int8, F>(
++          Tt,
++          b_type,
++          m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
++    case joint_dtypes_t::int8_bf16:
++      return matmul_primitive_create_and_cache<joint_dtypes_t::int8_bf16, F>(
++          Tt,
++          b_type,
++          m,
++          n,
++          k,
++          lda,
++          ldb,
++          ldc,
++          device_id,
++          attr,
++          scale_group_size,
++          zp_group_size,
++          batch_dim);
+     default:
+       throw std::runtime_error("Only support int4 and fp8 gemm ...");
+   }
+diff --git a/csrc/xpu/onednn/onednn_matmul.cpp b/csrc/xpu/onednn/onednn_matmul.cpp
+index 58209f9b7f..e598e760c4 100644
+--- a/csrc/xpu/onednn/onednn_matmul.cpp
++++ b/csrc/xpu/onednn/onednn_matmul.cpp
+@@ -4,6 +4,7 @@
+ #include "fp8_gemm_w8a16.h"
+ #include "int4_gemm_w4a16.h"
+ #include "int4_gemm_w4a8.h"
++#include "int8_gemm_w8a8.h"
+ 
+ inline bool is_supported_fp8(at::ScalarType t) {
+   return (t == at::ScalarType::Float8_e5m2) ||
+@@ -275,6 +276,57 @@ torch::Tensor int4_gemm_w4a16(
+   return result;
+ }
+ 
++torch::Tensor int8_scaled_mm(
++    const torch::Tensor& A,        // [m, k] int8
++    const torch::Tensor& A_scale,  // f32, m (per-token) or 1 (per-tensor)
++    const torch::Tensor& B,        // [k, n] int8 (NT view of [n, k] or NN)
++    const torch::Tensor& B_scale,  // f32, n (per-channel) or 1 (per-tensor)
++    c10::ScalarType out_dtype,     // f16 or bf16
++    const std::optional<torch::Tensor>& bias) {  // [n] or None
++  TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "int8_scaled_mm: 2-D A and B");
++  TORCH_CHECK(
++      A.scalar_type() == at::ScalarType::Char &&
++          B.scalar_type() == at::ScalarType::Char,
++      "int8_scaled_mm: A and B must be int8");
++  TORCH_CHECK(A.stride(1) == 1, "int8_scaled_mm: A rows must be contiguous");
++  TORCH_CHECK(A.size(1) == B.size(0), "int8_scaled_mm: K mismatch");
++  TORCH_CHECK(
++      out_dtype == at::ScalarType::Half ||
++          out_dtype == at::ScalarType::BFloat16,
++      "int8_scaled_mm: out dtype must be f16 or bf16");
++  const int64_t m = A.size(0);
++  const int64_t n = B.size(1);
++  TORCH_CHECK(
++      A_scale.scalar_type() == at::ScalarType::Float &&
++          B_scale.scalar_type() == at::ScalarType::Float,
++      "int8_scaled_mm: scales must be float32");
++  TORCH_CHECK(
++      A_scale.numel() == m || A_scale.numel() == 1,
++      "int8_scaled_mm: A_scale must be per-token [m] or per-tensor [1]");
++  TORCH_CHECK(
++      B_scale.numel() == n || B_scale.numel() == 1,
++      "int8_scaled_mm: B_scale must be per-channel [n] or per-tensor [1]");
++  if (bias.has_value() && bias->defined()) {
++    TORCH_CHECK(
++        bias->numel() == n && bias->is_contiguous(),
++        "int8_scaled_mm: bias must be contiguous [n]");
++  }
++  const at::DeviceGuard device_guard(A.device());
++  torch::Tensor result = at::empty({m, n}, A.options().dtype(out_dtype));
++  if (m == 0 || n == 0) return result;
++
++  torch::Tensor a_sc = A_scale.numel() == 1
++                           ? A_scale.reshape({1}).contiguous()
++                           : A_scale.reshape({m, 1}).contiguous();
++  torch::Tensor b_sc = B_scale.numel() == 1
++                           ? B_scale.reshape({1}).contiguous()
++                           : B_scale.reshape({1, n}).contiguous();
++  std::optional<torch::Tensor> b;
++  if (bias.has_value() && bias->defined()) b = bias->reshape({n});
++  oneDNN::dnnl_matmul_w8a8_int8(result, A, a_sc, B, b_sc, b);
++  return result;
++}
++
+ torch::Tensor int4_gemm_w4a8(
+     const torch::Tensor& A_,       // quantized inputs, [b, m, k]
+     const torch::Tensor& A_scale,  // [b * m, 1] or [b]
+diff --git a/csrc/xpu/onednn/onednn_stub.cpp b/csrc/xpu/onednn/onednn_stub.cpp
+index 7e63b16ec3..3c6c7ce7ab 100644
+--- a/csrc/xpu/onednn/onednn_stub.cpp
++++ b/csrc/xpu/onednn/onednn_stub.cpp
+@@ -78,6 +78,16 @@ torch::Tensor int4_gemm_w4a16(
+   onednn_not_built("int4_gemm_w4a16");
+ }
+ 
++torch::Tensor int8_scaled_mm(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    c10::ScalarType out_dtype,
++    const std::optional<torch::Tensor>& bias) {
++  onednn_not_built("int8_scaled_mm");
++}
++
+ torch::Tensor int4_gemm_w4a8(
+     const torch::Tensor& A_,
+     const torch::Tensor& A_scale,
+diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
+index cb72527565..5000ae246c 100644
+--- a/csrc/xpu/ops.h
++++ b/csrc/xpu/ops.h
+@@ -62,6 +62,16 @@ torch::Tensor int4_gemm_w4a16(
+     int64_t group_size,
+     const std::optional<torch::Tensor>& g_idx);
+ 
++// B70: W8A8 int8 GEMM (oneDNN), symmetric s8 x s8, per-token or per-tensor
++// activation scale, per-channel or per-tensor weight scale, f16/bf16 out.
++torch::Tensor int8_scaled_mm(
++    const torch::Tensor& A,
++    const torch::Tensor& A_scale,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    c10::ScalarType out_dtype,
++    const std::optional<torch::Tensor>& bias);
++
+ torch::Tensor int4_gemm_w4a8(
+     const torch::Tensor& A_,
+     const torch::Tensor& A_scale,
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index 75c8b9b2d5..d96052195e 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -55,6 +55,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "bias) -> Tensor");
+   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
+ 
++  // B70: W8A8 int8 GEMM (oneDNN); per-token/per-tensor A scale,
++  // per-channel/per-tensor B scale.
++  xpu_ops.def(
++      "int8_scaled_mm(Tensor A, Tensor A_scale, Tensor B, Tensor B_scale, "
++      "ScalarType out_dtype, Tensor? bias) -> Tensor");
++  xpu_ops.impl("int8_scaled_mm", torch::kXPU, &int8_scaled_mm);
++
+ #ifdef VLLM_MOE_ENABLED
+   xpu_ops.def(
+       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
+diff --git a/tests/test_b70_int8_native.py b/tests/test_b70_int8_native.py
+new file mode 100644
+index 0000000000..0434cefd35
+--- /dev/null
++++ b/tests/test_b70_int8_native.py
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: Apache-2.0
++# B70 (Lumnus): native per-token int8 quant + oneDNN int8 GEMM vs torch refs.
++import pytest
++import torch
++
++import vllm_xpu_kernels._C  # noqa: F401
++import vllm_xpu_kernels._xpu_C  # noqa: F401
++
++DEV = "xpu"
++
++
++def quant_ref(x: torch.Tensor):
++    """Eager copy of vllm._xpu_ops.xpu_ops.dynamic_per_token_int8_quant_ref."""
++    x2 = x.reshape(-1, x.shape[-1])
++    mn = torch.min(x2, dim=-1)[0].to(torch.float32).unsqueeze(-1)
++    mx = torch.max(x2, dim=-1)[0].to(torch.float32).unsqueeze(-1)
++    s = (torch.maximum(mn.abs(), mx.abs()) / 127).clamp(min=1e-5).to(x.dtype)
++    q = torch.clamp(torch.round(x2 / s.to(torch.float32)), -128, 127)
++    return q.to(torch.int8).view(x.shape), s.view(x.shape[:-1] + (1,))
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("m,k", [(1, 5120), (7, 17408), (512, 5120),
++                                 (33, 100), (3, 8)])
++@pytest.mark.parametrize("scale_f32", [True, False])
++def test_int8_quant_exact(dtype, m, k, scale_f32):
++    torch.manual_seed(0)
++    x = (torch.randn(m, k, device=DEV) * 3).to(dtype)
++    x[0, :4] = 0
++    if m > 2:
++        x[2] = 0  # all-zero row -> clamp(1e-5)
++    q_ref, s_ref = quant_ref(x)
++    q = torch.empty_like(x, dtype=torch.int8)
++    s = torch.empty(m, 1, device=DEV,
++                    dtype=torch.float32 if scale_f32 else dtype)
++    torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)
++    assert torch.equal(q, q_ref)
++    assert torch.equal(s.to(torch.float32), s_ref.to(torch.float32))
++
++
++@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("m,n,k", [(1, 4096, 5120), (16, 1024, 5120),
++                                   (600, 3072, 5120), (64, 5120, 17408)])
++@pytest.mark.parametrize("per_token", [True, False])
++@pytest.mark.parametrize("with_bias", [False, True])
++def test_int8_scaled_mm(out_dtype, m, n, k, per_token, with_bias):
++    torch.manual_seed(0)
++    a = torch.randint(-128, 128, (m, k), dtype=torch.int8, device=DEV)
++    w = torch.randint(-128, 128, (n, k), dtype=torch.int8, device=DEV)
++    sa = (torch.rand(m if per_token else 1, 1, device=DEV) + 0.1) * 1e-2
++    sw = (torch.rand(n, 1, device=DEV) + 0.1) * 1e-2
++    bias = torch.randn(n, device=DEV, dtype=out_dtype) if with_bias else None
++    acc = (a.cpu().to(torch.int64) @ w.cpu().to(torch.int64).t()).to(
++        torch.float64)
++    ref = acc * sa.cpu().double() * sw.cpu().double().t()
++    if bias is not None:
++        ref = ref + bias.cpu().double()
++    out = torch.ops._xpu_C.int8_scaled_mm(a, sa, w.t(), sw, out_dtype, bias)
++    torch.testing.assert_close(out.cpu().double(), ref.to(out_dtype).double(),
++                               rtol=1.6e-2, atol=1e-2)

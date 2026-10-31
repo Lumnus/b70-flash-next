@@ -1,0 +1,32 @@
+From a0aad860487b46a003f7ebe211172059cfe54ccd Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 01:48:38 +0000
+Subject: [PATCH 4/8] [B70][Spec] Warn about an unannotated draft KV group only
+ when block drop needs one
+
+_annotate_eagle_groups runs only under use_eagle_block_drop(); DFlash and
+DSpark build draft KV from the target hidden state alone and opt out
+(needs_eagle_block_drop, vllm-project/vllm#54163). The warning gated on
+use_eagle() and so fired on every DFlash boot over a hybrid (Mamba/GDN)
+target, Flash-Next and Qwen3.8-27B alike, while the draft SWA group was
+found and paged correctly. Gate it on the same predicate as the annotator.
+---
+ vllm/v1/core/kv_cache_utils.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index cd75915898..faea123de5 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2196,7 +2196,10 @@ def _warn_if_unannotated_eagle_mamba(
+ 
+     """
+     spec_config = vllm_config.speculative_config
+-    if spec_config is None or not spec_config.use_eagle():
++    # Annotation runs only under block drop (_annotate_eagle_groups), so a
++    # drafter that needs none (DFlash/DSpark, vllm-project/vllm#54163) has no
++    # group to find, by design.
++    if spec_config is None or not spec_config.use_eagle_block_drop():
+         return
+     if any(group.is_eagle_group for group in kv_cache_groups):
+         return

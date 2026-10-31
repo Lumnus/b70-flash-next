@@ -1,7 +1,7 @@
 From cd24fc53779f33103a413a03f79a092220a39030 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 10:25:38 +0000
-Subject: [PATCH 2/2] [Cache] swap_blocks_batch: add snapshot_src=False for
+Subject: [PATCH 2/5] [Cache] swap_blocks_batch: add snapshot_src=False for
  pinned and registered H2D sources
 
 swap_blocks_batch stages every H2D batch through a pinned buffer from the

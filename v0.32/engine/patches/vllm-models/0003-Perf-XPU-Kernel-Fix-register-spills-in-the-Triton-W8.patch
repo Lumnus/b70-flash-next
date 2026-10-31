@@ -1,0 +1,52 @@
+From 4cc2091605b1aeb9a14e1ed71bbb4e6deb99372b Mon Sep 17 00:00:00 2001
+From: Katsumi Takeuchi <contact@recutita.com>
+Date: Wed, 28 Oct 2026 13:53:40 +0900
+Subject: [PATCH 3/8] [Perf][XPU][Kernel] Fix register spills in the Triton
+ W8A8 INT8 GEMM above M = 64
+
+The current tiles above M = 64 run with 4 warps and spill registers on
+XPU; prefill-sized GEMMs are 9x to 17x slower than with these tiles.
+
+Backport of vllm-project/vllm#64244, applied after #64190: the import,
+the num_warps default and the kernel kwarg that both add are kept once,
+and this XPU M > 64 branch follows the XPU M <= 64 branch as an elif.
+Non-XPU tiles unchanged.
+
+Assisted-by: Claude Code with Opus 5.5 medium (Anthropic)
+Signed-off-by: Katsumi Takeuchi <contact@recutita.com>
+---
+ tests/kernels/quantization/test_triton_scaled_mm.py       | 1 +
+ .../quantization/compressed_tensors/triton_scaled_mm.py   | 8 ++++++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/tests/kernels/quantization/test_triton_scaled_mm.py b/tests/kernels/quantization/test_triton_scaled_mm.py
+index b0a2c215ab..76478aa791 100644
+--- a/tests/kernels/quantization/test_triton_scaled_mm.py
++++ b/tests/kernels/quantization/test_triton_scaled_mm.py
+@@ -68,6 +68,7 @@ MNK_FACTORS = [
+     (33, 256, 496),
+     (64, 971, 1024),
+     (64, 20486, 128),
++    (96, 256, 496),
+     (512, 256, 496),
+     (512, 20486, 1024),
+ ]
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+index c4578abeed..52fc265451 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+@@ -222,6 +222,14 @@ def triton_scaled_mm(
+             # BLOCK_M must cover M: every row block re-reads the whole weight.
+             tile_shape = (triton.next_power_of_2(M), 32, 128)
+             num_warps = 8
++        elif current_platform.is_xpu() and M > 64:
++            # With fewer warps per tile the int32 accumulator spills registers.
++            if M <= 128:
++                tile_shape = (128, 128, 32)
++                num_warps = 16
++            else:
++                tile_shape = (256, 128, 128)
++                num_warps = 32
+         elif next_power_of_2_M <= 32:
+             tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+         elif next_power_of_2_M <= 64:

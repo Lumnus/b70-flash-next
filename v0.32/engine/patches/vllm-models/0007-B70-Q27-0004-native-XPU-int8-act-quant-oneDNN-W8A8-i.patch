@@ -1,0 +1,280 @@
+From a1151698062e3db11ad37589180760f6100acadb Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 02:19:18 +0000
+Subject: [PATCH 7/8] B70-Q27-0004: native XPU int8 act quant + oneDNN W8A8
+ int8 GEMM when the kernels wheel has them
+
+Activation quant: ops.scaled_int8_quant (W8A8) and xpu_ops.dynamic_per_token_int8_quant
+(INC w4a8, XPUW4A8IntLinearKernel) call _C::dynamic_per_token_scaled_int8_quant when the
+vllm-xpu-kernels wheel registers it (0.1.16.2+gv.pr660662.int8n.*), else the torch.compile
+reference as before. Same bits either way. Decided once at import (B70_XPU_INT8_QUANT_NATIVE=0
+forces the reference); logs "B70 int8 act-quant: native op".
+
+W8A8 GEMM: XPUInt8ScaledMMLinearKernel (oneDNN _xpu_C::int8_scaled_mm) ahead of
+TritonInt8ScaledMMLinearKernel on XPU, selected only with B70_XPU_INT8_ONEDNN=1 and the op
+present; symmetric activations only (asymmetric stays on Triton). Logs "B70 int8 GEMM: oneDNN".
+---
+ vllm/_custom_ops.py                           | 14 +++-
+ vllm/_xpu_ops.py                              | 56 +++++++++++++++
+ .../model_executor/kernels/linear/__init__.py |  9 ++-
+ .../kernels/linear/mixed_precision/xpu.py     |  2 +-
+ .../kernels/linear/scaled_mm/xpu_int8.py      | 68 +++++++++++++++++++
+ .../inc/schemes/inc_w4a8_linear.py            |  2 +-
+ 6 files changed, 146 insertions(+), 5 deletions(-)
+ create mode 100644 vllm/model_executor/kernels/linear/scaled_mm/xpu_int8.py
+
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 2719df1a91..1ebcc6a856 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -1913,7 +1913,8 @@ def scaled_int8_quant(
+ 
+     """
+     if current_platform.is_xpu():
+-        # XPU has no _C int8 quant op; use the torch.compile reference.
++        # B70: vllm-xpu-kernels native per-token op when the wheel has it,
++        # else the torch.compile reference (same bits either way).
+         if not symmetric:
+             raise NotImplementedError(
+                 "asymmetric int8 activation quantization is unsupported on XPU"
+@@ -1922,8 +1923,17 @@ def scaled_int8_quant(
+             q = (input.to(torch.float32) / scale).round().clamp(-128, 127)
+             return q.to(torch.int8), scale, None
+ 
+-        from vllm._xpu_ops import xpu_ops
++        from vllm._xpu_ops import (
++            b70_dynamic_per_token_int8_quant_native,
++            b70_native_int8_quant_available,
++            xpu_ops,
++        )
+ 
++        if b70_native_int8_quant_available():
++            q, scales = b70_dynamic_per_token_int8_quant_native(
++                input.contiguous(), torch.float32
++            )
++            return q, scales.reshape(-1, 1), None
+         q, scales, _ = xpu_ops.dynamic_per_token_int8_quant_ref(
+             input.contiguous(), True, 8
+         )
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index 68811eecd6..4f53c9661f 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Callable
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+@@ -103,6 +104,51 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a8"):
+         return torch.empty((M, N), dtype=torch.float16, device=input.device)
+ 
+ 
++if hasattr(torch.ops._xpu_C, "int8_scaled_mm"):
++
++    @register_fake("_xpu_C::int8_scaled_mm")
++    def _int8_scaled_mm_fake(
++        a: torch.Tensor,
++        a_scale: torch.Tensor,
++        b: torch.Tensor,
++        b_scale: torch.Tensor,
++        out_dtype: torch.dtype,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        return torch.empty((a.size(0), b.size(1)), dtype=out_dtype, device=a.device)
++
++
++# B70: the vllm-xpu-kernels native per-token int8 quant op (wheel
++# 0.1.16.2+...int8n and later). Decided once at import, outside any traced code;
++# ``B70_XPU_INT8_QUANT_NATIVE=0`` forces the torch.compile reference.
++_B70_NATIVE_INT8_QUANT = os.environ.get(
++    "B70_XPU_INT8_QUANT_NATIVE", "1"
++) != "0" and hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant")
++if _B70_NATIVE_INT8_QUANT:
++    logger.info("B70 int8 act-quant: native op")
++
++
++def b70_native_int8_quant_available() -> bool:
++    return _B70_NATIVE_INT8_QUANT
++
++
++def b70_dynamic_per_token_int8_quant_native(
++    input: torch.Tensor, scale_dtype: torch.dtype
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Native symmetric per-token int8 quant; bit-identical to the reference.
++
++    Returns ``(q [..., K] int8, scale [..., 1] scale_dtype)``; the scale value
++    is the reference's (rounded to ``input.dtype``) in either dtype.
++    """
++    x = input if input.stride(-1) == 1 else input.contiguous()
++    if x.dim() != 2 and not x.is_contiguous():
++        x = x.contiguous()
++    q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
++    s = torch.empty(x.shape[:-1] + (1,), dtype=scale_dtype, device=x.device)
++    torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)
++    return q, s
++
++
+ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
+ 
+     @register_fake("_xpu_C::int4_gemm_w4a16")
+@@ -989,6 +1035,16 @@ _OPS_REGISTERED = False
+ 
+ 
+ class xpu_ops:
++    @staticmethod
++    def dynamic_per_token_int8_quant(
++        input: torch.Tensor, use_sym_quant: bool, bits: int
++    ):
++        """B70: native op when present (symmetric 8-bit), else the reference."""
++        if use_sym_quant and bits == 8 and b70_native_int8_quant_available():
++            q, s = b70_dynamic_per_token_int8_quant_native(input, input.dtype)
++            return q, s, torch.zeros(s.shape, dtype=torch.int32, device=s.device)
++        return xpu_ops.dynamic_per_token_int8_quant_ref(input, use_sym_quant, bits)
++
+     @staticmethod
+     @torch.compile
+     def dynamic_per_token_int8_quant_ref(
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index bb7adad164..caf3b9cb2a 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -227,6 +227,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+     XPUW8A8FP8LinearKernel,
+     XPUW8A16FP8LinearKernel,
+ )
++from vllm.model_executor.kernels.linear.scaled_mm.xpu_int8 import (
++    XPUInt8ScaledMMLinearKernel,
++)
+ from vllm.model_executor.kernels.linear.scaled_mm.zentorch import (
+     ZentorchInt8ScaledMMLinearKernel,
+ )
+@@ -366,6 +369,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
+         EmulationMxfp4LinearKernel,
+     },
+     "xpu": {
++        XPUInt8ScaledMMLinearKernel,
+         XPUW8A8FP8LinearKernel,
+         XPUFp8BlockScaledMMKernel,
+     },
+@@ -436,7 +440,9 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
+         HummingInt8ScaledMMLinearKernel,
+     ],
+     PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+-    PlatformEnum.XPU: [TritonInt8ScaledMMLinearKernel],
++    # B70: oneDNN int8 GEMM first; it is selected only with B70_XPU_INT8_ONEDNN=1
++    # and the vllm-xpu-kernels op present, else Triton (is_supported says why).
++    PlatformEnum.XPU: [XPUInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+ }
+ 
+ # in priority/performance order (when available)
+@@ -1324,6 +1330,7 @@ __all__ = [
+     "RowWiseTorchFP8ScaledMMLinearKernel",
+     "ROCmFP8ScaledMMLinearKernel",
+     "TritonInt8ScaledMMLinearKernel",
++    "XPUInt8ScaledMMLinearKernel",
+     "ZentorchInt8ScaledMMLinearKernel",
+     "ZentorchWNA16LinearKernel",
+     "MPLinearKernel",
+diff --git a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
+index c82e862e58..dac8a503a3 100644
+--- a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
++++ b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
+@@ -199,7 +199,7 @@ class XPUW4A8IntLinearKernel(MPLinearKernel):
+ 
+         # TODO: static and asymmetric quantization case
+         # Common code for CompressedTensorsW4A8Int does not read act symmetry data
+-        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant_ref(
++        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant(
+             reshaped_x, True, 8
+         )
+ 
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/xpu_int8.py b/vllm/model_executor/kernels/linear/scaled_mm/xpu_int8.py
+new file mode 100644
+index 0000000000..7b931ecf4d
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/scaled_mm/xpu_int8.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70: W8A8 INT8 linear through the oneDNN ``_xpu_C::int8_scaled_mm`` op.
++
++Selected ahead of ``TritonInt8ScaledMMLinearKernel`` on XPU only when the
++vllm-xpu-kernels wheel carries the op AND ``B70_XPU_INT8_ONEDNN=1``; otherwise
++the Triton kernel stays the path. Symmetric activations only (the op has no
++zero point); asymmetric layers fall through to Triton.
++"""
++
++import os
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++
++from .ScaledMMLinearKernel import Int8ScaledMMLinearLayerConfig
++from .triton import TritonInt8ScaledMMLinearKernel
++
++logger = init_logger(__name__)
++
++
++class XPUInt8ScaledMMLinearKernel(TritonInt8ScaledMMLinearKernel):
++    @classmethod
++    def is_supported(
++        cls, compute_capability: int | None = None
++    ) -> tuple[bool, str | None]:
++        if not current_platform.is_xpu():
++            return False, "requires XPU."
++        if os.environ.get("B70_XPU_INT8_ONEDNN", "0") != "1":
++            return False, "B70_XPU_INT8_ONEDNN is not 1."
++        if not hasattr(torch.ops._xpu_C, "int8_scaled_mm"):
++            return False, "vllm-xpu-kernels has no _xpu_C.int8_scaled_mm op."
++        return True, None
++
++    @classmethod
++    def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
++        if not c.input_symmetric:
++            return False, "asymmetric activations are not supported."
++        return True, None
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # Same layout as Triton: w_q -> [K, N] view of the [N, K] weight
++        # (oneDNN NT), channelwise scales for fused modules, scalar static
++        # input scale.
++        super().process_weights_after_loading(layer)
++        logger.info_once("B70 int8 GEMM: oneDNN", scope="local")
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        w_q, w_s, i_s, _, _ = self._get_layer_params(layer)
++        x_2d = x.reshape(-1, x.shape[-1])
++        x_q, x_s, _ = ops.scaled_int8_quant(x_2d.contiguous(), i_s, None, True)
++        out = torch.ops._xpu_C.int8_scaled_mm(
++            x_q,
++            x_s.reshape(-1).to(torch.float32),
++            w_q,
++            w_s.reshape(-1).to(torch.float32),
++            x.dtype,
++            bias,
++        )
++        return out.view(*x.shape[:-1], w_q.shape[1])
+diff --git a/vllm/model_executor/layers/quantization/inc/schemes/inc_w4a8_linear.py b/vllm/model_executor/layers/quantization/inc/schemes/inc_w4a8_linear.py
+index ceedcfb36b..6bf8780995 100644
+--- a/vllm/model_executor/layers/quantization/inc/schemes/inc_w4a8_linear.py
++++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_w4a8_linear.py
+@@ -95,7 +95,7 @@ class INCXPUW4A8LinearMethod(INCXPULinearMethod):
+         from vllm._xpu_ops import xpu_ops as ops
+ 
+         out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
+-        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant_ref(
++        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant(
+             reshaped_x, True, 8
+         )
+         out = torch.ops._xpu_C.int4_gemm_w4a8(

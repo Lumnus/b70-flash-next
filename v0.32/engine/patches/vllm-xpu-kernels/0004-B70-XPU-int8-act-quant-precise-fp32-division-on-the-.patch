@@ -1,0 +1,78 @@
+From e3d70f3629df918516ce793657ac7bd281de3a92 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 02:44:28 +0000
+Subject: [PATCH 4/5] [B70][XPU] int8 act quant: precise fp32 division on the
+ device
+
+'#pragma float_control' is ignored for spir64. icpx's default fast fp model
+decorated every FDiv in the kernel with FPMaxErrorDecorationINTEL 2.5 ulp and
+FPFastMathMode (SPIR-V of the TU). Compile int8_quant.cpp with
+-ffp-model=precise -foffload-fp32-prec-div instead: no fast-math or max-error
+decorations remain, so x / scale is correctly rounded as in the reference.
+---
+ CMakeLists.txt                           | 5 +++++
+ csrc/quantization/int8/int8_quant.cpp    | 4 ----
+ csrc/quantization/int8/int8_quant_math.h | 8 ++++----
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3b06d2a45e..99ede77cc0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -609,6 +609,11 @@ if(BASIC_KERNELS_ENABLED)
+       "csrc/topk_per_row.cpp"
+       "csrc/ngram_embedding_kernels.cpp")
+   include_directories("/usr/include")
++  # B70: the int8 act quant must match the torch reference bit for bit:
++  # IEEE fp32 division and no fast-math on host and device for this TU.
++  set_source_files_properties(
++    "csrc/quantization/int8/int8_quant.cpp"
++    PROPERTIES COMPILE_OPTIONS "-ffp-model=precise;-foffload-fp32-prec-div")
+ 
+   define_gpu_extension_target(
+     _C
+diff --git a/csrc/quantization/int8/int8_quant.cpp b/csrc/quantization/int8/int8_quant.cpp
+index 61a2ca5754..35f98cfc8d 100644
+--- a/csrc/quantization/int8/int8_quant.cpp
++++ b/csrc/quantization/int8/int8_quant.cpp
+@@ -16,8 +16,6 @@
+ 
+ #include "quantization/int8/int8_quant_math.h"
+ 
+-#pragma float_control(precise, on, push)
+-
+ namespace vllm {
+ 
+ template <typename scalar_t, typename scale_t, int VEC>
+@@ -106,8 +104,6 @@ class dynamic_per_token_int8_quant_kernel {
+ 
+ }  // namespace vllm
+ 
+-#pragma float_control(pop)
+-
+ namespace {
+ 
+ template <typename scalar_t, typename scale_t, int VEC>
+diff --git a/csrc/quantization/int8/int8_quant_math.h b/csrc/quantization/int8/int8_quant_math.h
+index 78fabb9361..7f0c31898d 100644
+--- a/csrc/quantization/int8/int8_quant_math.h
++++ b/csrc/quantization/int8/int8_quant_math.h
+@@ -13,9 +13,10 @@
+ 
+ #include <cstdint>
+ 
+-// icpx defaults to -ffp-model=fast; a reciprocal-multiply or a contracted
+-// op here would break the exact match with the reference.
+-#pragma float_control(precise, on, push)
++// icpx defaults to -ffp-model=fast and SYCL fp32 division to 2.5 ulp; either
++// would break the exact match. The device TU (int8_quant.cpp) is therefore
++// compiled with -ffp-model=precise -foffload-fp32-prec-div (CMakeLists.txt);
++// '#pragma float_control' is ignored for spir64 and cannot do it.
+ 
+ namespace vllm {
+ namespace int8q {
+@@ -42,4 +43,3 @@ inline float max_f(float a, float b) { return a > b ? a : b; }
+ }  // namespace int8q
+ }  // namespace vllm
+ 
+-#pragma float_control(pop)

@@ -1,0 +1,80 @@
+From ee38eed80e998e4a86ca75f687958e5d34b14f08 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Thu, 29 Oct 2026 22:11:37 +0000
+Subject: [PATCH 8/8] B70-XC: GDN backstep (0014c) is a no-op under
+ mamba_cache_mode=align
+
+With B70_OFFLOAD_GDN_BACKSTEP=1 and prefix caching (align), a prefix-cache hit restores a GDN state built
+through a different prefill chunk split than the cold path (the backstep stop is keyed on each request's own
+prompt length), and greedy output diverges from token 1 (Qwen3.6-35B-A3B, a warm-against-cold prefix-cache
+test; spec off and Model Runner V1 fail too; BACKSTEP=0 passes). In an agent session it shows as the model
+re-issuing tool calls it has already finished.
+The guard forces 0014c off under align, logs once, and B70_GDN_BACKSTEP_ALIGN_GUARD=0 opts out.
+---
+ vllm/v1/core/kv_cache_coordinator.py | 30 ++++++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py      |  8 +++++++-
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 7ba95f9975..09b4cb3fb7 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -62,9 +62,39 @@ def _validate_prefix_cache_retention_interval(
+         )
+ 
+ 
++# B70-XC: 0014c is forced off under Mamba "align" mode, where
++# warm-vs-cold greedy output diverges with it on (a prefix-cache test). Set by the
++# scheduler at construction; B70_GDN_BACKSTEP_ALIGN_GUARD=0 opts out.
++_B70_BACKSTEP_ALIGN_DISABLED = False
++
++
++def b70_disable_gdn_backstep_for_align() -> bool:
++    """Disable 0014c under align mode unless the guard is opted out."""
++    import os
++
++    global _B70_BACKSTEP_ALIGN_DISABLED
++    guard = os.environ.get("B70_GDN_BACKSTEP_ALIGN_GUARD", "1").strip().lower()
++    if guard in ("0", "false", "no", "off"):
++        return False
++    if not _B70_BACKSTEP_ALIGN_DISABLED:
++        from vllm.logger import init_logger
++
++        init_logger(__name__).warning(
++            "B70-XC backstep guard: B70_OFFLOAD_GDN_BACKSTEP=%s ignored under "
++            "mamba_cache_mode=align (no extra prefill stops, no extra retained "
++            "Mamba boundaries)",
++            os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", ""),
++        )
++    _B70_BACKSTEP_ALIGN_DISABLED = True
++    return True
++
++
+ def b70_gdn_backstep() -> int:
+     """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
+     import os
++
++    if _B70_BACKSTEP_ALIGN_DISABLED:
++        return 0
+     raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
+     try:
+         return max(0, int(raw)) if raw else 0
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bc160469bc..a48a1469e5 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -385,7 +385,13 @@ class Scheduler(SchedulerInterface):
+         )
+         # B70 0014c: prefill chunks also stop at the backstep boundaries so
+         # their Mamba states are materialized (they are block aligned).
+-        from vllm.v1.core.kv_cache_coordinator import b70_gdn_backstep
++        from vllm.v1.core.kv_cache_coordinator import (
++            b70_disable_gdn_backstep_for_align,
++            b70_gdn_backstep,
++        )
++
++        if self.need_mamba_block_aligned_split and b70_gdn_backstep():
++            b70_disable_gdn_backstep_for_align()
+         self.b70_gdn_backstep = b70_gdn_backstep()
+         # TODO: Support models with multiple Mamba specs that require different
+         # prefill checkpoint alignments instead of selecting the first one.

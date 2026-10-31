@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tree-level check: kit series (dense + sparse + hot/cold) applied to vanilla vLLM == scrubbed trunk (with
---hotcold-count N > 0: except the trunk's hot/cold commits).  Called by tools/check-trunk-tree.sh; see its header for the arguments.
+"""Tree-level check: kit series (dense + sparse + hot/cold + models) applied to vanilla vLLM == scrubbed trunk (with
+--hotcold-count N > 0: except the trunk's hot/cold commits).  Called by v0.32/engine/tools/check-trunk-tree.sh; see its header for the arguments.
 
 Everything runs on git objects with a temporary index: no checkout, no worktree, no branch is touched.
 New blobs written by the scrub stay in the object database as unreferenced objects.

@@ -1,7 +1,7 @@
 From 5fe35bb3c0419e5b66a4685fc98c844f373e14ac Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Fri, 23 Oct 2026 20:00:53 +0000
-Subject: [PATCH 1/2] [GDN] Skip rows whose state index is NULL_BLOCK_ID
+Subject: [PATCH 1/5] [GDN] Skip rows whose state index is NULL_BLOCK_ID
 
 vLLM pads decode and spec-decode batches that are replayed through a
 larger captured graph with rows whose state index is NULL_BLOCK_ID (0).
