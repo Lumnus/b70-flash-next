@@ -1,8 +1,8 @@
 # Known issues
 
 Each item: symptoms → cause → workaround. These are the 0.30 line's issues ([the 0.30 page](../README.md); written for 0.30.0-b70.2, reviewed
-2026-10-25); items 1, 2 and 3 apply to the 0.32 line too. The 0.32 line's own issues:
-[v0.32/README.md](../../v0.32/README.md#known-issues).
+2026-10-25); items 1, 2 and 3 apply to the 0.32 line too. For the 0.32 line, what works and what does not:
+[docs/lessons-learned.md](../../docs/lessons-learned.md).
 
 ## 1. A card keeps timing out driver jobs after a GT reset
 

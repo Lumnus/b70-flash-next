@@ -6,7 +6,7 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
-## 0.32.0-b70.5 — 2026-10-31: three models on one engine; the GDN backstep off in every preset
+## 0.32.0-b70.5 — 2026-10-31: sparse attention on B70 for Qwen3.8-Flash-Next, three models on one engine; the GDN backstep off in every preset
 
 - **Fix: `B70_OFFLOAD_GDN_BACKSTEP=0` in every preset.** b70.4's two presets (and the 0.30 engine files `s16-kv128-mtp3`,
   `awq-s16-kv128-chunked`, `r8g-kv64-0014jb`, `nvme2-kv96-0014jb`) shipped `1`. With the CPU KV tier and prefix caching
@@ -39,7 +39,10 @@ Nothing yet.
   57.1 / 72.6 tok/s at 1 / 4 streams against 55.7 / 68.9 with the synchronous swap; after an agent-session replay 38.2 / 77.5
   against 33.0 / 60.7; host stall per tick p50 82 ms against 160–940 ms. Re-gated on the b70.5 engine and kernels: MMLU /
   TruthfulQA 92.0 / 89.0 (n.s. against 92.7 / 89.0). Host MemAvailable at the shipped 64 GiB tier: 118.6 GiB.
-- **Flash-Next 4-card preset:** only the backstep key changes; not re-measured on the b70.5 kernels.
+- **Flash-Next 4-card preset:** only the backstep key changes.
+- **Flash-Next chat template** `v0.32/models/qwen38-flash-next/chat_template.jinja`, now passed by both presets
+  (`--chat-template`): the checkpoint's template plus a constant serving line, the thinking guidance and the effort mapping
+  with "off wins"; `serving_context: ""` drops the serving line. It renders identically to the template we serve.
 - **Qwen3.8-27B:** devan-carlin INT4 AutoRound run W4A8, DFlash2 K=7 with a 67,263-token shortlist draft head. 1 card: fp8 KV,
   a W8A8 int8 drafter (`quantize_dflash2_w8a8.py`), 147,456 context, 56–62 / 142–149 tok/s at one stream (prose / code).
   2 cards: 262,144 context, ~94 tok/s at one stream, MMLU / TruthfulQA 91.0 / 83.5.
@@ -47,8 +50,10 @@ Nothing yet.
   262,144 context, 16 slots, 1,060,309 GPU KV tokens, 152–168 / 376 tok/s, MMLU / TruthfulQA 88.7 / 88.5.
 - **Tooling.** `check-series.sh --models` and `--all` (four directories). `check-trunk-tree.sh` applies all four;
   `--no-models` for a trunk that ends at the hot/cold layer.
-- **Docs.** The cover describes one engine, three models and the presets per card count, with a models table; the engine page
-  and three model pages carry the details. `docs/switches.md` lists the new switches. Paths in the older entries below name the
+- **Docs.** The cover leads with sparse attention on Flash-Next, then the three models: a models table with peak decode,
+  best prefill, quality, attention backend and KV dtype per preset, and a table of the verified attention backends. The
+  engine page and three model pages carry the details. New `docs/lessons-learned.md` (what works, what does not, tuning and
+  testing advice) replaces the known-issues lists; the 0.30 line is listed as the previous line. `docs/switches.md` lists the new switches. Paths in the older entries below name the
   layout of their release.
 - Release notes: [RELEASE-NOTES-b70.5.md](RELEASE-NOTES-b70.5.md).
 

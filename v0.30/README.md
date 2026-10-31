@@ -1,4 +1,4 @@
-# The 0.30 line (stable fallback): 0.30.0-b70.2
+# The 0.30 line (previous, archived): 0.30.0-b70.2
 
 This directory is the 0.30 line of b70-flash-next: vLLM v0.30.0 + the 0.30 patch series, MTP speculative decoding,
 torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3. This page is the line in full: its validation and endurance, the per-build

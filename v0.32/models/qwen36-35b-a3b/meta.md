@@ -12,6 +12,8 @@ presets: one card (196,608-token context) and two cards (the full 262,144, 16 sl
 | presets | [`preset-1card`](preset-1card.args) / [`.env`](preset-1card.env) · [`preset-2card`](preset-2card.args) / [`.env`](preset-2card.env) |
 | chat template | [`chat_template-1card.jinja`](chat_template-1card.jinja) / [`chat_template-2card.jinja`](chat_template-2card.jinja): the checkpoint's template plus one constant serving line first in the system block (model, card count, context) and "off wins" (`reasoning_effort` none/off/false/0/disabled turns thinking off). `chat_template_kwargs: {"serving_context": ""}` drops the serving line. Per-effort thinking budgets are server-side (`B70_THINKING_BUDGET`) |
 | sampling defaults | the model card's thinking-mode preset for precise coding: temperature 0.6, top_p 0.95, top_k 20, min_p 0, presence 0. The card's general preset (temperature 1.0, presence 1.5) scored 34 against 41 of 50 on our agent capability gate |
+| attention | target and drafter on the XPU FlashAttention backend (vLLM's XPU default for the target; `FLASH_ATTN` named for the drafter); both presets, verified (gates below) |
+| KV cache dtype | no `--kv-cache-dtype` flag in either preset, so bf16 (`auto`) |
 | kernels | requires vllm-xpu-kernels #605 (kernels patch 0005): the routed-expert grouped GEMM of this model has shapes whose scale pitch is under 64 bytes |
 | engine switches | `B70_HEAD_FP8=1` (FP8 lm_head, shared by the drafter), `VLLM_XPU_INC_WNA16_BACKEND=w4a8`, the repetition stop widened to paragraph loops (`max=512,min=32,count=3`) |
 | run | `v0.32/engine/serve.sh qwen36-35b-a3b preset-1card` (or `preset-2card`) with `MODEL_PATH` at the weights and the drafter at `/models/qwen3.6-35b-a3b/DFlash` |
@@ -44,12 +46,3 @@ How to read it:
    do not fit one card.
 4. **Against the other two models on the same quality items** (two cards each): MMLU lower than Qwen3.8-Flash-Next 2-card
    (88.7 against 92.7, McNemar p 0.006); not different from Qwen3.8-27B (p 0.15). TruthfulQA: not different from either.
-
-## Known issues (Qwen3.6-35B-A3B)
-
-1. **The agent capability gate dropped from 41 to 35 of 50** after the sampling change to the coding preset (Fisher p ≈ 0.23,
-   not significant); MMLU and TruthfulQA did not move.
-2. **One stop of the 1-card engine hung more than 30 s** before it was killed; the boot after it was clean and passed the
-   gates. Not reproduced, cause unknown.
-3. **About 10 % of quality items hit the 2,400-token thinking cap** at medium effort (30 of 300); the same instrument was used
-   for every row.

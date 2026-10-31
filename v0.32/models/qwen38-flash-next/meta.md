@@ -10,7 +10,9 @@ table on NVMe and a host-RAM KV tier. Two presets: 4 cards for speed, 2 cards so
 | drafter | `incoai/Qwen3.8-Flash-Next-DFlash2` @ `a22a1744` (block diffusion, 0.6B) |
 | presets | [`preset-4card`](preset-4card.args) / [`.env`](preset-4card.env) · [`preset-2card`](preset-2card.args) / [`.env`](preset-2card.env) |
 | serve dir | the snapshot's files symlinked, with [`serve-config-qsa.json`](serve-config-qsa.json) as `config.json` (sparse attention, both presets) or [`v0.30/engines/serve-config-intel-autoround.json`](../../../v0.30/engines/serve-config-intel-autoround.json) (dense) |
-| chat template | the checkpoint's own in these presets; ours (thinking switches off on `enable_thinking=false` or a "none/off" effort) is not included |
+| chat template | [`chat_template.jinja`](chat_template.jinja), both presets: the checkpoint's template plus one constant serving line first in the system block (model and context window), a thinking guidance line and an effort mapping (off wins: `enable_thinking=false` or a `reasoning_effort` of none/off/false/0/disabled turns thinking off; `minimal` → low; `high`/`max`/`ultra` → xhigh). `chat_template_kwargs: {"serving_context": ""}` drops the serving line. Per-effort thinking budgets are server-side (`B70_THINKING_BUDGET` in the `.env`); when one runs out, the preset's `--reasoning-config` closes thinking with a short transition |
+| attention | **sparse (QSA)** by default: the full-attention layers attend over the indexer's selection with our Triton kernels (`attn2`). **Dense** is the other value: the full-attention layers on the XPU FlashAttention backend (vLLM's XPU default). Both verified on this engine ([Sparse attention](#sparse-attention-qsa)). The DFlash2 drafter runs on `TRITON_ATTN` in both |
+| KV cache dtype | no `--kv-cache-dtype` flag in either preset, so bf16 (`auto`) |
 | tested | 4× Arc Pro B70; 4 cards (TP4 + expert parallel, 12 slots, 262,144 context) and 2 cards (TP2 + expert parallel, 4 slots, 262,144 context, hot/cold expert offload) |
 | run | `v0.32/engine/serve.sh qwen38-flash-next preset-4card` (or `preset-2card`), after [Build and run](../../README.md#build-and-run) and [the weights](#weights) |
 
@@ -63,8 +65,9 @@ measured on it, follows the table.
 | decode, 1 stream (tok/s; ms per step) | 156.4 (23.9) | 58.2 (61.5) |
 | decode, 4 concurrent (total tok/s; ms per step) | 287.4 (46.4) | 69.4 (187.9) |
 | decode, 8 streams (total tok/s, two runs) | 580.9 / 577.8 | 109.2 / 119.7 |
-| prefill 32K (tok/s) | not re-measured (5,475 on the b70.3 build, 8 slots) | 2,768 (2,753 / 2,769 / 2,782) |
+| prefill (tok/s) | 5,382 at 32K, 4,897 at 131K (12 slots, the 0.1.15.4 kernel build with identical engine code) | 2,768 at 32K (2,753 / 2,769 / 2,782) |
 | host MemAvailable with it up (256 GB host) | 60.4 GiB | 154.9 GiB at a 16 GiB tier |
+| quality: MMLU 300 / TruthfulQA MC1 200 | 86.7 / 89.0, thinking off, temperature 0 (the 0.32 4-card engine with dense attention, 2026-10-23) | 92.0 / 89.0, thinking on, medium (the b70.5 engine, 2026-10-29; TP2 against TP4 fidelity is at the floors, item 3) |
 | gates | burst 0/150; token compare (det2) against the 0.1.15.4 build: PASS (c=1 3/8 identical + 5 near-tie; c=8 0/8 + 8 near-tie) | completion correct, journal clean; burst 0/150, structured output, mix probe and a 128K needle passed on the pre-release environment (below) |
 
 How to read it:
@@ -207,8 +210,8 @@ on our host).
 
 ## Sparse attention (QSA)
 
-**Status: working, experimental; the default attention of both presets.** Release 0.32.0-b70.2 added sparse attention on
-top of the dense line; 0.32.0-b70.3 brought it near dense speed; 0.32.0-b70.4 fixed its KV packing and made it the preset
+**The default attention of both presets: Qwen3.8-Flash-Next with its own sparse attention, on Arc Pro B70, in vLLM.**
+Release 0.32.0-b70.2 added it on top of the dense line; 0.32.0-b70.3 brought it near dense speed; 0.32.0-b70.4 fixed its KV packing and made it the preset
 default. The checkpoint's QSA indexer is kept and the full-attention layers attend over the indexer's selection (a
 2,048-token budget) with Triton kernels, instead of over the whole context. It boots on 4 and on 2 cards, answers correctly,
 passes the gates and the long-context needles, and its output matches dense up to the selection budget. Dense attention (the
@@ -291,35 +294,4 @@ and dump hooks. Both presets turn on `attn2`, `native_det` and the Triton select
 preset with [`serve-config-qsa.json`](serve-config-qsa.json) as the serve dir's `config.json` ([Weights](#weights)). The
 first start compiles the QSA Triton kernels cold (7 min in our first boot, ~5 min with a warm cache).
 
-**Known issues (sparse).**
-
-1. **Slower than dense on short context** by 3–11 % on one stream, at prefill up to 32K and at 8 streams (above); at 4 streams
-   it matches, and at 131K+ prefill and on agent-style session replays it beats it. No in-engine profile exists (the torch profiler hangs the engine on XPU), so where
-   the remaining time goes is inferred.
-2. **KV capacity about −13 %** against dense (344,706 tokens sparse at 12 slots against 397,309 dense at 8 slots, 4 cards, 0.1.15.4 environment), from the QSA side caches and the raw-key ring (vLLM warns that the QSA state backend's
-   `kernel_block_size=16` is not fully optimised).
-3. **Both variants are run-to-run nondeterministic from about token 512**, so bit-level comparison gates fail on either;
-   fidelity was measured with KL against a same-engine floor instead.
-4. **Prefill at 262K**: the first Triton kernel, run on Intel's main-branch Triton, beats `attn2` there (15.6 against
-   17.6 ms per layer, kernel level); the release uses Triton 3.8.0.
-5. **No multi-day run**, no generation or reasoning quality comparison with dense (retrieval-type tasks and next-token loss are measured), one host, Intel AutoRound only
-   ([measurements, what this does not show](../../../docs/measurements/v0.32-qsa.md#5-what-this-does-not-show)).
-6. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); do not serve it.
-   `native_det` is the qualified native mode.
-7. **Not run on the sparse engine:** the stock oneCCL plugin.
-
-## Known issues (Flash-Next)
-
-1. **Dense KV (8 slots) is ~2 % below the 0.30 perf line with the patched plugin, ~4 % with the stock plugin.** Peak activation is 1.93 GiB per rank against 1.31 on 0.30, and it is not
-   allocator fragmentation (expandable segments bought only ~0.1 GiB). Not yet attributed.
-2. **GPU idles ~3 ms per step in the PLE sync at one stream.** A device→host probe takes 25 µs in isolation. Open.
-3. **Only Intel AutoRound weights were measured on 0.32.** The AWQ build should work (vLLM 0.32 accepts it natively), but
-   it was not booted on this line.
-4. **2-card preset: hot/cold costs speed.** One stream 58.2 tok/s against 156.4 on 4 cards (b70.4 measurement). The fused hot+cold decode op
-   with bf16 scales is not bit-exact against all experts in VRAM (relative L2 ≤ 2.9e-3; the two stock calls are); fidelity
-   of the preset was measured at the floors ([Presets](#presets)).
-5. **An occasional 4-card boot comes up at ~339K KV tokens** instead of ~344–345K (2 of 5 boots on 2026-10-26: one rank
-   shows +0.08 GiB of non-torch memory). Harmless; cause unknown.
-
-The sparse-attention issues are listed in [Sparse attention](#sparse-attention-qsa); the engine's in
-[v0.32/README.md](../../README.md#known-issues).
+What to choose when, and what not to change: [Lessons learned](../../../docs/lessons-learned.md).

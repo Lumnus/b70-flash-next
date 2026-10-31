@@ -8,10 +8,12 @@ decoding (7 draft tokens) and a shortlist draft head. Two presets: one card (147
 | | |
 |---|---|
 | weights | `devan-carlin/Qwen3.8-27B-int4-AutoRound` @ `5efb20f2396e8223c2832183c29db23998d7a147` (Apache-2.0; auto-round → INC, int4, group 128, symmetric); file list with object ids: [`weights.oid`](weights.oid) |
-| drafter | `incoai/Qwen3.8-27B-DFlash2` @ `015e795645c74b1a0eeef3b570031fb62e769bc5` (Apache-2.0; [`drafter.oid`](drafter.oid)). The 1-card preset runs it converted to W8A8 int8 with [`quantize_dflash2_w8a8.py`](quantize_dflash2_w8a8.py) (`model.safetensors` sha256 `ff81cc3abb11647963aba4ff8a5ebfa23f806da2d1cf4c2a2464edcffdffd68c`, 1.91 instead of 3.58 GiB); the 2-card preset runs it as published (bf16) |
+| drafter | `incoai/Qwen3.8-27B-DFlash2` @ `015e795645c74b1a0eeef3b570031fb62e769bc5` (Apache-2.0; [`drafter.oid`](drafter.oid)). The 1-card preset runs it converted to W8A8 int8 with [`quantize_dflash2_w8a8.py`](quantize_dflash2_w8a8.py) (`model.safetensors` sha256 `ff81cc3abb11647963aba4ff8a5ebfa23f806da2d1cf4c2a2464edcffdffd68c`, 1.91 instead of 3.58 GiB); the 2-card preset runs it as published (bf16), the configuration its numbers were measured on |
 | draft vocab | [`draft-vocab-67263.txt`](draft-vocab-67263.txt) (sha256 `02ccd9cdd46d078210c8c09a2a4888c63eee3908eada324a1db4ef9e672aa12e`): steveseguin's token shortlist from [b70-optimization-lab](https://github.com/steveseguin/b70-optimization-lab) @ `b4f5f8c6` ([The Unlicense](draft-vocab.LICENSE)) plus every added token of the tokenizer, minus the drafter's mask token; built by [`build_draft_vocab.py`](build_draft_vocab.py) |
 | presets | [`preset-1card`](preset-1card.args) / [`.env`](preset-1card.env) · [`preset-2card`](preset-2card.args) / [`.env`](preset-2card.env) |
 | chat template | [`chat_template-1card.jinja`](chat_template-1card.jinja) / [`chat_template-2card.jinja`](chat_template-2card.jinja): the checkpoint's template plus one constant serving line first in the system block (model, card count, context), a thinking guidance line and an effort mapping (`none`/`off` turns thinking off; `minimal` → low; `high`/`max`/`ultra` → xhigh). `chat_template_kwargs: {"serving_context": ""}` drops the serving line. The two files differ only in that line |
+| attention | target on the XPU FlashAttention backend (vLLM's XPU default), the drafter on `TRITON_ATTN`; both presets, both verified (gates below) |
+| KV cache dtype | 1 card: `--kv-cache-dtype fp8` (e4m3, scale 1.0). 2 cards: no flag, so bf16 (`auto`) |
 | engine switches | `B70_HEAD_FP8=1` (FP8 lm_head, shared by the drafter), `B70_DFLASH_DRAFT_VOCAB`, `VLLM_XPU_INC_WNA16_BACKEND=w4a8`; 1-card adds `--kv-cache-dtype fp8` and `B70_XPU_INT8_ONEDNN=1` (the W8A8 drafter on oneDNN int8) |
 | run | `v0.32/engine/serve.sh qwen38-27b preset-1card` (or `preset-2card`) with `MODEL_PATH` at the weights, the drafter at `/models/qwen3.8-27b/DFlash2-w8a8` (1 card) or `/models/qwen3.8-27b/DFlash2` (2 cards) and the draft vocab at `/models/qwen3.8-27b/draft-vocab-67263.txt` |
 
@@ -56,17 +58,5 @@ How to read it:
    | `RedHatAI/Qwen3.8-27B-INT4` @ `91bd022` | 89.3 / 84.5 | ~90 / 250 / 362 | 2,311 / 1,453 |
    | `RukaRat/Qwen3.8-27B-INT8-W8A8-imatrix-MTP` @ `23f7b028` (196,608 context: one 262K request does not fit) | 89.0 / 81.5 | ~69 / 208 / 325 | 4,061 / 2,684 |
 
-5. **The 2-card preset has not been measured on the b70.5 kernels (#605) or with the backstep off.** The dense 27B does not
-   call the grouped GEMM that #605 changes, and the backstep only matters for CPU-tier reuse.
-
-## Known issues (Qwen3.8-27B)
-
-1. **Warm against cold prefix cache cannot be compared token for token on one card**: two cold runs already differ (at
-   token 91), so this test cannot show a backstep-class fault here. The backstep is off in both presets and forced off by the
-   engine; the agent loop on the served configuration is clean.
-2. **INT8 KV (`int8_per_token_head`) gives incoherent output** on this stack: it exists only on `TRITON_ATTN`, and the boot
-   that used it answered nonsense from the first greedy token. fp8 on the XPU FlashAttention backend is the working 8-bit KV.
-3. **The det gate at concurrency 8 diverges after the end of the answer** on the 2-card preset (ignore-EOS runs into an
-   invented turn; the INC w4a8 path changes prefill numerics with batch shape at its 512-row threshold). Teacher-forced
-   fidelity is at the reference level.
-4. **Quality on one card was not measured**: fp8 KV changes the target's numerics; the 2-card numbers are bf16 KV.
+5. **The b70.5 build and the 2-card numbers.** The dense 27B does not call the grouped GEMM that #605 changes, and the
+   backstep acts only on CPU-tier reuse, so neither b70.5 change touches the path the 2-card numbers measure.

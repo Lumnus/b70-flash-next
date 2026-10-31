@@ -1,53 +1,67 @@
 # b70-flash-next
 
-One vLLM engine for **Intel Arc Pro B70** cards, three models on it. The repository started as the Qwen3.8-Flash-Next
-port, hence the name; the current release, **0.32.0-b70.5**, serves **Qwen3.8-Flash-Next**, **Qwen3.8-27B** and
-**Qwen3.6-35B-A3B** from the same engine and the same Python environment, with one preset per model and card count. On our
-4-card host the three run side by side: Flash-Next on two cards, the 35B and the 27B on one card each.
+**Sparse attention (QSA) for Qwen3.8-Flash-Next on Intel Arc Pro B70, in vLLM.** The model's own sparse attention runs
+end to end on B70 cards: the QSA indexer picks a 2,048-token selection for each full-attention layer and Triton kernels
+on XPU attend over it, on 4 cards and on 2. It is the default of both Flash-Next presets. Against dense attention on the
+same engine, sparse prefills 1.31× faster at 260K tokens (4,480 against 3,420 tok/s), finishes an agent-session replay in
+204.7 s against 230–235 s, and answers 80/78 % against 72/72 % of long-context tasks at 128K. Dense attention
+(FlashAttention) is a parameter of the same engine; both are verified.
+
+The same engine serves **Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from the same Python environment, with one preset per model
+and card count. On our 4-card host the three run side by side: Flash-Next on two cards, the 35B and the 27B on one card
+each. The repository is named after the model it was built for.
 
 The engine is vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain, our patches on top, sparse attention and hot/cold expert offload
 for Flash-Next, DFlash/DFlash2 speculative decoding, a host-RAM KV tier, and a vllm-xpu-kernels build carrying our upstream
 fixes and native int8 ops. Its files are in [`v0.32/`](v0.32/README.md): the engine in `v0.32/engine/`, one directory per
-model in `v0.32/models/`. Every number on this page names the build and configuration it was measured on, on its model's
-page.
+model in `v0.32/models/`, each with a page that names the build and configuration every number was measured on.
 
 ## Models
 
-| model, weights | preset | context | decode, 1 stream (tok/s) | 4 concurrent (total tok/s) | prefill 32K (tok/s) | quality, thinking on: MMLU / TruthfulQA |
-|---|---|---|---|---|---|---|
-| **Qwen3.8-Flash-Next**, Intel AutoRound W4A16 ([page](v0.32/models/qwen38-flash-next/meta.md)) | 4 cards | 262,144 | 156.4 | 287.4 | — | — |
-| | 2 cards | 262,144 | 57.1 (`bench_det`) | 72.6 | 2,768 | 92.0 / 89.0 |
-| **Qwen3.8-27B**, INT4 AutoRound run W4A8 ([page](v0.32/models/qwen38-27b/meta.md)) | 2 cards | 262,144 | ~94 prose | 258 prose | 3,504 | 91.0 / 83.5 |
-| | 1 card | 147,456 | 56–62 prose, 142–149 code | 175–177 prose, 413–419 code | 1,947 | — |
-| **Qwen3.6-35B-A3B**, Intel INT4 mixed AutoRound ([page](v0.32/models/qwen36-35b-a3b/meta.md)) | 2 cards | 262,144 | 152–168 prose, 376 code | 418 prose | 9,997 | 88.7 / 88.5 |
-| | 1 card | 196,608 | 118–120 prose, 310–314 code | 308–316 prose, 756–798 code | 7,263 | — |
+| model, weights | preset | attention | KV | context | decode, 1 stream (tok/s) | peak decode, total (tok/s, streams) | best prefill (tok/s, prompt) | MMLU / TruthfulQA |
+|---|---|---|---|---|---|---|---|---|
+| **Qwen3.8-Flash-Next**, Intel AutoRound W4A16 ([page](v0.32/models/qwen38-flash-next/meta.md)) | 4 cards | **sparse** | bf16 | 262,144 | 156.4 | **580.9** (8) | **5,382** (32K) | 92.0 / 89.0 on 2 cards |
+| | 4 cards | dense | bf16 | 262,144 | 169.3 | 605.5 (8) | **6,305** (8K) | 86.7 / 89.0, thinking off |
+| | 2 cards | **sparse** | bf16 | 262,144 | 57.1 | 119.7 (8) | 2,768 (32K) | 92.0 / 89.0 |
+| **Qwen3.8-27B**, INT4 AutoRound run W4A8 ([page](v0.32/models/qwen38-27b/meta.md)) | 2 cards | dense | bf16 | 262,144 | ~94 prose | 370 (8) | 3,504 (32K) | 91.0 / 83.5 |
+| | 1 card | dense | fp8 | 147,456 | 56–62 prose, 142–149 code | 413–419 code, 175–177 prose (4) | 1,947 (32K) | — |
+| **Qwen3.6-35B-A3B**, Intel INT4 mixed AutoRound ([page](v0.32/models/qwen36-35b-a3b/meta.md)) | 2 cards | dense | bf16 | 262,144 | 152–168 prose, 376 code | **808** prose (16) | **9,997** (32K) | 88.7 / 88.5 |
+| | 1 card | dense | bf16 | 196,608 | 118–120 prose, 310–314 code | 756–798 code, 308–316 prose (4) | 8,386 (8K) | — |
 
-How the rows were taken, on each model's page: the Flash-Next 4-card row is the 0.32.0-b70.4 measurement (greedy, thinking
-off); its 2-card row is the shipped asynchronous hot/cold swap (2026-10-29) with prefill from b70.4; the 27B and 35B rows
-are 2026-10-29 (2 cards) and 2026-10-30/31 (1 card). Prose and code decode differ because the drafter is accepted more
-often on code. Quality is 300 MMLU and 200 TruthfulQA MC1 items, the same items for every model; a dash means not measured
-on that preset. Choosing between them: Flash-Next scores higher than the 35B on MMLU (McNemar p 0.006 on the same items) and
-needs two or four cards; the 35B is the fastest on two cards and on one, and holds four full 262K requests in GPU KV on two;
-the 27B is below Flash-Next on TruthfulQA (p 0.016), not different from the 35B, and the slowest.
+How to read the rows: every number is on its model's page with the build, date and settings it was measured on. Peak decode
+is the highest concurrency measured on that preset; prose and code differ because the drafter is accepted more often on
+code. Quality is 300 MMLU and 200 TruthfulQA MC1 items, the same items for every model, thinking on at medium effort unless
+marked, taken on the engine runs that produced the speed numbers; the Flash-Next 4-card sparse cell carries its 2-card
+numbers (same engine and weights; teacher-forced TP4 against TP2 fidelity is at the noise floor); a dash means the 1-card
+preset was not run for quality. Choosing between them: Flash-Next scores higher than the 35B on MMLU (McNemar p 0.006 on the
+same items) and needs two or four cards; the 35B is the fastest on two cards and on one, and holds four full 262K requests
+in GPU KV on two; the 27B is below Flash-Next on TruthfulQA (p 0.016), not different from the 35B.
+
+| model | attention backends (target · drafter), verified | KV cache dtype |
+|---|---|---|
+| Qwen3.8-Flash-Next | sparse QSA on Triton kernels (default) and dense on FlashAttention · DFlash2 on `TRITON_ATTN` | bf16 on both presets |
+| Qwen3.8-27B | FlashAttention · DFlash2 on `TRITON_ATTN` | fp8 on 1 card (what fits 147K context there), bf16 on 2 |
+| Qwen3.6-35B-A3B | FlashAttention · DFlash on `FLASH_ATTN` | bf16 on both presets |
+
+What works, what does not and how to tune it: [Lessons learned](docs/lessons-learned.md).
 
 ## Current release: 0.32.0-b70.5
 
 | | |
 |---|---|
-| release | `v0.32.0-b70.5`, 2026-10-31 ([release notes](RELEASE-NOTES-b70.5.md), [CHANGELOG](CHANGELOG.md)). Earlier: `v0.32.0-b70.4` (one engine, two Flash-Next presets; [notes](docs/releases/b70.4.md)), `v0.32.0-b70.3`, `v0.32.0-b70.2`, `v0.32.0-b70.1` |
+| release | `v0.32.0-b70.5`, 2026-10-31 ([release notes](RELEASE-NOTES-b70.5.md), [CHANGELOG](CHANGELOG.md)). Earlier: `v0.32.0-b70.4` (sparse attention as the default of two Flash-Next presets; [notes](docs/releases/b70.4.md)), `v0.32.0-b70.3`, `v0.32.0-b70.2`, `v0.32.0-b70.1` |
 | **fix** | `B70_OFFLOAD_GDN_BACKSTEP` is 0 in every preset (b70.4 shipped 1): with the CPU KV tier and prefix caching it restored a wrong GDN state on a prefix-cache hit, so a model in an agent session re-did finished work. The engine also forces it off under `mamba_cache_mode=align`. Users of b70.4: set it to 0 |
 | code | fork tag [`v0.32.0-b70.5`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.5): vLLM v0.32.0 + 109 commits, exported to four directories in [`v0.32/engine/patches/`](v0.32/engine/patches/): `vllm/` (50, the dense base incl. wu1ff's chain), `vllm-qsa/` (38, sparse attention), `vllm-hotcold/` (13, hot/cold expert offload), `vllm-models/` (8, the 27B/35B layer and the backstep guard) |
 | GPUs | Intel Arc Pro B70 (32 GB); presets for 1, 2 and 4 cards |
 | software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 with the legacy plugin rebuilt from oneCCL #229, vllm-xpu-kernels 0.1.16.2 + five patches (#660, #662, native int8 ops, #605) and our `libgdn_index64` ([v0.32/README.md](v0.32/README.md#software)) |
 | tested host | AMD EPYC 7402 (24C/48T) on an ASRock Rack ROMED8-2T, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe |
-| status | every preset gated and measured for speed; no multi-day run on 0.32 yet ([known issues](v0.32/README.md#known-issues)) |
-| stable fallback | [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), Flash-Next only, multi-day validated ([below](#the-030-line-stable-fallback)) |
+| validation | every preset gated and measured for speed, quality measured per model; each model page lists its gates |
+| previous | [`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), Flash-Next only, archived in [`v0.30/`](v0.30/README.md) |
 
 ## Quick start
 
 The short path; every step with its pinned commits and checks is in [v0.32/README.md](v0.32/README.md#build-and-run). These
-are the commands we ran with our paths replaced by placeholders; the sequence has not been run end to end in this form from a
-clean clone.
+are the commands we ran, with our paths replaced by placeholders.
 
 1. **Host.** B70 cards on the xe driver, compute-runtime 26.35.39758.10, oneAPI DPC++ 2026.1.1 for the native builds.
 2. **vLLM (the engine) and the Python environment** (torch 2.14.0+xpu, oneCCL 2022.1.2 from pip):
@@ -73,42 +87,26 @@ clean clone.
    VENV=/opt/b70/venv MODEL_PATH=/models/qwen3.8-27b/int4-autoround v0.32/engine/serve.sh qwen38-27b preset-1card
    ```
 
-## Known issues (short)
+## Previous line
 
-1. **No multi-day run on 0.32 yet.**
-2. **Do not run the GDN backstep with prefix caching** (`B70_OFFLOAD_GDN_BACKSTEP` > 0): fixed in the presets and guarded in
-   the engine, see the fix above.
-3. **INT8 KV (`int8_per_token_head`) gives incoherent output on XPU**; fp8 KV works.
-4. **oneCCL `LL=twoshots` corrupts output** on this stack; every oneCCL change needs the burst gate and a token compare.
-5. **Some measurements are from earlier builds** and labelled so: the Flash-Next 4-card preset on b70.4, its agent replay
-   and long prefill on the 0.1.15.4 kernels; the 27B 2-card preset before the b70.5 kernels.
-
-The full lists: [the engine](v0.32/README.md#known-issues) and each model's page.
-
-## The 0.30 line (stable fallback)
-
-**[`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2), 2026-10-07**, Qwen3.8-Flash-Next
-only: stock vLLM v0.30.0 + the series in [`v0.30/patches/`](v0.30/patches/), torch 2.13.0+xpu, vllm-xpu-kernels
-0.1.14.1+b70.3, MTP speculative decoding with 3 draft tokens, 16 sequences, ~311K GPU KV tokens + a 128 GiB CPU tier. On its
-recipe Intel AutoRound served about 15 days (2026-10-07 to 2026-10-23), the longest engine 8 days 6 hours with 0 errors; AWQ
-ran 3 days 16 hours in one engine with 0 errors. Everything about it is in **[`v0.30/`](v0.30/README.md)**. Since 0.32.0-b70.5
-its engine files also ship `B70_OFFLOAD_GDN_BACKSTEP=0`.
+[`0.30.0-b70.2`](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) (2026-10-07, Qwen3.8-Flash-Next only,
+stock vLLM v0.30.0 + its series, MTP speculative decoding): the recipe is archived in [`v0.30/`](v0.30/README.md).
 
 ## Lines
 
 | line | what | state |
 |---|---|---|
-| **current `0.32.0-b70.N`** | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork tag `v0.32.0-b70.5`, branch [`b70/v0.32.0-b70.5`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-b70.5)), torch 2.14, vllm-xpu-kernels 0.1.16.2 + five patches ([v0.32/](v0.32/README.md)) | **the current line**: Qwen3.8-Flash-Next (4 and 2 cards), Qwen3.8-27B and Qwen3.6-35B-A3B (2 and 1 card); gates, quality and speed measured, no multi-day run yet |
-| **stable fallback `0.30.0-b70.N`** | stock vLLM v0.30.0 + the series in `v0.30/patches/` (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 ([v0.30/README.md](v0.30/README.md)) | the multi-day validated Flash-Next line |
-| edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our `0.1.15.4+b70.1` kernel build ([docs/kernels.md](docs/kernels.md)) | **not recommended**: a progressive decode corruption under concurrency ([known issues](v0.30/docs/known-issues.md) item 5) |
+| **current** `0.32.0-b70.N` | vLLM v0.32.0 + wu1ff's 1.0.5 chain + our layers (fork tag `v0.32.0-b70.5`, branch [`b70/v0.32.0-b70.5`](https://github.com/Lumnus/vllm/tree/b70/v0.32.0-b70.5)), torch 2.14, vllm-xpu-kernels 0.1.16.2 + five patches ([v0.32/](v0.32/README.md)) | **the current line**: Qwen3.8-Flash-Next (4 and 2 cards), Qwen3.8-27B and Qwen3.6-35B-A3B (2 and 1 card); gates, quality and speed measured per preset |
+| previous `0.30.0-b70.N` | stock vLLM v0.30.0 + the series in `v0.30/patches/` (fork branch [`b70/v0.30.0-stable`](https://github.com/Lumnus/vllm/tree/b70/v0.30.0-stable), tag `v0.30.0-b70.2`), torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3 ([v0.30/README.md](v0.30/README.md)) | archived; Flash-Next only |
+| edge `main-YYYYMMDD-b70.N` | vLLM main + the series (fork branch [`b70/main`](https://github.com/Lumnus/vllm/tree/b70/main)), torch 2.14, our `0.1.15.4+b70.1` kernel build ([docs/kernels.md](docs/kernels.md)) | archived; not for serving (a progressive decode corruption under concurrency, [v0.30/docs/known-issues.md](v0.30/docs/known-issues.md) item 5) |
 
 ## Where to find what
 
 | path / repo | what |
 |---|---|
-| [`v0.32/`](v0.32/README.md) | the current line: `README.md` (the engine: series, software, build and run, known issues), `engine/` (`patches/` with the four vLLM directories, the kernel patches, the astra Python patches and `libgdn-index64/`; `scripts/check-series.sh`; `tools/check-trunk-tree.sh`; `serve.sh`), `models/<model>/` (`meta.md`, presets per card count, chat templates, weight file lists, model tools) |
-| [`v0.30/`](v0.30/README.md) | the 0.30.0-b70.2 line (stable fallback): its page, patches, engines, image recipe, scripts, known issues and measurements |
-| `docs/` | cross-line pages: [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) · [release notes of earlier releases](docs/releases/) |
+| [`v0.32/`](v0.32/README.md) | the current line: `README.md` (the engine: series, software, build and run, tuning), `engine/` (`patches/` with the four vLLM directories, the kernel patches, the astra Python patches and `libgdn-index64/`; `scripts/check-series.sh`; `tools/check-trunk-tree.sh`; `serve.sh`), `models/<model>/` (`meta.md`, presets per card count, chat templates, weight file lists, model tools) |
+| [`v0.30/`](v0.30/README.md) | the 0.30.0-b70.2 line (previous, archived): its page, patches, engines, image recipe, scripts, known issues and measurements |
+| `docs/` | cross-line pages: [lessons learned](docs/lessons-learned.md) · [switches](docs/switches.md) · [weights](docs/weights.md) · [kernels](docs/kernels.md) · [offload fix](docs/offload-fix.md) · [PLE INT8](docs/ple-int8.md) · [PLE on NVMe](docs/ple-nvme.md) · [measurements](docs/measurements/README.md) · [release notes of earlier releases](docs/releases/) |
 | `tools/` | Flash-Next tools used by both lines: `build_int8_ple.py` (INT8 PLE table), `intel_snapshot.py` and `awq_snapshot.py` (snapshots + serve configs), `minachist_repack.py` (Minachist experts into the Intel snapshot), `repro_band.py` (reproduce the offload miss) |
 | [Lumnus/vllm](https://github.com/Lumnus/vllm) | the code: `b70/v0.32.0-b70.5` (tag `v0.32.0-b70.5`, the 0.32 engine; tags `v0.32.0-b70.4-dense`, `v0.32.0-b70.4-qsa` and `v0.32.0-b70.4` mark where the dense base, the sparse layer and the hot/cold layer end); older: `b70/v0.32.0-b70.4`, `b70/v0.32.0` (tag `v0.32.0-b70.1`), `b70/v0.32.0-qsa-release` (b70.2/b70.3 sparse), `b70/v0.30.0-stable`, `b70/v0.30.0` (b70.1), `b70/main` (edge), `offload-hybrid-junction` (the offload fix in upstream style) |
 | [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels) | `b70/v0.1.14` (tag `v0.1.14.1+b70.3`, the 0.30 line's kernels), `b70/v0.1.15` (edge). The 0.32 line's kernels are upstream `6b30c9b` (0.1.16.2) + `v0.32/engine/patches/vllm-xpu-kernels/` |

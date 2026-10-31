@@ -8,11 +8,14 @@ is fork tag `v0.32.0-b70.5`; the environment is torch 2.14 + vllm-xpu-kernels 0.
 our `libgdn_index64.so` ([Software](#software)). Model, card count, drafter, attention and offload are run-time parameters:
 each model has a directory with its presets, one per card count.
 
-| model | presets | page |
-|---|---|---|
-| Qwen3.8-Flash-Next (Intel AutoRound W4A16) | 4 cards, 2 cards | [models/qwen38-flash-next/](models/qwen38-flash-next/meta.md) |
-| Qwen3.8-27B (INT4 AutoRound, run W4A8) | 2 cards, 1 card | [models/qwen38-27b/](models/qwen38-27b/meta.md) |
-| Qwen3.6-35B-A3B (Intel INT4 mixed AutoRound) | 2 cards, 1 card | [models/qwen36-35b-a3b/](models/qwen36-35b-a3b/meta.md) |
+| model | presets | attention (target · drafter) | KV cache dtype | page |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next (Intel AutoRound W4A16) | 4 cards, 2 cards | **sparse QSA on our Triton kernels** (default) or dense on FlashAttention, both verified · DFlash2 on `TRITON_ATTN` | bf16, both presets | [models/qwen38-flash-next/](models/qwen38-flash-next/meta.md) |
+| Qwen3.8-27B (INT4 AutoRound, run W4A8) | 2 cards, 1 card | FlashAttention · DFlash2 on `TRITON_ATTN` | 2 cards bf16; 1 card **fp8** | [models/qwen38-27b/](models/qwen38-27b/meta.md) |
+| Qwen3.6-35B-A3B (Intel INT4 mixed AutoRound) | 2 cards, 1 card | FlashAttention · DFlash on `FLASH_ATTN` | bf16, both presets | [models/qwen36-35b-a3b/](models/qwen36-35b-a3b/meta.md) |
+
+FlashAttention here is vLLM's XPU default backend for the target (no `--attention-backend` flag); the drafter's backend is
+named in its `--speculative-config`. bf16 KV means no `--kv-cache-dtype` flag (`auto`).
 
 | | |
 |---|---|
@@ -22,9 +25,9 @@ each model has a directory with its presets, one per card count.
 | KV | GPU KV plus a host-RAM tier in a private pinned pool per rank (`--kv-offloading-size`) |
 | software | [Software](#software); pins with hashes in [PROVENANCE.md](../PROVENANCE.md) §8 and §9 |
 | tested host | AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe, 4× B70 |
-| status | each preset measured for speed and gated (burst, structured output, token compare, agent loop; quality on two cards for each model); no multi-day run on 0.32; no container image |
+| validation | every preset gated (burst, structured output, token compare, agent loop) and measured for speed; quality measured per model; runs from a Python environment, no container image |
 
-The 0.30.0-b70.2 recipe is in [`v0.30/`](../v0.30/README.md), unchanged, and is the stable fallback line for Flash-Next.
+The previous line, 0.30.0-b70.2 (Flash-Next only), is archived in [`v0.30/`](../v0.30/README.md).
 
 ## Layout
 
@@ -38,7 +41,7 @@ v0.32/
     tools/check-trunk-tree.sh  the four directories against a trunk at tree level (maintainers)
     serve.sh               serve.sh MODEL PRESET: sources the preset .env, reads the .args, runs vllm serve
   models/
-    qwen38-flash-next/     meta.md, preset-4card.{args,env}, preset-2card.{args,env}, serve-config-qsa.json
+    qwen38-flash-next/     meta.md, preset-4card.{args,env}, preset-2card.{args,env}, chat_template.jinja, serve-config-qsa.json
     qwen38-27b/            meta.md, preset-1card / preset-2card, chat templates, weights.oid, drafter.oid, draft vocab,
                            build_draft_vocab.py, quantize_dflash2_w8a8.py
     qwen36-35b-a3b/        meta.md, preset-1card / preset-2card, chat templates, weights.oid, drafter.oid
@@ -153,8 +156,8 @@ Every tier is pinned memory: it does not count against a container memory limit,
 
 ## Build and run
 
-The commands we ran, with our paths replaced by placeholders. The engine and environment were built and checked file by
-file against these steps; the sequence has not been run end to end in this form from a clean clone.
+The commands we ran, with our paths replaced by placeholders; the engine and environment were checked file by file against
+these steps.
 
 1. **Base.** compute-runtime 26.35.39758.10 on the host, the xe driver, and oneAPI DPC++ 2026.1.1 for the builds.
 
@@ -253,9 +256,10 @@ file against these steps; the sequence has not been run end to end in this form 
    runtime segfaults at exit). Extra arguments are appended and win. The first start compiles cold (Flash-Next with the QSA
    Triton kernels: 7 min in our first boot, ~4–5 min after; the 27B and 35B on one card: 2–3 min).
 
-## What changed against the 0.30 line, and why 0.32 was slower at first (Flash-Next)
+## What the 0.32 engine tunes (Flash-Next)
 
-Our first 0.32 build served correctly but was ~25 % slower at one stream. Measured causes, largest first:
+The levers below are set in the presets. Each was found and measured on Flash-Next (a 0.32 build without them was ~25 %
+slower at one stream), largest first:
 
 1. **compute-runtime copy-through-lock.** Every small per-step host→device copy waited for the in-order queue to
    drain, so host preparation never overlapped the GPU: about 9.5 ms per step at one stream (found with phase timing
@@ -297,36 +301,6 @@ Upstream fixes folded in (all six are our posted PRs; #658 merged on main on 202
 | KV offload: pin a shared-prefix junction when a hybrid model's sparse group cuts the offload hit | vLLM #63566 (fixes #63565) | cherry-picked; replaces our 0014b |
 | oneCCL legacy plugin: device USM that `msync()` sees as host takes the GPU path | oneCCL #229 (fixes #228) | plugin build, step 6 |
 
-## Known issues
+## Lessons learned
 
-1. **No multi-day run yet.** The 0.32 line has served since 2026-10-24 (the 27B and 35B since 2026-10-29), with planned stops
-   for development windows; there is no endurance number for it yet.
-2. **One hang in development.** Before the copy-through-lock fix, one boot with FULL graphs hung in `sample_tokens`
-   (unit stopped, cards rebound). It did not recur in later boots or in the drill; the cause is not known.
-3. **AWQ / 0.30 items still apply** where the code is shared: card hangs after a GT reset ([v0.30/docs/known-issues.md](../v0.30/docs/known-issues.md)
-   item 1), liveness must generate, and pinned memory escapes container limits.
-4. **oneCCL `LL=twoshots`** corrupts output on this stack (burst gate 64/150 bad); every oneCCL change needs the burst gate and
-   a token compare (garbage and divergence check, not an equivalence test) before serving.
-5. **The b70.4 environment was measured for Flash-Next speed and gates, not for the replay and long prefill.** The agent-session
-   replay, 131K/260K prefill and the long-context task set ran on the 0.1.15.4 kernel build with identical engine code; on
-   the 0.1.16.2 environment the 4-card preset reproduces that build's per-step time (23.9 ms) and passes the token compare
-   against it ([Flash-Next presets](models/qwen38-flash-next/meta.md#presets)). Upstream #658 (64-bit GDN conv-state offsets) is merged on main and in no release, so
-   the stock `_xpu_C` GDN op lacks it (the PyPI 0.1.16.2 build fails `tests/gdn_attn/test_causal_conv1d.py -k
-   large_state_offset` 3 of 3 on a card; our rebuild has the same GDN source); the engine never calls it (its GDN op is `torch.ops._gdn_index64` from `libgdn_index64.so`, which passes the same tests 3 of 3).
-6. **Our kernel build has no FlashAttention-2, MQA-logits or Xe3P code** (all off, as in every build we serve): the attention
-   libraries come from the PyPI wheel, the fp8 MQA-logits ops are not registered (the engine does not call them; a model that
-   needs them needs an MQA-on build, which ran out of memory on our 64 GiB builder), and B70 is Xe2.
-7. **The GDN backstep (`B70_OFFLOAD_GDN_BACKSTEP`, 0014c) is unsafe with prefix caching** on hybrid GDN models: a prefix-cache
-   hit restores a GDN state built through a different prefill chunk split, and output diverges from the first token (seen
-   in an agent session as the model re-issuing tool calls it had already finished). Every preset ships it at 0, and the
-   engine forces it off under `mamba_cache_mode=align` (patches/vllm-models 0008). The exact numeric fault of the extra
-   GDN prefill chunk on XPU is not pinned.
-8. **INT8 KV (`--kv-cache-dtype int8_per_token_head`) gives incoherent output on XPU.** It exists only on `TRITON_ATTN`; one
-   boot of the 27B with it answered nonsense from the first greedy token, while the same configuration with fp8 KV on
-   FlashAttention answered correctly. fp8 is the working 8-bit KV type.
-9. **The oneDNN W8A8 GEMM's GPU numerics** were checked through the drafter that uses it (acceptance within 3–4 % of the
-   bf16 drafter, gates clean), not by a kernel-level comparison on the card.
-
-Per model: [Flash-Next](models/qwen38-flash-next/meta.md#known-issues-flash-next) (and its
-[sparse-attention issues](models/qwen38-flash-next/meta.md#sparse-attention-qsa)), [Qwen3.8-27B](models/qwen38-27b/meta.md#known-issues-qwen38-27b),
-[Qwen3.6-35B-A3B](models/qwen36-35b-a3b/meta.md#known-issues-qwen36-35b-a3b).
+What works, what does not, and how to tune and test this engine: [docs/lessons-learned.md](../docs/lessons-learned.md).

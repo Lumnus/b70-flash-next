@@ -16,7 +16,7 @@
 --max-num-batched-tokens 4096
 --max-num-seqs 8
 # fp8 KV (e4m3, scale 1.0) on the XPU FlashAttention backend: about twice the tokens of bf16 on one card. Do not use
-# int8_per_token_head here: on TRITON_ATTN it gave incoherent greedy output on XPU (meta.md, Known issues)
+# int8_per_token_head here: on TRITON_ATTN it gave incoherent greedy output on XPU (docs/lessons-learned.md §1)
 --kv-cache-dtype fp8
 # the text model only (the checkpoint's vision tower is not loaded)
 --language-model-only
