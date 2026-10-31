@@ -1,59 +1,83 @@
 # b70-flash-next
 
-**Sparse attention (QSA) for Qwen3.8-Flash-Next on Intel Arc Pro B70, in vLLM.** The model's own sparse attention runs
-end to end on B70 cards: the QSA indexer picks a 2,048-token selection for each full-attention layer and Triton kernels
-on XPU attend over it, on 4 cards and on 2. It is the default of both Flash-Next presets. Against dense attention on the
-same engine, sparse prefills 1.31× faster at 260K tokens (4,480 against 3,420 tok/s), finishes an agent-session replay
-in 204.7 s against 230–235 s, and answers 80/78 % against 72/72 % of long-context tasks at 128K. Dense attention
-(FlashAttention) is a parameter of the same engine; both are verified. This is the first released, gated vLLM serving
-recipe for Qwen3.8-Flash-Next with sparse attention on B70. Prior public work: Intel's SYCL QSA kernels for Flash-Next
-on B70, and TSUMUGI-XE's Triton QSA patches
-([vllm-project/vllm#54595](https://github.com/vllm-project/vllm/issues/54595)).
+vLLM serving for **Intel Arc Pro B70** cards: **Qwen3.8-Flash-Next with its native sparse attention (QSA)**, plus
+**Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from one engine and one Python environment, with a tuned preset per model and
+card count (4, 2 or 1 cards). The current release is **0.32.0-b70.5**: vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain and our
+patches on top. The repository keeps the name of the model it was built for.
 
-The same engine serves **Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from the same Python environment, with one preset per model
-and card count. On our 4-card host the three run side by side: Flash-Next on two cards, the 35B and the 27B on one card
-each. The repository is named after the model it was built for.
+1. **Sparse attention on B70.** Flash-Next's QSA runs end to end on the cards (indexer plus Triton kernels on XPU) and is
+   the default of its presets. It pays off as prompts grow: prefill is 1.31× dense at 260K tokens, an agent-session
+   replay finishes in 204.7 s against 230–235 s, and long-context tasks at 128K score 80/78 % against 72/72 %
+   ([sparse against dense](#sparse-against-dense-attention)).
+2. **Three models on one 4-card host, side by side:** Flash-Next on two cards, the 35B and the 27B on one card each.
+3. **Throughput:** Flash-Next on 4 cards decodes 580.9 tok/s across 8 streams (156.4 at one); the 35B reaches 808 tok/s
+   across 16 streams on 2 cards and prefills 9,997 tok/s.
+4. **Memory tiers:** a host-RAM KV tier, the Flash-Next n-gram table as INT8 on NVMe, DFlash/DFlash2 speculative decoding,
+   and a vllm-xpu-kernels build with our fixes and native int8 ops.
 
-The engine is vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain, our patches on top, sparse attention and hot/cold expert offload
-for Flash-Next, DFlash/DFlash2 speculative decoding, a host-RAM KV tier, and a vllm-xpu-kernels build carrying our upstream
-fixes and native int8 ops. Its files are in [`v0.32/`](v0.32/README.md): the engine in `v0.32/engine/`, one directory per
-model in `v0.32/models/`, each with a page that names the build and configuration every number was measured on.
+The engine and the presets are in [`v0.32/`](v0.32/README.md): the engine in `v0.32/engine/`, one directory per model in
+`v0.32/models/`, each with a page naming the build and configuration every number below was measured on.
 
 ## Models
 
-| model, weights | preset | attention | KV | context | decode, 1 stream (tok/s) | peak decode, total (tok/s, streams) | best prefill (tok/s, prompt) | MMLU / TruthfulQA |
-|---|---|---|---|---|---|---|---|---|
-| **Qwen3.8-Flash-Next**, Intel AutoRound W4A16 ([page](v0.32/models/qwen38-flash-next/meta.md)) | 4 cards | **sparse** | bf16 | 262,144 | 156.4 | **580.9** (8) | **5,382** (32K) | 92.0 / 89.0 on 2 cards |
-| | 4 cards | dense | bf16 | 262,144 | 169.3 | 605.5 (8) | **6,305** (8K) | 86.7 / 89.0, thinking off |
-| | 2 cards | **sparse** | bf16 | 262,144 | 57.1 | 119.7 (8) | 2,768 (32K) | 92.0 / 89.0 |
-| **Qwen3.8-27B**, INT4 AutoRound run W4A8 ([page](v0.32/models/qwen38-27b/meta.md)) | 2 cards | dense | bf16 | 262,144 | ~94 prose | 370 (8) | 3,504 (32K) | 91.0 / 83.5 |
-| | 1 card | dense | fp8 | 147,456 | 56–62 prose, 142–149 code | 413–419 code, 175–177 prose (4) | 1,947 (32K) | — |
-| **Qwen3.6-35B-A3B**, Intel INT4 mixed AutoRound ([page](v0.32/models/qwen36-35b-a3b/meta.md)) | 2 cards | dense | bf16 | 262,144 | 152–168 prose, 376 code | **808** prose (16) | **9,997** (32K) | 88.7 / 88.5 |
-| | 1 card | dense | bf16 | 196,608 | 118–120 prose, 310–314 code | 756–798 code, 308–316 prose (4) | 8,386 (8K) | — |
+| model, weights | cards | attention | context | decode, 1 stream (tok/s) | peak decode, total (tok/s, streams) | prefill 32K (tok/s) | long prefill (tok/s) |
+|---|---|---|---|---|---|---|---|
+| **Qwen3.8-Flash-Next**, Intel AutoRound W4A16 ([page](v0.32/models/qwen38-flash-next/meta.md)) | 4 | sparse | 262,144 | 156.4 | **580.9** (8) | 5,382 | **4,480 at 260K** · 4,897 at 131K |
+| | 2 | sparse | 262,144 | 57.1 | 119.7 (8) | 2,768 | — |
+| **Qwen3.8-27B**, INT4 AutoRound run W4A8 ([page](v0.32/models/qwen38-27b/meta.md)) | 2 | dense | 262,144 | ~94 | 370 (8) | 3,504 | 2,434 at 128K |
+| | 1 | dense | 147,456 | 59 prose · 146 code | 416 code (4) | 1,947 | 926 at 139K |
+| **Qwen3.6-35B-A3B**, Intel INT4 mixed AutoRound ([page](v0.32/models/qwen36-35b-a3b/meta.md)) | 2 | dense | 262,144 | 155 prose · 376 code | **808** (16) | **9,997** | 6,355 at 128K |
+| | 1 | dense | 196,608 | 119 prose · 312 code | 798 code (4) | 7,263 | — |
 
-How to read the rows: every number is on its model's page with the build, date and settings it was measured on. Peak decode
-is the highest concurrency measured on that preset; prose and code differ because the drafter is accepted more often on
-code. Quality is 300 MMLU and 200 TruthfulQA MC1 items, the same items for every model, thinking on at medium effort unless
-marked, taken on the engine runs that produced the speed numbers; the Flash-Next 4-card sparse cell carries its 2-card
-numbers (same engine and weights; teacher-forced TP4 against TP2 fidelity is at the noise floor); a dash means the 1-card
-preset was not run for quality. Choosing between them: Flash-Next scores higher than the 35B on MMLU (McNemar p 0.006 on the
-same items) and needs two or four cards; the 35B is the fastest on two cards and on one, and holds four full 262K requests
-in GPU KV on two; the 27B is below Flash-Next on TruthfulQA (p 0.016), not different from the 35B.
+Peak decode is the highest concurrency measured on that preset. Prose and code differ because the drafter is accepted
+more often on code. A dash means not measured on that preset.
+
+### Sparse against dense attention
+
+Flash-Next on 4 cards, same engine code, weights and drafter, booted back to back
+([measurements](docs/measurements/v0.32-qsa.md)). Sparse gives up about a tenth on short prompts and overtakes dense as
+the prompt grows, which is where agent sessions live.
+
+| | dense | sparse | sparse / dense |
+|---|---|---|---|
+| prefill 8K / 32K (tok/s) | 6,305 / 6,114 | 5,659 / 5,475 | 0.90 |
+| prefill 131K (tok/s) | 4,641 | 4,916 | 1.06 |
+| prefill 260K (tok/s) | 3,420 | **4,480** | **1.31** |
+| agent-session replay, multi-turn (wall time) | 230–235 s | **204.7 s** | 0.88× the time |
+| long-context tasks at 128K | 72 / 72 % | **80 / 78 %** | |
+| decode, 1 stream / 8 streams (tok/s) | 169.3 / 605.5 | 153.1 / 569.0 | 0.90 / 0.94 |
+
+Both are verified; dense (FlashAttention) is one parameter away.
+
+### Quality
+
+300 MMLU and 200 TruthfulQA MC1 items, the same items for every model, thinking on at medium effort, measured on the engine
+runs named on each model page.
+
+| model | MMLU | TruthfulQA | measured on |
+|---|---|---|---|
+| Qwen3.8-Flash-Next | 92.0 | 89.0 | 2 cards, sparse |
+| Qwen3.8-27B | 91.0 | 83.5 | 2 cards |
+| Qwen3.6-35B-A3B | 88.7 | 88.5 | 2 cards |
+
+Flash-Next scores higher than the 35B on MMLU (McNemar p 0.006 on the same items); the 27B is below Flash-Next on
+TruthfulQA (p 0.016) and not different from the 35B.
 
 | model | attention backends (target · drafter), verified | KV cache dtype |
 |---|---|---|
-| Qwen3.8-Flash-Next | sparse QSA on Triton kernels (default) and dense on FlashAttention · DFlash2 on `TRITON_ATTN` | bf16 on both presets |
-| Qwen3.8-27B | FlashAttention · DFlash2 on `TRITON_ATTN` | fp8 on 1 card (what fits 147K context there), bf16 on 2 |
-| Qwen3.6-35B-A3B | FlashAttention · DFlash on `FLASH_ATTN` | bf16 on both presets |
+| Qwen3.8-Flash-Next | sparse QSA on Triton kernels (default), dense on FlashAttention · DFlash2 on `TRITON_ATTN` | bf16 |
+| Qwen3.8-27B | FlashAttention · DFlash2 on `TRITON_ATTN` (W8A8 drafter on 1 card) | fp8 on 1 card, bf16 on 2 |
+| Qwen3.6-35B-A3B | FlashAttention · DFlash on `FLASH_ATTN` | bf16 |
 
-What works, what does not and how to tune it: [Lessons learned](docs/lessons-learned.md).
+Every preset ships a generic chat template: the model's stock template plus a working thinking-off switch; behaviour and
+attribution belong to the client or gateway. What works, what does not and how to tune it:
+[Lessons learned](docs/lessons-learned.md).
 
 ## Current release: 0.32.0-b70.5
 
 | | |
 |---|---|
 | release | `v0.32.0-b70.5`, 2026-10-31 ([release notes](RELEASE-NOTES-b70.5.md), [CHANGELOG](CHANGELOG.md)). Earlier: `v0.32.0-b70.4` (sparse attention as the default of two Flash-Next presets; [notes](docs/releases/b70.4.md)), `v0.32.0-b70.3`, `v0.32.0-b70.2`, `v0.32.0-b70.1` |
-| **fix** | `B70_OFFLOAD_GDN_BACKSTEP` is 0 in every preset (b70.4 shipped 1): with the CPU KV tier and prefix caching it restored a wrong GDN state on a prefix-cache hit, so a model in an agent session re-did finished work. The engine also forces it off under `mamba_cache_mode=align`. Users of b70.4: set it to 0 |
 | code | fork tag [`v0.32.0-b70.5`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.5): vLLM v0.32.0 + 109 commits, exported to four directories in [`v0.32/engine/patches/`](v0.32/engine/patches/): `vllm/` (50, the dense base incl. wu1ff's chain), `vllm-qsa/` (38, sparse attention), `vllm-hotcold/` (13, hot/cold expert offload), `vllm-models/` (8, the 27B/35B layer and the backstep guard) |
 | GPUs | Intel Arc Pro B70 (32 GB); presets for 1, 2 and 4 cards |
 | software | torch 2.14.0+xpu, triton 3.8.0+xpu, oneAPI 2026.1.1, compute-runtime 26.35.39758.10, oneCCL 2022.1.2 with the legacy plugin rebuilt from oneCCL #229, vllm-xpu-kernels 0.1.16.2 + five patches (#660, #662, native int8 ops, #605) and our `libgdn_index64` ([v0.32/README.md](v0.32/README.md#software)) |
