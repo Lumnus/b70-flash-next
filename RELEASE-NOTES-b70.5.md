@@ -1,10 +1,13 @@
 **0.32.0-b70.5**: sparse attention for Qwen3.8-Flash-Next on Intel Arc Pro B70, and one engine for three models.
 
-**Sparse attention (QSA) on B70.** Qwen3.8-Flash-Next runs its own sparse attention end to end in vLLM on Arc Pro B70: the
-QSA indexer picks a 2,048-token selection for each full-attention layer, and Triton kernels on XPU attend over it. It is
-the default of both Flash-Next presets, on 4 cards and on 2. Against dense attention on the same engine: prefill 1.31× at
-260K tokens (4,480 against 3,420 tok/s), an agent-session replay in 204.7 s against 230–235 s, long-context tasks at 128K
-80/78 % against 72/72 %. Dense attention on FlashAttention stays a parameter; both are verified.
+**Sparse attention (QSA) on B70.** Qwen3.8-Flash-Next runs its own sparse attention end to end in vLLM on Arc Pro B70:
+the QSA indexer picks a 2,048-token selection for each full-attention layer, and Triton kernels on XPU attend over it.
+It is the default of both Flash-Next presets, on 4 cards and on 2. Against dense attention on the same engine: prefill
+1.31× at 260K tokens (4,480 against 3,420 tok/s), an agent-session replay in 204.7 s against 230–235 s, long-context
+tasks at 128K 80/78 % against 72/72 %. Dense attention on FlashAttention stays a parameter; both are verified. This is
+the first released, gated vLLM serving recipe for Qwen3.8-Flash-Next with sparse attention on B70. Prior public work:
+Intel's SYCL QSA kernels for Flash-Next on B70, and TSUMUGI-XE's Triton QSA patches
+([vllm-project/vllm#54595](https://github.com/vllm-project/vllm/issues/54595)).
 
 **One engine, three models.** The same engine and Python environment serve Qwen3.8-Flash-Next, Qwen3.8-27B and
 Qwen3.6-35B-A3B, one preset per model and card count. On one 4-card host the three run side by side (Flash-Next on 2 cards,
@@ -39,9 +42,10 @@ finished. Every b70.5 preset ships 0, and the engine forces it off under `mamba_
    vllm-project/vllm-xpu-kernels#605.
 4. **Flash-Next 2-card** turns on the asynchronous hot/cold swap: faster after a change of traffic (38.2 against 33.0 tok/s at
    one stream after an agent-session replay) and no decode stall per swap tick.
-5. **Flash-Next chat template** in the kit (`v0.32/models/qwen38-flash-next/chat_template.jinja`, wired into both presets):
-   a constant serving line, the thinking guidance and the effort mapping, with "off wins" (`enable_thinking=false` or a
-   none/off effort turns thinking off).
+5. **Generic chat templates** for all three models (`v0.32/models/<model>/chat_template.jinja`, one per model, wired into
+   every preset): the checkpoint's own template plus the thinking switch, with "off wins" (`enable_thinking=false` or a
+   none/off effort turns thinking off). No serving line, no guidance, no system text: behaviour and attribution belong to
+   the client or gateway layer. Plain chats render byte-identical to the checkpoint's template.
 6. **Qwen3.8-27B on one card** with fp8 KV and an INT8 (W8A8) drafter made by `quantize_dflash2_w8a8.py`.
 7. **Lessons learned** (`docs/lessons-learned.md`): what works on this stack, what does not, and how to tune and test it.
 

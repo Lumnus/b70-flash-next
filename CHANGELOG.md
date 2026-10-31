@@ -40,9 +40,11 @@ Nothing yet.
   against 33.0 / 60.7; host stall per tick p50 82 ms against 160–940 ms. Re-gated on the b70.5 engine and kernels: MMLU /
   TruthfulQA 92.0 / 89.0 (n.s. against 92.7 / 89.0). Host MemAvailable at the shipped 64 GiB tier: 118.6 GiB.
 - **Flash-Next 4-card preset:** only the backstep key changes.
-- **Flash-Next chat template** `v0.32/models/qwen38-flash-next/chat_template.jinja`, now passed by both presets
-  (`--chat-template`): the checkpoint's template plus a constant serving line, the thinking guidance and the effort mapping
-  with "off wins"; `serving_context: ""` drops the serving line. It renders identically to the template we serve.
+- **Generic chat templates**, one per model (`v0.32/models/<model>/chat_template.jinja`), passed by every preset
+  (`--chat-template`): the checkpoint's own template plus the thinking switch ("off wins": `enable_thinking=false` or a
+  none/off effort turns thinking off; on Qwen3.8 other effort names map onto xhigh/medium/low instead of raising). No serving
+  line, no thinking guidance, no system text: behaviour and attribution belong to the client or gateway layer. Plain chats
+  render byte-identical to the checkpoint's template. The per-card 27B and 35B template files are gone.
 - **Qwen3.8-27B:** devan-carlin INT4 AutoRound run W4A8, DFlash2 K=7 with a 67,263-token shortlist draft head. 1 card: fp8 KV,
   a W8A8 int8 drafter (`quantize_dflash2_w8a8.py`), 147,456 context, 56–62 / 142–149 tok/s at one stream (prose / code).
   2 cards: 262,144 context, ~94 tok/s at one stream, MMLU / TruthfulQA 91.0 / 83.5.

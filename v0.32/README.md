@@ -42,13 +42,14 @@ v0.32/
     serve.sh               serve.sh MODEL PRESET: sources the preset .env, reads the .args, runs vllm serve
   models/
     qwen38-flash-next/     meta.md, preset-4card.{args,env}, preset-2card.{args,env}, chat_template.jinja, serve-config-qsa.json
-    qwen38-27b/            meta.md, preset-1card / preset-2card, chat templates, weights.oid, drafter.oid, draft vocab,
+    qwen38-27b/            meta.md, preset-1card / preset-2card, chat_template.jinja, weights.oid, drafter.oid, draft vocab,
                            build_draft_vocab.py, quantize_dflash2_w8a8.py
-    qwen36-35b-a3b/        meta.md, preset-1card / preset-2card, chat templates, weights.oid, drafter.oid
+    qwen36-35b-a3b/        meta.md, preset-1card / preset-2card, chat_template.jinja, weights.oid, drafter.oid
 ```
 
 A new model is a new directory under `models/`: its presets as `.args`/`.env` pairs, a `meta.md` with the pinned weights,
-drafter, tested cards, context and the measured numbers, and its chat template if it has one.
+drafter, tested cards, context and the measured numbers, and its chat template if it needs one (generic: the
+checkpoint's own template plus the thinking switch; behaviour and attribution belong to the client or gateway layer).
 
 ## The series
 
@@ -126,7 +127,7 @@ when the backstep is on), so the Flash-Next presets run the b70.4 code paths apa
 | torch / triton | 2.14.0+xpu / 3.8.0+xpu |
 | Intel runtime wheels | intel-sycl-rt, dpcpp-cpp-rt, intel-opencl-rt 2026.1.1; onemkl-sycl 2026.1.0 |
 | oneCCL | 2022.1.2 (pip `oneccl`) core and loader; both presets use the legacy plugin rebuilt with oneCCL#229 (build step 6); the stock plugin is a parameter |
-| vllm-xpu-kernels | **0.1.16.2 + five patches** (build step 3): the compiled libraries are built from upstream `6b30c9b` + [`patches/vllm-xpu-kernels/`](engine/patches/vllm-xpu-kernels/) (our #660 and #662; the native per-token int8 activation quantisation and oneDNN W8A8 GEMM ops with their precise-division build flag; vllm-project/vllm-xpu-kernels#605, the grouped-GEMM scale-prefetch pitch guard the 35B needs) with FlashAttention-2, MQA-logits and Xe3P off; the attention libraries and the Python files come from the PyPI 0.1.16.2 wheel; the astra Python modules and hooks from [`patches/vllm-xpu-kernels-py/`](engine/patches/vllm-xpu-kernels-py/) (step 4). Plus our `libgdn_index64.so` (step 5): the engine's GDN op, with 64-bit conv-state offsets at every site. Upstream #658 (the same 64-bit fix) is merged on main on 2026-10-26 and in no release |
+| vllm-xpu-kernels | **0.1.16.2 + five patches** (build step 3): the compiled libraries are built from upstream `6b30c9b` + [`patches/vllm-xpu-kernels/`](engine/patches/vllm-xpu-kernels/) (our #660 and #662; the native per-token int8 activation quantisation and oneDNN W8A8 GEMM ops with their precise-division build flag; vllm-project/vllm-xpu-kernels#605, the grouped-GEMM scale-prefetch pitch guard the 35B needs; the same five as commits on Lumnus/vllm-xpu-kernels [`b70/v0.1.16`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.16)) with FlashAttention-2, MQA-logits and Xe3P off; the attention libraries and the Python files come from the PyPI 0.1.16.2 wheel; the astra Python modules and hooks from [`patches/vllm-xpu-kernels-py/`](engine/patches/vllm-xpu-kernels-py/) (step 4). Plus our `libgdn_index64.so` (step 5): the engine's GDN op, with 64-bit conv-state offsets at every site. Upstream #658 (the same 64-bit fix) is merged on main on 2026-10-26 and in no release |
 | native libraries | wu1ff's B70-LLM-Controller 1.0.5 libraries, the Level Zero peer-residency shim, `libgdn_index64.so`, and Niluthon's `libb70_moe_decode.so` (Flash-Next 2-card preset), all built in step 5 |
 | other pins | transformers 5.17.0, auto-round-lib 0.16.0 |
 | vLLM | v0.32.0 + the four directories above (fork tag `v0.32.0-b70.5`) |
@@ -182,6 +183,7 @@ these steps.
    uv pip install --python /opt/b70/venv/bin/python vllm-xpu-kernels==0.1.16.2      # PyPI wheel, sha256 starts 86bfa26abbb6
    git clone https://github.com/vllm-project/vllm-xpu-kernels.git && cd vllm-xpu-kernels
    git checkout 6b30c9b92cc525c32729df988b5f918e7c5661a5 && git am <kit>/v0.32/engine/patches/vllm-xpu-kernels/*.patch
+   # or, the same tree as commits: git clone -b b70/v0.1.16 https://github.com/Lumnus/vllm-xpu-kernels.git
    source /opt/intel/oneapi/2026.1/oneapi-vars.sh   # plus gcc-toolset-13 on our builder
    VLLM_XPU_ENABLE_XE3P=OFF FA2_KERNELS_ENABLED=OFF MQA_LOGITS_KERNELS_ENABLED=OFF VLLM_XPU_ENABLE_ONEDNN=ON MAX_JOBS=6 \
      VLLM_VERSION_OVERRIDE=0.1.16.2+b70 /opt/b70/venv/bin/python setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38

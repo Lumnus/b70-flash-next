@@ -39,26 +39,16 @@
         {{- raise_exception('Unexpected content type.') }}
     {%- endif %}
 {%- endmacro %}
-{#- Serving changes for Qwen3.6-35B-A3B, minimal on the stock template:
-    (1) serving_context: one constant line rendered FIRST in the system block (prefix-cache stable); a request
-        overrides it with chat_template_kwargs.serving_context, and serving_context="" renders byte-identical to stock.
-        Keep `serving_context` UNASSIGNED here: vLLM passes a request kwarg through only for undeclared variables.
-    (2) off-wins: reasoning_effort in none/off/false/0/disabled turns thinking off even without enable_thinking.
-    The stock 3.6 template has no effort instructions and never raises on reasoning_effort, so there is no level
-    mapping to add; per-effort token caps are server-side (B70_THINKING_BUDGET). #}
-{%- set default_serving_context %}You are Qwen3.6-35B-A3B, served on a private vLLM deployment on one Intel Arc Pro B70 with a 196,608-token context window.{% endset %}
-{%- set serving_head = (serving_context if serving_context is defined and serving_context is not none else default_serving_context)|string|trim %}
-{%- if reasoning_effort is defined and reasoning_effort is not none and (reasoning_effort|string|lower) in ('none', 'off', 'false', '0', 'disabled') %}
-    {%- set enable_thinking = false %}
-{%- endif %}
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
 {%- endif %}
+{#- Generic template: the checkpoint's own chat template plus the thinking switch. Off wins: enable_thinking=false or a
+    reasoning_effort of none/off turns thinking off. Behaviour and attribution belong to the client or gateway layer. #}
+{%- if reasoning_effort is defined and reasoning_effort is not none and (reasoning_effort|string|lower) in ('none', 'off', 'false', '0', 'disabled') %}
+    {%- set enable_thinking = false %}
+{%- endif %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {{- '<|im_start|>system\n' }}
-    {%- if serving_head %}
-        {{- serving_head + '\n\n' }}
-    {%- endif %}
     {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
     {%- for tool in tools %}
         {{- "\n" }}
@@ -76,9 +66,7 @@
 {%- else %}
     {%- if messages[0].role == 'system' %}
         {%- set content = render_content(messages[0].content, false, true)|trim %}
-        {{- '<|im_start|>system\n' + (serving_head + '\n\n' if serving_head and content else serving_head) + content + '<|im_end|>\n' }}
-    {%- elif serving_head %}
-        {{- '<|im_start|>system\n' + serving_head + '<|im_end|>\n' }}
+        {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
     {%- endif %}
 {%- endif %}
 {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}

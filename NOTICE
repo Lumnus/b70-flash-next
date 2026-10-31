@@ -83,9 +83,9 @@ Third-party material
      vllm-project/vllm-xpu-kernels#196 (Apache-2.0).
    - v0.32/models/qwen38-27b/draft-vocab-67263.txt is built from steveseguin/b70-optimization-lab @ b4f5f8c6
      (The Unlicense; text in v0.32/models/qwen38-27b/draft-vocab.LICENSE) plus the tokenizer's added tokens.
-   - v0.32/models/qwen38-27b/chat_template-*.jinja and v0.32/models/qwen36-35b-a3b/chat_template-*.jinja modify the chat
-     templates of the checkpoints they serve (Qwen3.8-27B as published by devan-carlin, Apache-2.0; Qwen3.6-35B-A3B as
-     published by Intel), each under the checkpoint's license.
+   - v0.32/models/*/chat_template.jinja modify the chat templates of the checkpoints they serve (Qwen3.8-Flash-Next and
+     Qwen3.6-35B-A3B as published by Intel, Qwen3.8-27B as published by devan-carlin, Apache-2.0), each under the
+     checkpoint's license.
    - Weights and drafters are referenced, not included: devan-carlin/Qwen3.8-27B-int4-AutoRound (5efb20f, Apache-2.0),
      incoai/Qwen3.8-27B-DFlash2 (015e795, Apache-2.0), Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound (65f69c7),
      z-lab/Qwen3.6-35B-A3B-DFlash (f181eec, Apache-2.0).

@@ -3,9 +3,12 @@
 **Sparse attention (QSA) for Qwen3.8-Flash-Next on Intel Arc Pro B70, in vLLM.** The model's own sparse attention runs
 end to end on B70 cards: the QSA indexer picks a 2,048-token selection for each full-attention layer and Triton kernels
 on XPU attend over it, on 4 cards and on 2. It is the default of both Flash-Next presets. Against dense attention on the
-same engine, sparse prefills 1.31× faster at 260K tokens (4,480 against 3,420 tok/s), finishes an agent-session replay in
-204.7 s against 230–235 s, and answers 80/78 % against 72/72 % of long-context tasks at 128K. Dense attention
-(FlashAttention) is a parameter of the same engine; both are verified.
+same engine, sparse prefills 1.31× faster at 260K tokens (4,480 against 3,420 tok/s), finishes an agent-session replay
+in 204.7 s against 230–235 s, and answers 80/78 % against 72/72 % of long-context tasks at 128K. Dense attention
+(FlashAttention) is a parameter of the same engine; both are verified. This is the first released, gated vLLM serving
+recipe for Qwen3.8-Flash-Next with sparse attention on B70. Prior public work: Intel's SYCL QSA kernels for Flash-Next
+on B70, and TSUMUGI-XE's Triton QSA patches
+([vllm-project/vllm#54595](https://github.com/vllm-project/vllm/issues/54595)).
 
 The same engine serves **Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from the same Python environment, with one preset per model
 and card count. On our 4-card host the three run side by side: Flash-Next on two cards, the 35B and the 27B on one card
