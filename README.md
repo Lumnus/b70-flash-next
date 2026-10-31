@@ -1,18 +1,18 @@
 # b70-flash-next
 
-vLLM serving for **Intel Arc Pro B70** cards: **Qwen3.8-Flash-Next with its native sparse attention (QSA)**, plus
-**Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from one engine and one Python environment, with a tuned preset per model and
+vLLM serving for **Intel Arc Pro B70** cards: **Qwen3.8-Flash-Next with with both dense and sparse attention (QSA)**, plus
+**Qwen3.8-27B** and **Qwen3.6-35B-A3B**, from one engine stack and one Python environment, with a tuned preset per model and
 card count (4, 2 or 1 cards). The current release is **0.32.0-b70.5**: vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain and our
 patches on top. The repository keeps the name of the model it was built for.
 
 1. **Sparse attention on B70.** Flash-Next's QSA runs end to end on the cards (indexer plus Triton kernels on XPU) and is
-   the default of its presets. It pays off as prompts grow: prefill is 1.31× dense at 260K tokens, an agent-session
-   replay finishes in 204.7 s against 230–235 s, and long-context tasks at 128K score 80/78 % against 72/72 %
-   ([sparse against dense](#sparse-against-dense-attention)).
-2. **Three models on one 4-card host, side by side:** Flash-Next on two cards, the 35B and the 27B on one card each.
+   the default of its presets. It pays off as prompts grow: fast prefill for bigger context, an overally faster and more accurate agentic flows.
+   Dense attention mode with FlashAttn kernels is still available.
+   Full report is available at [sparse against dense](#sparse-against-dense-attention)
+2. **Three models on one 4-card host, side by side with speculative decoding:** Flash-Next on two cards, the 35B and the 27B on one card each. 
 3. **Throughput:** Flash-Next on 4 cards decodes 580.9 tok/s across 8 streams (156.4 at one); the 35B reaches 808 tok/s
-   across 16 streams on 2 cards and prefills 9,997 tok/s.
-4. **Memory tiers:** a host-RAM KV tier, the Flash-Next n-gram table as INT8 on NVMe, DFlash/DFlash2 speculative decoding,
+   across 16 streams on 2 cards and prefills 9,997 tok/s. Running 35B on single board is plenty fast too.
+4. **Memory tiers:** a host-RAM KV tier, the Flash-Next n-gram table as INT8 on NVMe, DFlash/DFlash2 speculative decoding on all,
    and a vllm-xpu-kernels build with our fixes and native int8 ops.
 
 The engine and the presets are in [`v0.32/`](v0.32/README.md): the engine in `v0.32/engine/`, one directory per model in
