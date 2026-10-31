@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
     --no-qsa) qsa=0; hc=0; md=0; shift ;;
     --no-models) md=0; shift ;;
     --no-hotcold) hc=0; md=0; shift ;;
-    -h|--help) sed -n 2,29p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,30p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

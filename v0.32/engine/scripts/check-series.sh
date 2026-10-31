@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
     --hotcold) which=(hotcold); shift ;;
     --models) which=(models); shift ;;
     --all) which=(dense qsa hotcold models); shift ;;
-    -h|--help) sed -n 2,15p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
