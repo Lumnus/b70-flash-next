@@ -1,6 +1,6 @@
 # Example engines (0.30 line)
 
-These are the 0.30 line's engines ([the 0.30 page](../README.md)). The current line's engine files are in [v0.32/engines/](../../v0.32/engines/)
+These are the 0.30 line's engines ([the 0.30 page](../README.md)). The current line's presets are in [v0.32/models/](../../v0.32/models/)
 ([v0.32/README.md](../../v0.32/README.md)); `serve-config-intel-autoround.json` here is also the 0.32 line's dense serve config.
 
 Example configurations for 4× Arc Pro B70 and ~256 GB host RAM. Adjust the paths, the GPU memory fraction and the CPU
@@ -12,7 +12,7 @@ KV size to your host.
 | `s16-kv128-mtp3` + `MODEL=awq` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | the validated alternative: same code and flags |
 | `awq-s16-kv128-chunked` | AWQ (wtdcode @ `0939125`) | 16 | INT8, from NVMe | 128 GiB (0018 chunks) | on | what we served on b70.1, without MTP |
 | `r8g-kv64` | devan W4A16 @ `40b8f18d` | 8 | INT8, pinned in RAM | 64 GiB | off | behind the numbers in `docs/measurements/` |
-| `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`, `GDN_BACKSTEP=1`) | same |
+| `r8g-kv64-0014jb` | devan W4A16 | 8 | INT8, pinned in RAM | 64 GiB | on (`JUNCTION=1`; measured with `GDN_BACKSTEP=1`, shipped with 0) | same |
 | `nvme2-kv96-0014jb` | devan W4A16 | 8 | INT8, from NVMe | 96 GiB | on | NVMe frees ~39 GiB; 96 GiB KV spends most of it |
 
 Files: `common.env` (shared environment), `<engine>.env` (the differences, plus the keys `run-example.sh` reads:
@@ -81,7 +81,9 @@ chat template (note 1) and a host-RAM guard.
    or more is refused by the driver; patch 0018 splits the pool into equal chunks, so no driver debug keys are
    needed. At 128 GiB we saw host MemAvailable drift down over hours of use (cause not identified), so on b70.1 we ran
    `KV_OFFLOADING_SIZE=64`. On b70.2, kernels b70.3 (or 0031) keep host memory flat under KV reload load ([the 0.30 page, The host-RAM KV tier](../README.md#the-host-ram-kv-tier-030-measurements)). Keep the size a power of two (total / 4).
-5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, `B70_OFFLOAD_GDN_BACKSTEP=1` (docs/offload-fix.md).
+5. **Offload fix.** The 0014jb arm: `B70_OFFLOAD_JUNCTION=1`, and `B70_OFFLOAD_GDN_BACKSTEP=1` when it was measured
+   ([docs/offload-fix.md](../../docs/offload-fix.md)). Every engine file ships `B70_OFFLOAD_GDN_BACKSTEP=0` since 0.32.0-b70.5: with
+   prefix caching on a hybrid model the backstep can restore a wrong GDN state on a prefix hit ([CHANGELOG](../../CHANGELOG.md)).
 
 ## PLE table: RAM or NVMe
 

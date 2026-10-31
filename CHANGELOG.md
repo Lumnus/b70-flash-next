@@ -6,6 +6,52 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
+## 0.32.0-b70.5 — 2026-10-31: three models on one engine; the GDN backstep off in every preset
+
+- **Fix: `B70_OFFLOAD_GDN_BACKSTEP=0` in every preset.** b70.4's two presets (and the 0.30 engine files `s16-kv128-mtp3`,
+  `awq-s16-kv128-chunked`, `r8g-kv64-0014jb`, `nvme2-kv96-0014jb`) shipped `1`. With the CPU KV tier and prefix caching
+  (`mamba_cache_mode=align`), the backstep's extra prefill stop is keyed on each request's own prompt length, so the request
+  that cached a GDN state and the one that hits it build it through different chunk splits; the hit restores a state that does
+  not match the history, and greedy output diverges from the first token. In an agent session it showed as the model
+  re-issuing tool calls it had already finished. Found on Qwen3.6-35B-A3B with a warm-against-cold prefix-cache test
+  (diverged at token 1 with the backstep on, with or without speculative decoding, on both model runners; identical with it
+  off). The engine now also forces it off under align (`vllm-models` 0008, one log line; `B70_GDN_BACKSTEP_ALIGN_GUARD=0`
+  opts out). What it bought, CPU-tier reuse of a state one block below the replay boundary, is lost: such a miss
+  re-prefills the GDN tail. **b70.4 users: set `B70_OFFLOAD_GDN_BACKSTEP=0`.**
+- **Three models.** Qwen3.8-Flash-Next (4 and 2 cards), Qwen3.8-27B (2 cards and 1 card) and Qwen3.6-35B-A3B (2 cards and 1
+  card), each with a `meta.md` (pinned weights and drafter, tested cards, context, measured numbers) and its presets in
+  `v0.32/models/<model>/`. Measured side by side on one 4-card host: Flash-Next 2-card, the 35B on card 1, the 27B on card 2.
+- **Layout.** `v0.32/patches/` → `v0.32/engine/patches/`, `v0.32/scripts/` → `v0.32/engine/scripts/`,
+  `tools/check-trunk-tree.sh` and `check_trunk_tree.py` → `v0.32/engine/tools/`, the Flash-Next presets and
+  `serve-config-qsa.json` → `v0.32/models/qwen38-flash-next/`, `RELEASE-NOTES-b70.4.md` → `docs/releases/b70.4.md` (all
+  `git mv`). New `v0.32/engine/serve.sh MODEL PRESET`. `v0.32/README.md` is the engine page; the Flash-Next presets,
+  parameters, sparse attention and validation tables moved to its model page.
+- **Engine: fork tag `v0.32.0-b70.5`**, b70.4's engine + 8 commits in the new `v0.32/engine/patches/vllm-models/`: the
+  Qwen3.5/3.8 FP8 lm_head (`B70_HEAD_FP8`), the Triton W8A8 INT8 GEMM tiles of vllm-project/vllm#64190 and #64244, the DFlash
+  draft-KV warning gate, the asynchronous hot/cold swap (`B70_MOE_HOTCOLD_ASYNC_SWAP`), the DFlash2 shortlist draft head
+  (`B70_DFLASH_DRAFT_VOCAB`), native int8 activation quantisation and the oneDNN W8A8 GEMM (`B70_XPU_INT8_ONEDNN`), and the
+  backstep guard. Every one is off unless its switch is set or its op is present. The first three directories are b70.4's,
+  unchanged.
+- **Kernels: five patches** on vllm-xpu-kernels `6b30c9b`: #660 and #662 as before, the native int8 ops (0003) with a
+  precise-division build flag (0004), and vllm-project/vllm-xpu-kernels#605 (0005), the grouped GEMM scale-prefetch pitch guard
+  the 35B's expert shapes need.
+- **Flash-Next 2-card preset:** the asynchronous hot/cold swap (swap budget 16, decay 0.85, 16 spare rows): steady decode
+  57.1 / 72.6 tok/s at 1 / 4 streams against 55.7 / 68.9 with the synchronous swap; after an agent-session replay 38.2 / 77.5
+  against 33.0 / 60.7; host stall per tick p50 82 ms against 160–940 ms. Re-gated on the b70.5 engine and kernels: MMLU /
+  TruthfulQA 92.0 / 89.0 (n.s. against 92.7 / 89.0). Host MemAvailable at the shipped 64 GiB tier: 118.6 GiB.
+- **Flash-Next 4-card preset:** only the backstep key changes; not re-measured on the b70.5 kernels.
+- **Qwen3.8-27B:** devan-carlin INT4 AutoRound run W4A8, DFlash2 K=7 with a 67,263-token shortlist draft head. 1 card: fp8 KV,
+  a W8A8 int8 drafter (`quantize_dflash2_w8a8.py`), 147,456 context, 56–62 / 142–149 tok/s at one stream (prose / code).
+  2 cards: 262,144 context, ~94 tok/s at one stream, MMLU / TruthfulQA 91.0 / 83.5.
+- **Qwen3.6-35B-A3B:** Intel INT4 mixed AutoRound, DFlash K=7. 1 card: 196,608 context, 118–120 / 310–314 tok/s. 2 cards:
+  262,144 context, 16 slots, 1,060,309 GPU KV tokens, 152–168 / 376 tok/s, MMLU / TruthfulQA 88.7 / 88.5.
+- **Tooling.** `check-series.sh --models` and `--all` (four directories). `check-trunk-tree.sh` applies all four;
+  `--no-models` for a trunk that ends at the hot/cold layer.
+- **Docs.** The cover describes one engine, three models and the presets per card count, with a models table; the engine page
+  and three model pages carry the details. `docs/switches.md` lists the new switches. Paths in the older entries below name the
+  layout of their release.
+- Release notes: [RELEASE-NOTES-b70.5.md](RELEASE-NOTES-b70.5.md).
+
 ## 0.32.0-b70.4 — 2026-10-26: one engine, one environment, two presets; sparse attention and hot/cold in the engine; kernels 0.1.16.2 with our PRs
 
 One release (no intermediate b70.4 builds were published).
@@ -25,7 +71,7 @@ One release (no intermediate b70.4 builds were published).
   rank, 64 GiB KV tier): 58.2 / 69.4 / 109.2 tok/s and GPU KV 273,169, measured at a 16 GiB tier (154.9 GiB host RAM left free; about 107 GiB expected at 64). They replace `serve.args`,
   `serve.env`, `serve-plugin.env`, `qsa-serve.args` and `qsa-serve.env`. Attention, cards, drafter, expert offload, KV offload
   size, slots, GPU memory, oneCCL plugin and two opt-outs are tabulated with their defaults and what each was measured at in
-  [v0.32/README.md](v0.32/README.md#parameters).
+  [v0.32/models/qwen38-flash-next/meta.md](v0.32/models/qwen38-flash-next/meta.md#parameters).
 - **Dense base: 50 patches.** 0001–0049 are the b70.1 series, unchanged in content (headers read `n/50`); **0050** backports
   vllm-project/vllm#54163 (merged upstream 2026-10-23): DFlash and DSpark no longer drop the trailing prefix-cache block, so
   `disable_eagle_block_drop` is no longer set (b70.1–b70.3 set it; agent-session replay 232 s against 266 s, dense, 8 slots).
@@ -62,7 +108,7 @@ One release (no intermediate b70.4 builds were published).
   the 0.32 sparse-against-dense measurements) and `tools/`. `v0.32/` is unchanged. The 0.30 scripts run from `v0.30/`
   (`v0.30/scripts/check-series.sh`; the image builds with `v0.30/` as the context). File contents are unchanged apart
   from links; paths in the entries below name the layout of their release.
-- Release notes: [RELEASE-NOTES-b70.4.md](RELEASE-NOTES-b70.4.md).
+- Release notes: [docs/releases/b70.4.md](docs/releases/b70.4.md).
 
 ## 0.32.0-b70.3 — 2026-10-26: sparse attention (QSA) brought near dense speed; dense engine args
 
@@ -132,7 +178,7 @@ The sparse variant:
 - **Status.** Working, experimental, slower than dense on multi-stream. Not run for days, no task-level comparison with
   dense. Not shipped: the engine-definition and card-sweep scripts we drove the measurements
   with (they run on our own host).
-- `v0.32/README.md`: the "in preparation" placeholder is now the section [Sparse attention (QSA)](v0.32/README.md#sparse-attention-qsa)
+- `v0.32/README.md`: the "in preparation" placeholder is now the section [Sparse attention (QSA)](v0.32/models/qwen38-flash-next/meta.md#sparse-attention-qsa)
   (anchor renamed from `#sparse-attention-qsa-in-preparation`).
 
 ## Repository changes — 2026-10-25: attribution and scope of the headline numbers and gates

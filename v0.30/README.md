@@ -4,7 +4,7 @@ This directory is the 0.30 line of b70-flash-next: vLLM v0.30.0 + the 0.30 patch
 torch 2.13, vllm-xpu-kernels 0.1.14.1+b70.3. This page is the line in full: its validation and endurance, the per-build
 numbers (the Intel-vs-AWQ comparison), the host-RAM KV tier measurements, how to run it, and its patch series. Every
 number on this page was measured on the 0.30 line; the row or paragraph says which recipe (the released MTP k=3 recipe,
-or the 0.30 perf line with DFlash2 K=7). The current line is 0.32.0-b70.4: [the cover](../README.md) and
+or the 0.30 perf line with DFlash2 K=7). The current line is 0.32.0-b70.5: [the cover](../README.md) and
 [v0.32/README.md](../v0.32/README.md).
 
 | path (under `v0.30/`) | what |
@@ -108,7 +108,7 @@ The per-build numbers of the 0.30 line. Two calibrated 4-bit checkpoints run on 
 round-to-nearest one is the reference, and a fourth variant (Minachist's recalibrated experts in Intel's checkpoint)
 is supported. Intel AutoRound is the recommended build on both lines. Unless a table says otherwise, the rows below
 were measured on the 0.30.0-b70.2 recipe (MTP k=3, 16 slots, kernels b70.2/b70.3) with a different harness from the
-one behind the 0.32 numbers on the [cover](../README.md#numbers-0320-b704); they are much lower than the 0.32 line's
+one behind the 0.32 numbers on the [cover](../README.md#models); they are much lower than the 0.32 line's
 because that recipe has no DFlash2, no async scheduling and 1024-token prefill chunks, not because of the weights. The
 Minachist table is the exception: it was measured on the 0.30 perf line (DFlash2 K=7). Intel's 0.32 numbers are on the
 cover. The two calibrated builds are close; the reasons for the order:
@@ -240,7 +240,7 @@ Agent sessions resend long, growing prompts. The CPU tier keeps their KV cache i
 it back instead of recomputing it. Both lines run it at 128 GiB in a private pinned pool per rank. Every number in this
 table was measured on the 0.30 line (the 0.30.0-b70.2 recipe, kernels b70.3); it is the deeper measurement of the same
 mechanism the 0.32 line uses. The 0.32 line's own KV-tier numbers (an agent-session replay, host RAM) are on the
-[cover](../README.md#host-ram-and-the-kv-tier-032).
+[cover](../v0.32/models/qwen38-flash-next/meta.md#host-ram-flash-next).
 
 | | |
 |---|---|
@@ -259,7 +259,7 @@ Sources: [docs/measurements/b70.2.md](docs/measurements/b70.2.md) §3.
 
 ## Quick start
 
-For the current line, see [Quick start (0.32)](../README.md#quick-start-032-current-line).
+For the current line, see [Quick start (0.32)](../README.md#quick-start).
 
 ```bash
 git clone https://github.com/Lumnus/b70-flash-next && cd b70-flash-next/v0.30

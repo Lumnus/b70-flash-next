@@ -1,7 +1,7 @@
 # Runtime switches (`B70_*`) of the 0.30 series
 
 This page covers the 0.30 series in `v0.30/patches/`. The 0.32 line carries most of these switches as ports, plus its own;
-its engine files ([v0.32/engines/preset-4card.env](../v0.32/engines/preset-4card.env)) explain each one inline, and
+its engine files ([v0.32/models/qwen38-flash-next/preset-4card.env](../v0.32/models/qwen38-flash-next/preset-4card.env)) explain each one inline, and
 [v0.32/README.md](../v0.32/README.md#the-series) lists the series.
 
 Every feature the b70 series adds is behind an environment variable and **off by default**. With none of them set,
@@ -66,12 +66,13 @@ is then looked up with that effort.
 | `B70_OFFLOAD_TRACE` | unset (off) | 0014a/f | `1`: boot line, a state line every period, and the mechanism events only (`junction-set`, `zeroed_by`), once per request per value. `2`: also every per-request lookup/store/load/hand-off/req-done line. Log prefix `B70-OFFLOAD`, logger `vllm.b70_offload`. |
 | `B70_OFFLOAD_TRACE_PERIOD_S` | `60` | 0014a | state-line period (a daemon thread, so it also fires when idle). |
 | `B70_OFFLOAD_JUNCTION` | unset (off) | 0014b | `1`: when a Mamba/GDN group cuts an offload hit below what the full-attention groups proved, pin a shared-prefix junction there so the recompute stores that state. A "same document, new question" revisit misses once, then hits (docs/offload-fix.md). |
-| `B70_OFFLOAD_GDN_BACKSTEP` | `0` | 0014c | `N`: also retain the Mamba/GDN states at the N block boundaries below the replay boundary, so the first revisit hits too. Cost per request: N × one Mamba state set (~116 MB for Qwen3.8-Flash-Next) in the CPU tier. |
+| `B70_OFFLOAD_GDN_BACKSTEP` | `0` | 0014c | `N`: also retain the Mamba/GDN states at the N block boundaries below the replay boundary, so the first revisit hits too. Cost per request: N × one Mamba state set (~116 MB for Qwen3.8-Flash-Next) in the CPU tier. **Keep it 0 with prefix caching on a hybrid model:** a prefix-cache hit can restore a GDN state built through a different chunk split, and output diverges from the first token (CHANGELOG, 0.32.0-b70.5). |
 | `B70_OFFLOAD_EMPTY_ADVANCE_GUARD` | unset (off) | 0014d | `1`: guard for vllm#56795 (do not advance past keys still write-pending under another request). |
 | `B70_OFFLOAD_GROUP_EVICT` | unset (off) | 0014e/f | `1`: select the vllm#51787 backport (request-scoped recency, tail-before-head eviction across all KV groups). Unset = upstream v0.30.0 LRU/ARC, byte for byte. |
 
-Candidate default for the offload fix ("0014jb"): `B70_OFFLOAD_TRACE=1 B70_OFFLOAD_JUNCTION=1
-B70_OFFLOAD_GDN_BACKSTEP=1 B70_OFFLOAD_EMPTY_ADVANCE_GUARD=0 B70_OFFLOAD_GROUP_EVICT=0`.
+The offload-fix arm ("0014jb") was measured with `B70_OFFLOAD_TRACE=1 B70_OFFLOAD_JUNCTION=1 B70_OFFLOAD_GDN_BACKSTEP=1
+B70_OFFLOAD_EMPTY_ADVANCE_GUARD=0 B70_OFFLOAD_GROUP_EVICT=0`; since 0.32.0-b70.5 every engine file ships
+`B70_OFFLOAD_GDN_BACKSTEP=0` (row above).
 
 ## Ungated parts (active even with every switch unset)
 
@@ -103,3 +104,16 @@ boundary, and a probe that zeroes block 0 around FULL replays. The flag files ar
 Ungated in b70.2: 0020 and 0022 (MTP loader indexer skip; vllm#55506 port), 0028 (acts only on an INC config), 0032
 (log once). Every patch that adds a log line logs once per process when it first acts (e.g. `B70-0029b`, `B70-0031`),
 so a deployment can confirm what is active.
+
+## Switches added in 0.32.0-b70.5 (0.32 line, `v0.32/engine/patches/vllm-models/`)
+
+| variable | default | patch | effect |
+|---|---|---|---|
+| `B70_HEAD_FP8` | unset (off) | 0001 | `1` on XPU: the Qwen3.5/3.8 lm_head (Qwen3.8-27B, Qwen3.6-35B-A3B) as FP8 W8A16 with a row scale, converted at the first forward; a drafter that shares the head reads the same FP8 weights. Flash-Next has its own form of the switch in the dense base. Skipped with a warning when the head is tied or not BF16 |
+| `B70_MOE_HOTCOLD_ASYNC_SWAP` | unset (off) | 0005 | `1` (with `B70_MOE_HOTCOLD_SWAP=1`): the hot/cold swap as side-stream copies and routing flips, one phase per runner step, without a host synchronisation |
+| `B70_MOE_HOTCOLD_ASYNC_SPARE` | the swap budget | 0005 | free cold rows per layer for the asynchronous swap (pinned host RAM); also caps the swaps per layer and cycle |
+| `B70_DFLASH_DRAFT_VOCAB` | unset (off) | 0006 | `<file of token ids>`: the DFlash2 drafter of a Qwen3.5/3.8 target scores only these tokens for its candidates; the target verifies against the full vocabulary, so the output distribution is unchanged |
+| `B70_XPU_INT8_QUANT_NATIVE` | on when the kernels have the op | 0007 | `0`: the torch.compile reference for per-token int8 activation quantisation instead of the native op (same bits) |
+| `B70_XPU_INT8_ONEDNN` | unset (off) | 0007 | `1`: W8A8 int8 GEMMs (compressed-tensors) on oneDNN `int8_scaled_mm` ahead of Triton, symmetric activations only. `B70_INT8_GEMM_SCALE_MODE=postop` moves the per-token scale into a post-op |
+| `B70_GDN_BACKSTEP_ALIGN_GUARD` | on | 0008 | `0`: let `B70_OFFLOAD_GDN_BACKSTEP` act under `mamba_cache_mode=align` again (not recommended) |
+

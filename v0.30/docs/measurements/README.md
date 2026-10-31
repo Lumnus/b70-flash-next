@@ -1,6 +1,6 @@
 # Measurements of the 0.30 line
 
-**Current line 0.32.0-b70.4: [v0.32/README.md §Presets](../../../v0.32/README.md#presets); how 0.32 was validated against 0.30: [v0.32/README.md](../../../v0.32/README.md#numbers-0320-b701-how-the-line-was-validated).**
+**Current line 0.32.0-b70.4: [v0.32/README.md §Presets](../../../v0.32/models/qwen38-flash-next/meta.md#presets); how 0.32 was validated against 0.30: [v0.32/README.md](../../../v0.32/models/qwen38-flash-next/meta.md#numbers-0320-b701-how-the-line-was-validated).**
 **0.32 sparse attention (QSA) against dense: [v0.32-qsa.md](../../../docs/measurements/v0.32-qsa.md).**
 **0.30.0-b70.2 (the stable fallback; Intel AutoRound + MTP): [b70.2.md](b70.2.md).**
 
