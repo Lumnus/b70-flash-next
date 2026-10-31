@@ -1,0 +1,7 @@
+# incoai/Qwen3.8-27B-DFlash2 @ 015e795645c74b1a0eeef3b570031fb62e769bc5: Hugging Face object id (git blob sha1 for small files, sha256 for LFS files), bytes, path. Fetch the revision,
+# then check each file against this list.
+50bbb90c56f7da6c41ef378fa235a891daf5a238 1581 .gitattributes
+f753df682b9f4281444f209c4deb14fc3a9894f1 5399 README.md
+6d8dcc9a9472bddb644c881fe83050b5343d09bf5ffb0912e5598e55fe671e99 286889 assets/dflash2-figure.png
+79279cc5665bced6f3cdaa2095a2ffe819497b2e 1239 config.json
+67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c 3848817896 model.safetensors

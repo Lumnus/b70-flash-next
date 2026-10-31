@@ -1,8 +1,9 @@
-# preset-4card.args — `vllm serve` flags of the 4-card preset, 0.32.0-b70.4 (tensor parallel 4 + expert parallel, DFlash2 K=7,
+# preset-4card.args — `vllm serve` flags of the 4-card preset, 0.32.0-b70.5 (tensor parallel 4 + expert parallel, DFlash2 K=7,
 # 12 slots, 128 GiB host-RAM KV tier, sparse attention by default). One flag and its value per line. Pair with preset-4card.env
-# and a serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../v0.30/engines/serve-config-intel-autoround.json
-# (dense); every other capability is a parameter, see v0.32/README.md "Parameters". This is the configuration served and validated on
-# 2026-10-26 (fork tag v0.32.0-b70.4, the 0.1.16.2 environment; numbers in v0.32/README.md "Presets"). Run: v0.32/README.md "Build and run" step 8.
+# and a serve dir whose config.json is serve-config-qsa.json (sparse, the default) or ../../../v0.30/engines/serve-config-intel-autoround.json
+# (dense); every other capability is a parameter, see meta.md "Parameters". Measured on 2026-10-26 on fork tag
+# v0.32.0-b70.4 and the 0.1.16.2 environment (numbers in meta.md "Presets"); b70.5 changes only B70_OFFLOAD_GDN_BACKSTEP=0 in the .env and
+# was not re-measured at 4 cards. Run: v0.32/engine/serve.sh qwen38-flash-next preset-4card (v0.32/README.md "Build and run").
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
@@ -12,7 +13,7 @@
 --trust-remote-code
 # 0.88 leaves too little KV for one 262,144-token request on this stack; 0.89 is the highest value vLLM's start-up
 # free-memory check accepts on compute-runtime 26.35.
-# PARAMETER gpu-memory: 0.89 measured; see v0.32/README.md Parameters
+# PARAMETER gpu-memory: 0.89 measured; see meta.md Parameters
 --gpu-memory-utilization 0.89
 --max-model-len 262144
 # prefill chunk 4096 tokens: +45-50 % prefill against 1024; 8192 bought nothing and cost 15 % KV
@@ -40,7 +41,7 @@
 # DFlash2 block-diffusion drafter (incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744), 7 draft tokens, sharded over the
 # 4 cards; async scheduling stays on (the vLLM default), DFlash2 at K=7 only pays with it. The drafter runs on
 # TRITON_ATTN; the target model takes vLLM's XPU default backend (FlashAttention), so no --attention-backend flag.
-# PARAMETER drafter: DFlash2 K=7 (default). MTP: see v0.32/README.md Parameters
+# PARAMETER drafter: DFlash2 K=7 (default). MTP: see meta.md Parameters
 --speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 # clients see cached prompt tokens in usage
 --enable-prompt-tokens-details

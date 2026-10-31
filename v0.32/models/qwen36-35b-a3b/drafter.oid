@@ -1,0 +1,8 @@
+# z-lab/Qwen3.6-35B-A3B-DFlash @ f181eece646affea2c38b2765f1aaa01a9734ccd: Hugging Face object id (git blob sha1 for small files, sha256 for LFS files), bytes, path. Fetch the revision,
+# then check each file against this list.
+aad9294c74eb1ef1fbb18fe10fca9bf37788be74 1580 .gitattributes
+ae66142520be57bca7475a34d85e49f3a6ec325f 6749 README.md
+bea1f82796909c1e4f7261ee3c08af743ec3c25057b83fca918808b76af4a7dc 338153 assets/dflash_system.png
+e8e3d9b2bcd714e4d2393ead9f1b8f5a190cbcf0 66921 assets/speedup.png
+e632a69fbbeb4dcf3562be37ee28967be84adb6b 1222 config.json
+1fb90ef50a32bfb8dd2abfe601dd3608d6d5b59dc342820a98830f76f8cd72b7 771819674 model.safetensors

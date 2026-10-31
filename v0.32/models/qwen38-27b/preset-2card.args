@@ -1,0 +1,38 @@
+# preset-2card.args — `vllm serve` flags of the Qwen3.8-27B 2-card preset, 0.32.0-b70.5: tensor parallel 2, DFlash2 K=7 (bf16
+# drafter at draft TP2), bf16 KV, 8 slots, the full 262,144-token context, 64 GiB host-RAM KV tier. One flag and its value per
+# line; pair with preset-2card.env. Measured 2026-10-29 (numbers in meta.md). Run: v0.32/engine/serve.sh qwen38-27b preset-2card
+--served-model-name qwen38-27b
+--host 0.0.0.0
+# PARAMETER port: ours is 8000 + the lowest card index; any free port works
+--port 8001
+--dtype bfloat16
+--tensor-parallel-size 2
+# PARAMETER gpu-memory: 0.89, as the Flash-Next presets
+--gpu-memory-utilization 0.89
+--max-model-len 262144
+# prefill chunk 4096 tokens
+--max-num-batched-tokens 4096
+--max-num-seqs 8
+# the text model only (the checkpoint's vision tower is not loaded)
+--language-model-only
+# FULL graphs for uniform decode: every multiple of 1+K = 8 up to 8 x 8, plus three prefill sizes
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,256,512,1024]}
+--cudagraph-metrics
+--enable-auto-tool-choice
+--tool-call-parser qwen3_coder
+--reasoning-parser qwen3
+# the served template (relative to the kit root; serve.sh runs there): a constant serving line first in the system block, the
+# thinking guidance and effort mapping; serving_context="" in chat_template_kwargs renders the checkpoint's own template
+--chat-template v0.32/models/qwen38-27b/chat_template-2card.jinja
+# server default temperature 0.7 (top_p 0.95 / top_k 20 from the checkpoint's generation_config); a request's own value wins
+--override-generation-config {"temperature": 0.7}
+# when the per-effort thinking budget (B70_THINKING_BUDGET) runs out, close thinking with a short transition
+--reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
+# CPU KV tier: 64 GiB of pinned host RAM (32 GiB per rank; AllowUnrestrictedSize=1 in the .env)
+# PARAMETER KV offload size (GiB, host RAM): 64
+--kv-offloading-size 64
+--kv-offloading-backend native
+# DFlash2 block-diffusion drafter: incoai/Qwen3.8-27B-DFlash2 @ 015e795 (bf16), sharded over both cards. Drafter attention TRITON_ATTN.
+# PARAMETER drafter: the W8A8 drafter of the 1-card preset was measured at one card only
+--speculative-config {"method":"dflash","model":"/models/qwen3.8-27b/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":2,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
+--enable-prompt-tokens-details
