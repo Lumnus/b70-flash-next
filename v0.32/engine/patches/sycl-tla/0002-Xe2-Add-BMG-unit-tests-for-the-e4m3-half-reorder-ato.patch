@@ -1,0 +1,322 @@
+From a2f4ed8e593a7cc236b7a05100eb1d66d1c2b058 Mon Sep 17 00:00:00 2001
+From: riceharvest <myappleiddarimaan@gmail.com>
+Date: Fri, 16 Oct 2026 00:34:12 +0200
+Subject: [PATCH 2/2] [Xe2] Add BMG unit tests for the e4m3 -> half reorder
+ atoms (default and CUTE_XE_E4M3_HALF_UNSCALED)
+
+Runs Xe_Reorder<UU|VV, float_e4m3_t, half_t> on all 256 e4m3 codes and
+checks every output bit pattern against a host reference:
+- default path: out == half(e4m3), NaN codes 0x7F / 0xFF -> NaN
+- CUTE_XE_E4M3_HALF_UNSCALED: out == half(e4m3 * 2^-8) exactly,
+  NaN codes -> +-480 * 2^-8
+
+The opt-in define changes the same inline atoms for the whole translation
+unit, so its test is a separate executable
+(cutlass_test_unit_cute_intel_xe_e4m3_half_unscaled); the default-path test
+is part of cutlass_test_unit_cute_intel_xe. Both pass on an Arc Pro B70
+(BMG-G31, DPCPP_SYCL_TARGET=intel_gpu_bmg_g31, oneAPI 2026.0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: riceharvest <myappleiddarimaan@gmail.com>
+
+diff --git a/test/unit/cute/CMakeLists.txt b/test/unit/cute/CMakeLists.txt
+index ac7a1b46..cd244a1d 100644
+--- a/test/unit/cute/CMakeLists.txt
++++ b/test/unit/cute/CMakeLists.txt
+@@ -73,6 +73,9 @@ if (CUTLASS_ENABLE_SYCL)
+       cutlass_test_unit_cute_msvc_compilation
+       cutlass_test_unit_cute_intel_xe
+       )
++    if(SYCL_INTEL_TARGET)
++      add_dependencies(cutlass_test_unit_cute cutlass_test_unit_cute_intel_xe_e4m3_half_unscaled)
++    endif()
+ 
+     add_custom_target(
+       test_unit_cute
+@@ -83,5 +86,8 @@ if (CUTLASS_ENABLE_SYCL)
+       #Intel Tests
+       test_unit_cute_intel_xe
+       )
++    if(SYCL_INTEL_TARGET)
++      add_dependencies(test_unit_cute test_unit_cute_intel_xe_e4m3_half_unscaled)
++    endif()
+   endif()
+ endif()
+diff --git a/test/unit/cute/intel_xe/CMakeLists.txt b/test/unit/cute/intel_xe/CMakeLists.txt
+index 3acbe9ff..6b15f527 100755
+--- a/test/unit/cute/intel_xe/CMakeLists.txt
++++ b/test/unit/cute/intel_xe/CMakeLists.txt
+@@ -54,6 +54,14 @@ cutlass_test_unit_add_executable(
+   xe_transpose_2d.cpp
+   quantize_block_wise.cpp
+   dequantize.cpp
++  reorder_e4m3_half.cpp
++)
++
++# CUTE_XE_E4M3_HALF_UNSCALED changes the e4m3 -> half reorder atoms for the whole translation unit,
++# so its test is a separate executable.
++cutlass_test_unit_add_executable(
++  cutlass_test_unit_cute_intel_xe_e4m3_half_unscaled
++  reorder_e4m3_half_unscaled.cpp
+ )
+ else()
+ cutlass_test_unit_add_executable(
+diff --git a/test/unit/cute/intel_xe/reorder_e4m3_half.cpp b/test/unit/cute/intel_xe/reorder_e4m3_half.cpp
+new file mode 100644
+index 00000000..e5b94800
+--- /dev/null
++++ b/test/unit/cute/intel_xe/reorder_e4m3_half.cpp
+@@ -0,0 +1,49 @@
++/* Copyright (C) 2026 Intel Corporation, All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ **************************************************************************************************/
++
++// Xe2 (BMG) e4m3 -> half reorder atoms, default path: every e4m3 code, exact (NaN -> NaN).
++// The CUTE_XE_E4M3_HALF_UNSCALED path is tested in reorder_e4m3_half_unscaled.cpp (separate
++// executable: the define changes the same inline atoms, so it cannot share a binary with this file).
++
++#include "reorder_e4m3_half.hpp"
++
++#if !(defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35))
++
++template <class...> class E4m3HalfDefaultKernel;
++
++TEST(BMG_CuTe_Xe_Reorder_E4m3_Half, uu_default_all_codes) {
++  e4m3_half_test::run_all_codes<cute::ReorderKind::UU, false, E4m3HalfDefaultKernel<cute::_0>>();
++}
++
++TEST(BMG_CuTe_Xe_Reorder_E4m3_Half, vv_default_all_codes) {
++  e4m3_half_test::run_all_codes<cute::ReorderKind::VV, false, E4m3HalfDefaultKernel<cute::_1>>();
++}
++
++#endif
+diff --git a/test/unit/cute/intel_xe/reorder_e4m3_half.hpp b/test/unit/cute/intel_xe/reorder_e4m3_half.hpp
+new file mode 100644
+index 00000000..bcee94de
+--- /dev/null
++++ b/test/unit/cute/intel_xe/reorder_e4m3_half.hpp
+@@ -0,0 +1,139 @@
++/* Copyright (C) 2026 Intel Corporation, All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ **************************************************************************************************/
++
++// Shared helpers for the Xe2 e4m3 -> half reorder tests (reorder_e4m3_half.cpp: default path,
++// reorder_e4m3_half_unscaled.cpp: CUTE_XE_E4M3_HALF_UNSCALED path). Include after the CuTe headers.
++//
++// Each test runs one Xe_Reorder<UU|VV, float_e4m3_t, half_t> atom per 64-byte input register over all 256
++// e4m3 codes and compares every output bit pattern against a host reference.
++
++#pragma once
++
++#include <cute/tensor.hpp>
++#include <cute/arch/reorder_xe.hpp>
++#include <sycl/sycl.hpp>
++#include <cute/util/compat.hpp>
++
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++
++#include "cutlass_unit_test.h"
++
++namespace e4m3_half_test {
++
++using namespace cute;
++using namespace compat::experimental;
++
++// A sub-group register of N-component vectors holds component c of work-item i at element c * 16 + i.
++// One uchar4 per work-item = one 64-byte input register; one ushort4 = two 32-word output registers.
++constexpr int kSg = intel::sg_size;          // 16
++constexpr int kBytesPerReg = 4 * kSg;        // 64
++constexpr int kRegs = 256 / kBytesPerReg;    // 4 registers cover all 256 codes
++
++template <ReorderKind Kind>
++void reorder_kernel(uint8_t const* src, uint16_t* dst) {
++  const int tid = ThreadIdxX();
++  for (int r = 0; r < kRegs; ++r) {
++    intel::uchar4 s;
++    intel::ushort4 d;
++    for (int c = 0; c < 4; ++c) {
++      s[c] = src[r * kBytesPerReg + c * kSg + tid];
++    }
++    Xe_Reorder<Kind, cutlass::float_e4m3_t, cutlass::half_t>::reorder(s, d);
++    for (int c = 0; c < 4; ++c) {
++      dst[r * kBytesPerReg + c * kSg + tid] = d[c];
++    }
++  }
++}
++
++// Source byte (within the 64-byte register) feeding output word w (0..63) of the register pair.
++//   UU: <1;1,0> regions, word w <- byte w.
++//   VV: <4;2,1> regions from offsets 0 and 2: words 0..31 take bytes 0,1,4,5,8,9,...;
++//       words 32..63 take bytes 2,3,6,7,...
++template <ReorderKind Kind>
++int source_byte(int w) {
++  if constexpr (Kind == ReorderKind::UU) {
++    return w;
++  } else {
++    const int h = w / 32, v = w % 32;
++    return (v / 2) * 4 + 2 * h + (v % 2);
++  }
++}
++
++inline uint16_t half_bits(float f) {
++  cutlass::half_t h(f);
++  uint16_t b;
++  std::memcpy(&b, &h, sizeof(b));
++  return b;
++}
++
++inline bool half_is_nan(uint16_t b) { return (b & 0x7C00) == 0x7C00 && (b & 0x03FF) != 0; }
++
++// Run the atom on the device for all 256 codes and check every output against the host reference.
++//   Unscaled == false: out == half(e4m3), NaN codes (0x7F, 0xFF) -> NaN (default path).
++//   Unscaled == true:  out == half(e4m3 * 2^-8) exactly, NaN codes -> +-480 * 2^-8 (opt-in path).
++template <ReorderKind Kind, bool Unscaled, class KernelName>
++void run_all_codes() {
++  cutlass::host_vector<uint8_t> host_src(256);
++  for (int i = 0; i < 256; ++i) host_src[i] = static_cast<uint8_t>(i);
++  cutlass::device_vector<uint8_t> device_src = host_src;
++  cutlass::device_vector<uint16_t> device_dst(256);
++
++  launch<reorder_kernel<Kind>, KernelName>(
++      launch_policy{compat::dim3(1), compat::dim3(kSg),
++                    kernel_properties{sycl_exp::sub_group_size<kSg>}},
++      device_src.data(), device_dst.data());
++  compat::wait_and_throw();
++  cutlass::host_vector<uint16_t> host_dst = device_dst;
++
++  int checked = 0;
++  for (int r = 0; r < kRegs; ++r) {
++    for (int w = 0; w < kBytesPerReg; ++w) {
++      const uint8_t code = host_src[r * kBytesPerReg + source_byte<Kind>(w)];
++      const uint16_t got = host_dst[r * kBytesPerReg + w];
++      const bool nan_code = (code & 0x7F) == 0x7F;
++      float ref = static_cast<float>(cutlass::float_e4m3_t::bitcast(code));
++      if (Unscaled) {
++        if (nan_code) ref = (code & 0x80) ? -480.0f : 480.0f;
++        ref = std::ldexp(ref, -8);
++        EXPECT_EQ(got, half_bits(ref)) << "code 0x" << std::hex << int(code) << " word " << std::dec << w;
++      } else if (nan_code) {
++        EXPECT_TRUE(half_is_nan(got)) << "code 0x" << std::hex << int(code) << " -> 0x" << got;
++      } else {
++        EXPECT_EQ(got, half_bits(ref)) << "code 0x" << std::hex << int(code) << " word " << std::dec << w;
++      }
++      ++checked;
++    }
++  }
++  EXPECT_EQ(checked, 256);
++}
++
++} // namespace e4m3_half_test
+diff --git a/test/unit/cute/intel_xe/reorder_e4m3_half_unscaled.cpp b/test/unit/cute/intel_xe/reorder_e4m3_half_unscaled.cpp
+new file mode 100644
+index 00000000..b36b2d97
+--- /dev/null
++++ b/test/unit/cute/intel_xe/reorder_e4m3_half_unscaled.cpp
+@@ -0,0 +1,50 @@
++/* Copyright (C) 2026 Intel Corporation, All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ **************************************************************************************************/
++
++// Xe2 (BMG) e4m3 -> half reorder atoms with the opt-in CUTE_XE_E4M3_HALF_UNSCALED path: every e4m3 code
++// must decode to exactly value * 2^-8, and the NaN codes 0x7F / 0xFF to +-480 * 2^-8.
++
++#define CUTE_XE_E4M3_HALF_UNSCALED
++
++#include "reorder_e4m3_half.hpp"
++
++#if defined(CUTE_XE_E4M3_HALF_UNSCALED_ACTIVE)
++
++template <class...> class E4m3HalfUnscaledKernel;
++
++TEST(BMG_CuTe_Xe_Reorder_E4m3_Half_Unscaled, uu_unscaled_all_codes) {
++  e4m3_half_test::run_all_codes<cute::ReorderKind::UU, true, E4m3HalfUnscaledKernel<cute::_0>>();
++}
++
++TEST(BMG_CuTe_Xe_Reorder_E4m3_Half_Unscaled, vv_unscaled_all_codes) {
++  e4m3_half_test::run_all_codes<cute::ReorderKind::VV, true, E4m3HalfUnscaledKernel<cute::_1>>();
++}
++
++#endif
+-- 
+2.43.0
+

@@ -1,0 +1,537 @@
+From 277fa0d88f2003d0a3c49cbc4f4a1c66cb7f73c5 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 23:04:11 +0000
+Subject: [PATCH 23/51] B70-IP-D2: CPU tests (spec gate, split views, writer,
+ K4 parity, routing)
+
+tests/v1/core/test_b70_ip_d2.py, no GPU:
+
+1. Spec: flag on, FLASH_ATTN packs int8_per_token_head == TRITON_ATTN
+   (blocks 64/832/3264, kv heads 1/2/4); flag off or not XPU: spec unchanged
+   and the dtype is rejected; the QSA backend keeps the inline packing.
+2. Views: split_layout_views equals the kernel test's reference views over the
+   raw page bytes (data_ptr, shape, strides, dtype) on NHD and HND logical
+   caches, padded pages and a layer offset; 64-B alignment rules of
+   check_int8_kv_cache hold; no byte written. Non-compact layouts, unaligned
+   padded pages and head_size 96 are refused. The view cache rebuilds after the
+   runner's _k_scale_cache reset and on a new cache.
+3. Writer (TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=): FlashAttentionImpl
+   .do_kv_cache_update puts the reference quantization (absmax/127, round half
+   away, clamp) at the reference byte positions, skips slot -1 and the padded
+   key rows, and leaves every other byte (other slots, page padding) alone.
+4. K4 parity: the same tokens in an inline cache and a split cache dequantize
+   to bit-identical bf16/fp16 blocks; the forced K4 prefill over the split
+   cache equals the stock K4 prefill over the inline cache (bit-exact).
+5. Routing (stand-in kernels): q 1, causal q 8, ragged q 3/1/5 and non-causal
+   q 8 go to one int8 call; a 40-token chunk and non-causal q 20 go to the
+   dequant path (with B70_PTH_FA_PREFILL=0 set); all within 1.5e-2 of an fp32
+   reference on the dequantized cache.
+
+Result (CPU, torch 2.14.1+cpu, triton 3.9 interpreter): 23 passed; with the
+K3/W1 and H1 suites 29 passed. Without TRITON_INTERPRET the 4 writer cases
+skip (19 passed). Mutations (K/V scale views swapped, non-causal rows sent to
+the causal route) fail the views/writer and routing tests.
+---
+ tests/v1/core/test_b70_ip_d2.py | 493 ++++++++++++++++++++++++++++++++
+ 1 file changed, 493 insertions(+)
+ create mode 100644 tests/v1/core/test_b70_ip_d2.py
+
+diff --git a/tests/v1/core/test_b70_ip_d2.py b/tests/v1/core/test_b70_ip_d2.py
+new file mode 100644
+index 0000000000..32a9f4525e
+--- /dev/null
++++ b/tests/v1/core/test_b70_ip_d2.py
+@@ -0,0 +1,493 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-D2: int8 per-token-head KV on the XPU FLASH_ATTN backend, CPU tests.
++
++1. Spec: with ``B70_PTH_FA_DECODE=1`` FLASH_ATTN packs int8_per_token_head
++   exactly like TRITON_ATTN (same page bytes, so hybrid unify / K3 agree); off,
++   nothing changes. The QSA backend keeps its inline packing either way.
++2. Views: ``split_layout_views`` gives the vllm-xpu-kernels contract (int8
++   [B, N, H, D] with strides (page, H*2D, 2D, 1), V at +D, fp32 scales
++   [B, N, H] with strides (page/4, H, 1) after the data region), equal to the
++   kernel test's own reference over raw page bytes, for NHD/HND logical caches,
++   padded pages and a layer offset; it refuses non-compact and unaligned caches.
++3. Writer (``TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=``): the FA impl's
++   do_kv_cache_update (TRITON_ATTN's per-token-head writer through the split
++   views) puts the reference quantization at the reference byte positions,
++   ignores slot -1 and padded key rows, and leaves every other byte alone.
++4. K4 parity: the same tokens in an inline (TRITON_ATTN) cache and a split
++   (D2) cache dequantize to the same bf16 blocks, and the forced K4 prefill over
++   the split cache equals the stock K4 prefill over the inline cache.
++5. Routing: fa_int8_forward sends q 1 / causal q <= 16 / non-causal q <= 16 to
++   the INT8 decode call (int8 K/V + scale views) and longer batches to the
++   dequant path; all agree with an fp32 reference on the dequantized cache.
++
++    TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q tests/v1/core/test_b70_ip_d2.py
++"""
++
++import os
++import sys
++import types
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.attention.backends import b70_pth_fa
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++HS = 256
++
++
++class _XPU:
++    @staticmethod
++    def is_xpu():
++        return True
++
++
++@pytest.fixture
++def d2_on(monkeypatch):
++    monkeypatch.setattr(b70_pth_fa, "current_platform", _XPU())
++    monkeypatch.setenv("B70_PTH_FA_DECODE", "1")
++
++
++# --------------------------------------------------------------------------
++# references
++# --------------------------------------------------------------------------
++def quantize_ref(x):
++    """The int8_per_token_head writer semantics of vLLM (fp32)."""
++    xf = x.float()
++    scale = torch.clamp(xf.abs().amax(-1) / 127.0, min=1e-6)
++    y = xf * (1.0 / scale)[..., None]
++    y = torch.where(y >= 0, y + 0.5, y - 0.5).clamp(-128.0, 127.0).trunc()
++    return y.to(torch.int8), scale
++
++
++def kernel_ref_views(raw, block_size, nkv, hs):
++    """vllm-xpu-kernels tests/flash_attn/int8_kv_b70_check.py split_layout_views,
++    over raw [nb, page] uint8 (page may be padded)."""
++    nb, page = raw.shape
++    data = block_size * nkv * 2 * hs
++    sb = block_size * nkv * 4
++    d = torch.as_strided(
++        raw.view(torch.int8),
++        (nb, block_size, nkv, 2 * hs),
++        (page, nkv * 2 * hs, 2 * hs, 1),
++    )
++    f = raw.view(torch.float32)
++
++    def scales(off):
++        return torch.as_strided(
++            f, (nb, block_size, nkv), (page // 4, nkv, 1), f.storage_offset() + off // 4
++        )
++
++    return d[..., :hs], d[..., hs:], scales(data), scales(data + sb)
++
++
++def make_layer_cache(nb, nkv, bs, hs=HS, nhd=True, pad=0, layer_off=0, fill=0x5A):
++    """A vLLM-style logical (B, H, N, C) int8 layer view over a flat buffer.
++    Returns (raw [nb, page] uint8 over the same bytes, kv_cache view)."""
++    c = 2 * (hs + 4)
++    page = bs * nkv * c + pad
++    buf = torch.full((layer_off + nb * page,), fill, dtype=torch.uint8)
++    raw = buf[layer_off:].view(nb, page)
++    i8 = buf.view(torch.int8)
++    # physical [B, N, H, C] (NHD) or [B, H, N, C] (HND)
++    stride = (page, c, nkv * c, 1) if nhd else (page, bs * c, c, 1)
++    kv = torch.as_strided(i8, (nb, nkv, bs, c), stride, layer_off)
++    return raw, kv
++
++
++def inline_views(kv_cache):
++    """TRITON_ATTN / K4 views over the inline layout (TritonAttentionImpl)."""
++    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
++
++    impl = object.__new__(TritonAttentionImpl)
++    impl._k_scale_cache = None
++    impl._v_scale_cache = None
++    impl._kv_quant_mode = None
++    impl._ensure_scale_caches(kv_cache)
++    padded = kv_cache.shape[-1] // 2
++    k, v = kv_cache.transpose(1, 2).split(padded, dim=-1)
++    return k, v, impl._k_scale_cache, impl._v_scale_cache
++
++
++# --------------------------------------------------------------------------
++# 1. spec / gate
++# --------------------------------------------------------------------------
++def _spec(block=64, nkv=2):
++    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
++
++    return FullAttentionSpec(
++        block_size=block,
++        num_kv_heads=nkv,
++        head_size=HS,
++        dtype=torch.int8,
++        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++    )
++
++
++def test_spec_matches_triton_when_on(d2_on):
++    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
++    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
++
++    for block, nkv in ((64, 2), (3264, 1), (832, 4)):
++        spec = _spec(block, nkv)
++        fa = FlashAttentionBackend.customize_spec(spec)
++        tr = TritonAttentionBackend.customize_spec(spec)
++        assert fa == tr
++        assert fa.page_size_bytes == block * nkv * 2 * (HS + 4)
++    assert FlashAttentionBackend.supports_kv_cache_dtype("int8_per_token_head")
++
++
++def test_spec_unchanged_when_off(monkeypatch):
++    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
++
++    monkeypatch.setattr(b70_pth_fa, "current_platform", _XPU())
++    monkeypatch.delenv("B70_PTH_FA_DECODE", raising=False)
++    spec = _spec()
++    assert FlashAttentionBackend.customize_spec(spec) == spec
++    assert not FlashAttentionBackend.supports_kv_cache_dtype("int8_per_token_head")
++    monkeypatch.setenv("B70_PTH_FA_DECODE", "1")
++    monkeypatch.setattr(
++        b70_pth_fa, "current_platform", SimpleNamespace(is_xpu=lambda: False)
++    )
++    assert not FlashAttentionBackend.supports_kv_cache_dtype("int8_per_token_head")
++
++
++def test_qsa_keeps_inline_packing(d2_on):
++    # import order: model before qsa
++    pytest.importorskip("vllm.models.qwen4_exp.nvidia.model")
++    from vllm.models.qwen4_exp.nvidia import qsa
++    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
++
++    spec = _spec(3264, 1)
++    b = qsa.Qwen4ExpQSAFlashAttentionBackend
++    assert b.customize_spec(spec) == TritonAttentionBackend.customize_spec(spec)
++    assert b.supports_kv_cache_dtype("int8_per_token_head")
++
++
++# --------------------------------------------------------------------------
++# 2. views
++# --------------------------------------------------------------------------
++@pytest.mark.parametrize("nhd", [True, False])
++@pytest.mark.parametrize(
++    "nkv,bs,pad,off", [(1, 64, 0, 0), (2, 64, 128, 0), (4, 128, 0, 4096)]
++)
++def test_split_views_contract(nhd, nkv, bs, pad, off):
++    nb = 5
++    raw, kv = make_layer_cache(nb, nkv, bs, nhd=nhd, pad=pad, layer_off=off)
++    k, v, ks, vs = b70_pth_fa.split_layout_views(kv, nkv, HS)
++    rk, rv, rks, rvs = kernel_ref_views(raw, bs, nkv, HS)
++    page = raw.shape[1]
++    for got, ref in ((k, rk), (v, rv), (ks, rks), (vs, rvs)):
++        assert got.shape == ref.shape and got.stride() == ref.stride()
++        assert got.data_ptr() == ref.data_ptr() and got.dtype == ref.dtype
++    assert k.stride() == (page, nkv * 2 * HS, 2 * HS, 1)
++    assert v.data_ptr() - k.data_ptr() == HS
++    assert ks.stride() == vs.stride() == (page // 4, nkv, 1)
++    assert ks.data_ptr() - k.data_ptr() == bs * nkv * 2 * HS
++    assert vs.data_ptr() - ks.data_ptr() == bs * nkv * 4
++    # check_int8_kv_cache's alignment rules
++    assert k.stride(0) % 64 == 0 and k.stride(2) % 64 == 0
++    assert (k.data_ptr() - raw.data_ptr()) % 64 == 0
++    # views only: no byte changed
++    assert bool((raw == 0x5A).all())
++
++
++def test_split_views_refuse_bad_layouts():
++    # head dims outside the block (LHBNC-like): not block-compact
++    nb, nkv, bs = 3, 2, 64
++    c = 2 * (HS + 4)
++    buf = torch.zeros(nb * nkv * bs * c, dtype=torch.int8)
++    kv = torch.as_strided(buf, (nb, nkv, bs, c), (bs * c, nb * bs * c, c, 1))
++    with pytest.raises(ValueError, match="block-compact"):
++        b70_pth_fa.split_layout_views(kv, nkv, HS)
++    # padded page not a multiple of 64
++    _, kv = make_layer_cache(3, 2, 64, pad=8)
++    with pytest.raises(ValueError, match="64-byte"):
++        b70_pth_fa.split_layout_views(kv, 2, HS)
++    # head size not a multiple of 64
++    _, kv = make_layer_cache(3, 2, 64, hs=96)
++    with pytest.raises(ValueError, match="64-byte"):
++        b70_pth_fa.split_layout_views(kv, 2, 96)
++
++
++def test_views_cache_follows_runner_reset():
++    _, kv = make_layer_cache(3, 2, 64)
++    impl = SimpleNamespace(num_kv_heads=2, head_size=HS, _k_scale_cache=None)
++    a = b70_pth_fa.pth_split_views(impl, kv)
++    assert b70_pth_fa.pth_split_views(impl, kv) is a
++    impl._k_scale_cache = None  # what the runner does after profiling
++    b = b70_pth_fa.pth_split_views(impl, kv)
++    assert b is not a and b[0].data_ptr() == a[0].data_ptr()
++    _, kv2 = make_layer_cache(3, 2, 64)
++    assert b70_pth_fa.pth_split_views(impl, kv2)[0].data_ptr() == kv2.data_ptr()
++
++
++# --------------------------------------------------------------------------
++# 3. writer
++# --------------------------------------------------------------------------
++@pytest.mark.skipif(
++    not INTERPRET, reason='needs TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=""'
++)
++@pytest.mark.parametrize("nhd", [True, False])
++@pytest.mark.parametrize("nkv,pad", [(1, 0), (2, 128)])
++def test_writer_roundtrip(nhd, nkv, pad):
++    from vllm.v1.attention.backend import AttentionType
++    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
++
++    torch.manual_seed(0)
++    nb, bs = 4, 64
++    raw, kv = make_layer_cache(nb, nkv, bs, nhd=nhd, pad=pad)
++    before = raw.clone()
++    impl = object.__new__(FlashAttentionImpl)
++    impl.attn_type = AttentionType.DECODER
++    impl._b70_fa_int8 = True
++    impl._k_scale_cache = None
++    impl.num_kv_heads, impl.head_size = nkv, HS
++
++    nt = 9
++    key = torch.randn(nt + 3, nkv, HS) * 2  # 3 padded rows past slot_mapping
++    key[:, :, 7] *= 20
++    val = torch.randn(nt + 3, nkv, HS)
++    slots = torch.tensor([0, 1, 63, 64, 130, -1, 200, 255, 77], dtype=torch.int64)
++    layer = SimpleNamespace()
++    impl.do_kv_cache_update(layer, key, val, kv, slots)
++
++    rk, rv, rks, rvs = kernel_ref_views(raw, bs, nkv, HS)
++    exp = before.clone()
++    ek, ev, eks, evs = kernel_ref_views(exp, bs, nkv, HS)
++    kq, kscale = quantize_ref(key[:nt])
++    vq, vscale = quantize_ref(val[:nt])
++    for t, s in enumerate(slots.tolist()):
++        if s < 0:
++            continue
++        b, o = divmod(s, bs)
++        ek[b, o], ev[b, o], eks[b, o], evs[b, o] = kq[t], vq[t], kscale[t], vscale[t]
++    assert torch.equal(rk, ek) and torch.equal(rv, ev)
++    assert torch.equal(rks, eks) and torch.equal(rvs, evs)
++    assert torch.equal(raw, exp)  # nothing else (padding, other slots) touched
++
++
++# --------------------------------------------------------------------------
++# 4. K4 parity
++# --------------------------------------------------------------------------
++def _fill_both(nkv, bs, nb, seqs, seed=0):
++    """Same quantized tokens into an inline cache and a split cache."""
++    g = torch.Generator().manual_seed(seed)
++    _, kv_in = make_layer_cache(nb, nkv, bs, fill=0)
++    _, kv_sp = make_layer_cache(nb, nkv, bs, fill=0)
++    ik, iv, iks, ivs = inline_views(kv_in)
++    sk, sv, sks, svs = b70_pth_fa.split_layout_views(kv_sp, nkv, HS)
++    perm = (torch.randperm(nb - 1, generator=g) + 1).tolist()
++    bt = torch.zeros(len(seqs), max(-(-s // bs) for s in seqs), dtype=torch.int32)
++    dense_k, dense_v, c = [], [], 0
++    for i, L in enumerate(seqs):
++        n = -(-L // bs)
++        bt[i, :n] = torch.tensor(perm[c : c + n])
++        c += n
++        key = torch.randn(L, nkv, HS, generator=g) * 2
++        val = torch.randn(L, nkv, HS, generator=g)
++        kq, ksc = quantize_ref(key)
++        vq, vsc = quantize_ref(val)
++        pos = torch.arange(L)
++        b, o = bt[i][pos // bs].long(), pos % bs
++        for kk, vv, kss, vss in ((ik, iv, iks, ivs), (sk, sv, sks, svs)):
++            kk[b, o, :, :HS] = kq
++            vv[b, o, :, :HS] = vq
++            kss[b, o], vss[b, o] = ksc, vsc
++        dense_k.append(kq.float() * ksc[..., None])
++        dense_v.append(vq.float() * vsc[..., None])
++    return kv_in, kv_sp, bt, dense_k, dense_v
++
++
++def test_dequant_blocks_parity_with_k4():
++    nkv, bs, nb = 2, 64, 9
++    kv_in, kv_sp, bt, _, _ = _fill_both(nkv, bs, nb, [70, 130, 5])
++    ik, iv, iks, ivs = inline_views(kv_in)
++    sk, sv, sks, svs = b70_pth_fa.split_layout_views(kv_sp, nkv, HS)
++    ids = torch.arange(1, nb, dtype=torch.long)
++    for dt in (torch.bfloat16, torch.float16):
++        a = torch.empty(ids.numel(), bs, nkv, HS, dtype=dt)
++        b = torch.empty_like(a)
++        b70_pth_fa._dequant_blocks(ik, iks, ids, a, HS)
++        b70_pth_fa._dequant_blocks(sk, sks, ids, b, HS)
++        assert torch.equal(a, b)
++        b70_pth_fa._dequant_blocks(iv, ivs, ids, a, HS)
++        b70_pth_fa._dequant_blocks(sv, svs, ids, b, HS)
++        assert torch.equal(a, b)
++
++
++# --------------------------------------------------------------------------
++# kernel stand-ins (no vllm_xpu_kernels on CPU)
++# --------------------------------------------------------------------------
++class _FakeXpuOps:
++    """flash_attn_varlen_func stand-in: paged causal attention in fp32 over
++    either a bf16 cache or an int8 cache with per-token-head descale views."""
++
++    def __init__(self):
++        self.calls = []
++
++    def flash_attn_varlen_func(
++        self,
++        q,
++        k,
++        v,
++        cu_seqlens_q,
++        max_seqlen_q,
++        max_seqlen_k,
++        softmax_scale=None,
++        causal=False,
++        out=None,
++        block_table=None,
++        seqused_k=None,
++        window_size=None,
++        k_descale=None,
++        v_descale=None,
++        s_aux=None,
++        **kw,
++    ):
++        self.calls.append(
++            SimpleNamespace(kdtype=k.dtype, max_q=max_seqlen_q, causal=causal)
++        )
++        if k.dtype == torch.int8:
++            assert k_descale is not None and k_descale.shape == k.shape[:3]
++            kf = k.float() * k_descale[..., None]
++            vf = v.float() * v_descale[..., None]
++        else:
++            kf, vf = k.float(), v.float()
++        bs, nkv = k.shape[1], k.shape[2]
++        cu = cu_seqlens_q.tolist()
++        used = seqused_k.tolist()
++        for i in range(len(cu) - 1):
++            q0, q1, L = cu[i], cu[i + 1], used[i]
++            if q1 == q0:
++                continue
++            nblk = -(-L // bs)
++            blocks = block_table[i, :nblk].long()
++            K = kf[blocks].reshape(-1, nkv, kf.shape[-1])[:L]
++            V = vf[blocks].reshape(-1, nkv, vf.shape[-1])[:L]
++            out[q0:q1] = _ref_attn(q[q0:q1].float(), K, V, softmax_scale, causal).to(
++                out.dtype
++            )
++        return out
++
++
++def _ref_attn(q, K, V, scale, causal):
++    g = q.shape[1] // K.shape[1]
++    K, V = K.repeat_interleave(g, 1), V.repeat_interleave(g, 1)
++    s = torch.einsum("qhd,khd->hqk", q, K) * scale
++    if causal:
++        L, ql = K.shape[0], q.shape[0]
++        qpos = torch.arange(L - ql, L)
++        mask = torch.arange(L)[None, :] <= qpos[:, None]
++        s = s.masked_fill(~mask[None], float("-inf"))
++    return torch.einsum("hqk,khd->qhd", torch.softmax(s, -1), V)
++
++
++@pytest.fixture
++def fake_kernels(monkeypatch):
++    ops = _FakeXpuOps()
++    mod = types.ModuleType("vllm._xpu_ops")
++    mod.xpu_ops = ops
++    monkeypatch.setitem(sys.modules, "vllm._xpu_ops", mod)
++    pkg = types.ModuleType("vllm_xpu_kernels")
++    fai = types.ModuleType("vllm_xpu_kernels.flash_attn_interface")
++    fai._SPEC_DECODE_MAX_QLEN = 16
++    pkg.flash_attn_interface = fai
++    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels", pkg)
++    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels.flash_attn_interface", fai)
++    monkeypatch.setattr(b70_pth_fa, "_scratch", {})
++    return ops
++
++
++def _impl(nkv, hq, max_len=4096):
++    return SimpleNamespace(
++        num_kv_heads=nkv,
++        head_size=HS,
++        scale=HS**-0.5,
++        alibi_slopes=None,
++        sinks=None,
++        logits_soft_cap=0,
++        sliding_window=(-1, -1),
++        _b70_max_model_len=max_len,
++        _k_scale_cache=None,
++        _v_scale_cache=None,
++    )
++
++
++def _meta(q_lens, seqs, bt, causal=True):
++    qsl = torch.tensor([0] + torch.tensor(q_lens).cumsum(0).tolist(), dtype=torch.int32)
++    return SimpleNamespace(
++        query_start_loc=qsl,
++        seq_lens=torch.tensor(seqs, dtype=torch.int32),
++        block_table=bt,
++        max_query_len=max(q_lens),
++        max_seq_len=max(seqs),
++        causal=causal,
++    )
++
++
++def test_forced_k4_split_equals_k4_inline(fake_kernels, monkeypatch):
++    monkeypatch.setattr(b70_pth_fa, "current_platform", _XPU())
++    monkeypatch.delenv("B70_PTH_FA_PREFILL", raising=False)
++    nkv, hq, bs, nb = 2, 8, 64, 12
++    seqs, q_lens = [200, 90, 130], [100, 90, 70]
++    kv_in, kv_sp, bt, _, _ = _fill_both(nkv, bs, nb, seqs, seed=1)
++    meta = _meta(q_lens, seqs, bt)
++    q = torch.randn(sum(q_lens), hq, HS).to(torch.bfloat16)
++
++    # stock K4 over the inline cache (TRITON_ATTN path)
++    imp_a = _impl(nkv, hq)
++    ik, iv, iks, ivs = inline_views(kv_in)
++    imp_a._k_scale_cache, imp_a._v_scale_cache = iks, ivs
++    out_a = torch.zeros_like(q)
++    assert b70_pth_fa.maybe_fa_prefill(imp_a, q, ik, iv, out_a, meta, q.shape[0])
++
++    # forced K4 over the split cache (D2 path)
++    imp_b = _impl(nkv, hq)
++    sk, sv, sks, svs = b70_pth_fa.split_layout_views(kv_sp, nkv, HS)
++    out_b = torch.zeros_like(q)
++    assert b70_pth_fa.maybe_fa_prefill(
++        imp_b, q, sk, sv, out_b, meta, q.shape[0], pth_scales=(sks, svs), force=True
++    )
++    assert torch.equal(out_a, out_b)
++    assert all(c.kdtype == torch.bfloat16 for c in fake_kernels.calls)
++
++
++# --------------------------------------------------------------------------
++# 5. routing
++# --------------------------------------------------------------------------
++@pytest.mark.parametrize(
++    "q_lens,causal,want",
++    [
++        ([1, 1, 1], True, "int8"),
++        ([8, 8, 8], True, "int8"),  # uniform DFlash K=7 verify
++        ([3, 1, 5], True, "int8"),  # adaptive verification (ragged)
++        ([8, 8, 8], False, "int8"),  # non-causal draft block
++        ([1, 40, 1], True, "bf16"),  # mixed with a prefill chunk
++        ([20, 20, 20], False, "bf16"),
++    ],
++)
++def test_fa_int8_forward_routes(fake_kernels, monkeypatch, q_lens, causal, want):
++    monkeypatch.setattr(b70_pth_fa, "current_platform", _XPU())
++    monkeypatch.setenv("B70_PTH_FA_PREFILL", "0")  # forced path must ignore it
++    nkv, hq, bs, nb = 2, 8, 64, 12
++    seqs = [150, 64, 129]
++    _, kv_sp, bt, dk, dv = _fill_both(nkv, bs, nb, seqs, seed=2)
++    meta = _meta(q_lens, seqs, bt, causal)
++    q = torch.randn(sum(q_lens), hq, HS).to(torch.bfloat16)
++    out = torch.zeros_like(q)
++    impl = _impl(nkv, hq)
++    b70_pth_fa.fa_int8_forward(impl, q, kv_sp, meta, out, q.shape[0], (-1, -1))
++    kinds = {("int8" if c.kdtype == torch.int8 else "bf16") for c in fake_kernels.calls}
++    assert kinds == {want}
++    if want == "int8":
++        assert all(c.causal for c in fake_kernels.calls)
++    qsl = meta.query_start_loc.tolist()
++    for i in range(len(seqs)):
++        ref = _ref_attn(
++            q[qsl[i] : qsl[i + 1]].float(), dk[i], dv[i], impl.scale, causal
++        )
++        got = out[qsl[i] : qsl[i + 1]].float()
++        rel = (got - ref).norm() / ref.norm()
++        assert rel < 1.5e-2, (i, rel.item())

@@ -1,0 +1,962 @@
+From b23b3b80e04f3b3dfa18d015e7c4c6280fafa73f Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 01:57:09 +0000
+Subject: [PATCH 34/51] B70-PLE-RAM: native INT8 PLE table in pinned host RAM
+ (B70_PLE_INT8=1, port of Lumnus 0008)
+
+PLE is either RAM native or on SSD. B70_PLE_INT8=1 (+ B70_PLE_INT8_PATH)
+selects Qwen4ExpPLEInt8RAMEmbedding: each TP rank reads its owned row range of
+the INT8 row-scale table (160 int8 + fp32 scale = 164 B/row) once at boot into
+pinned slabs and addresses rows directly by id (row - tp_start). No row cache,
+no slot map, no reader on the step path. B70_PLE_INT8=1 together with
+B70_PLE_INT8_NVME=1 raises at init.
+
+- ple_ram.py (host-only, numpy): PleRamTable, plan_slabs. Slabs fill a power of
+  two to within one row (max 8 GiB, tail < 1 MiB): the torch caching host
+  allocator rounds each pinned request up to a power of two, so one 12.2 GiB
+  slab per TP4 rank would pin 16 GiB. Load reuses ple_nvme.preload_range
+  (O_DIRECT 64 MiB chunks, B70_PLE_INT8_LOAD_THREADS / _LOAD_CHUNK_MIB).
+- b70_ple_ram.py: subclass of the 0.32 NVMe class; the host-prepared
+  producer/consumer is inherited, _fill_stage gathers from RAM. Boot checks:
+  every owned scale finite and >= 0 (0008's full scan), B70_PLE_INT8_BOOT_SAMPLE
+  rows vs O_DIRECT row reads, BF16 cross-check with PLE_TABLE_PATH. One line per
+  rank: "B70 PLE INT8 RAM (rank r): N rows, X GiB pinned, loaded in Y s ...".
+- Gather: host gather into the pinned stage + one H2D, then the existing eager
+  consumer (int8 byte-sum all-reduce, per-row q*s dequant to BF16). The ids are
+  already on the host (B70_PLE_HOST_IDS=1), so no extra sync; 0008's UVA Triton
+  gather is not used (one PCIe read per 164-B row, and the 0.32 pinned-UVA class
+  has not run on XPU).
+- b70_ple_nvme.py: flag/label made class attributes, the BF16 cross-check
+  factored into bf16_crosscheck (NVMe behaviour unchanged).
+
+Tests: tests/b70/test_ple_int8_ram.py, 25 passed + 1 skipped (real-table test,
+needs B70_PLE_INT8_TEST_PATH). Existing PLE NVMe tests unchanged: 33 passed,
+3 skipped.
+---
+ tests/b70/test_ple_int8_ram.py                | 346 ++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py  |  75 ++--
+ vllm/models/qwen4_exp/nvidia/b70_ple_ram.py   | 185 ++++++++++
+ .../qwen4_exp/nvidia/ngram_embedding.py       |   7 +-
+ vllm/models/qwen4_exp/nvidia/ple_nvme.py      |   3 +-
+ vllm/models/qwen4_exp/nvidia/ple_ram.py       | 167 +++++++++
+ 6 files changed, 751 insertions(+), 32 deletions(-)
+ create mode 100644 tests/b70/test_ple_int8_ram.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ple_ram.py
+
+diff --git a/tests/b70/test_ple_int8_ram.py b/tests/b70/test_ple_int8_ram.py
+new file mode 100644
+index 0000000000..18555bdfe8
+--- /dev/null
++++ b/tests/b70/test_ple_int8_ram.py
+@@ -0,0 +1,346 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-PLE-RAM: the INT8 row-scale PLE table native in pinned host RAM (B70_PLE_INT8=1).
++
++The host side (``ple_ram``, ``ple_nvme``) loads standalone; the class-level
++tests import the tree's ``b70_ple_ram`` (CPU torch, no XPU) and are skipped
++when vLLM does not import. B70_PLE_INT8_TEST_PATH (+ PLE_TABLE_PATH) adds a
++row-exact and rel-L2 check against the real table.
++"""
++import importlib.util
++import json
++import os
++import struct
++import sys
++import tempfile
++
++import numpy as np
++import pytest
++import torch
++
++HERE = os.path.dirname(__file__)
++NVIDIA = os.path.join(HERE, "../../vllm/models/qwen4_exp/nvidia")
++
++
++def _load(name):
++    spec = importlib.util.spec_from_file_location(name, os.path.join(NVIDIA, f"{name}.py"))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++ple_nvme = _load("ple_nvme")
++ple_ram = _load("ple_ram")
++
++DIM = 160
++ROW = DIM + 4
++QFN_ROWS = 320001536  # INT8-ple-rowscale-76427c71: U8 [320001536, 164]
++
++
++def _vllm_ram():
++    try:
++        from vllm.models.qwen4_exp.nvidia import b70_ple_nvme, b70_ple_ram
++    except Exception as exc:  # pragma: no cover - CPU venv without the tree's deps
++        pytest.skip(f"vLLM tree does not import here: {exc}")
++    return b70_ple_nvme, b70_ple_ram
++
++
++def _quantize(x: torch.Tensor) -> np.ndarray:
++    """build_int8_ple.py's formula: s = absmax/127 (fp32), q = round(x/s) clamp +-127."""
++    x = x.to(torch.float32)
++    s = x.abs().amax(1, keepdim=True) / 127.0
++    q = (x / s.clamp_min(1e-30)).round().clamp_(-127, 127).to(torch.int8)
++    packed = torch.cat([q.view(torch.uint8), s.contiguous().view(torch.uint8)], dim=1)
++    return packed.numpy()
++
++
++def _write(tmp, data: np.ndarray, pad: int = 37) -> str:
++    hdr = json.dumps({"table": {"dtype": "U8", "shape": list(data.shape),
++                                "data_offsets": [0, data.nbytes]},
++                      "__metadata__": {"format": "lumnus-ple-int8-rowscale/v1"}}).encode()
++    hdr += b" " * (pad + (-(len(hdr) + pad) % 8))  # data start off page alignment
++    path = os.path.join(tmp, "t.safetensors")
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(hdr)) + hdr + data.tobytes())
++    return path
++
++
++def _random_table(rows, seed=11):
++    rng = np.random.default_rng(seed)
++    data = rng.integers(0, 256, size=(rows, ROW), dtype=np.uint8)
++    data[:, DIM:] = np.abs(rng.standard_normal((rows, 1), dtype=np.float32)).view(np.uint8)
++    return data
++
++
++def _ranges(rows, tp):
++    per = rows // tp
++    return [(r * per, (r + 1) * per if r < tp - 1 else rows) for r in range(tp)]
++
++
++# 1. owned-range math -------------------------------------------------------
++
++@pytest.mark.parametrize("tp", [1, 2, 4])
++def test_owned_ranges_and_slabs_qfn(tp):
++    """The vLLM vocab shard of the QFN table for TP 1/2/4, and the slab plan over it."""
++    try:
++        from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++    except Exception as exc:  # pragma: no cover
++        pytest.skip(f"vLLM does not import: {exc}")
++    per = QFN_ROWS // tp
++    assert per * tp == QFN_ROWS
++    total_pinned = 0
++    for rank in range(tp):
++        idx = VocabParallelEmbedding._get_indices(QFN_ROWS, QFN_ROWS, QFN_ROWS, QFN_ROWS, rank, tp)
++        start, end = idx.org_vocab_start_index, idx.org_vocab_end_index
++        assert (start, end) == (rank * per, (rank + 1) * per)
++        slabs = ple_ram.plan_slabs(end - start, ROW)
++        assert sum(slabs) == end - start
++        for r in slabs[:-1]:  # every slab fills its power of two to within one row
++            assert r * ROW <= ple_ram.MAX_SLAB_BYTES
++            assert ple_ram.pow2_ceil(r * ROW) - r * ROW < ROW
++        pinned = ple_ram.pinned_bytes(slabs, ROW)
++        assert 0 <= pinned - (end - start) * ROW < ple_ram.TAIL_BYTES + len(slabs) * ROW
++        total_pinned += pinned
++    # 48.88 GiB in all, whatever the TP (vs 64 GiB for one power-of-two slab per TP4 rank).
++    assert abs(total_pinned - QFN_ROWS * ROW) < tp * (ple_ram.TAIL_BYTES + 16 * ROW)
++    if tp == 4:
++        assert per == 80000384 and per * ROW == 13120062976
++        assert ple_ram.plan_slabs(per, ROW)[:2] == [(1 << 33) // ROW, (1 << 32) // ROW]
++
++
++def test_plan_slabs_edges():
++    assert ple_ram.plan_slabs(0, ROW) == []
++    assert ple_ram.plan_slabs(1, ROW) == [1]
++    assert ple_ram.plan_slabs(6000, ROW, 1 << 16, 4096) == [399, 399, 399, 399, 399, 399, 399,
++                                                          399, 399, 399, 399, 399, 399, 399,
++                                                          399, 15]
++    with pytest.raises(ValueError):
++        ple_ram.plan_slabs(10, ROW, max_bytes=100)
++
++
++# 2. load + gather, row exact ---------------------------------------------------
++
++@pytest.mark.parametrize("tp", [1, 2, 4])
++@pytest.mark.parametrize("slab,tail", [(1 << 33, 1 << 20), (1 << 16, 4096), (1 << 13, 512)])
++def test_load_and_gather_row_exact(tp, slab, tail):
++    rows = 6000
++    with tempfile.TemporaryDirectory() as tmp:
++        data = _random_table(rows)
++        path = _write(tmp, data)
++        start, shape, dt = ple_nvme.safetensors_tensor_location(path, "table")
++        assert (shape, dt) == ([rows, ROW], "U8")
++        rng = np.random.default_rng(3)
++        stage_sum = np.zeros((64, 4, ROW), np.int64)
++        for tp_start, tp_end in _ranges(rows, tp):
++            t = ple_ram.PleRamTable(tp_start, tp_end, ROW, max_slab_bytes=slab, tail_bytes=tail)
++            info = t.load(path, start, threads=3, chunk_bytes=2 * ple_nvme.PAGE)
++            assert info["direct"] and info["rows"] == tp_end - tp_start
++            assert np.array_equal(np.concatenate(t.slabs), data[tp_start:tp_end])
++            # Direct reads of the file agree byte for byte (the boot sample check).
++            store = ple_nvme.PleNvmeRowStore(path, start, ROW, rows, io_threads=2, reader="py")
++            own = np.unique(rng.integers(tp_start, tp_end, 300))
++            assert np.array_equal(t.rows(own), store.read_rows(own))
++            store.close()
++            t.scan_scales(DIM)
++            with pytest.raises(IndexError):
++                t.rows(np.array([tp_end]))
++        # One step over all ranks: each rank fills only its rows; the byte sum (ETP
++        # all-reduce, one owner per row) is the full gather.
++        ids = rng.integers(0, rows, size=(64, 4))
++        heads = np.arange(4)
++        for tp_start, tp_end in _ranges(rows, tp):
++            t = ple_ram.PleRamTable(tp_start, tp_end, ROW, max_slab_bytes=slab, tail_bytes=tail)
++            t.load(path, start, threads=2)
++            stage = np.zeros((64, 4, ROW), np.uint8)
++            n = t.gather_into(stage, ids, heads)
++            own = (ids >= tp_start) & (ids < tp_end)
++            assert n == int(own.sum())
++            assert np.array_equal(stage[own], data[ids[own]])
++            assert not stage[~own].any()
++            stage_sum += stage
++        assert np.array_equal(stage_sum.astype(np.uint8), data[ids])
++
++
++def test_gather_into_own_head_subset():
++    """Only the rank's heads are gathered, into their own columns of the stage."""
++    rows = 4096
++    with tempfile.TemporaryDirectory() as tmp:
++        data = _random_table(rows, seed=5)
++        path = _write(tmp, data)
++        start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++        t = ple_ram.PleRamTable(1024, 3072, ROW, max_slab_bytes=1 << 15, tail_bytes=2048)
++        t.load(path, start)
++        heads = np.array([1, 2])
++        ids = np.random.default_rng(1).integers(0, rows, size=(40, 4))
++        stage = np.zeros((48, 4, ROW), np.uint8)
++        t.gather_into(stage, ids[:, heads], heads)
++        for c, h in enumerate(heads):
++            own = (ids[:, h] >= 1024) & (ids[:, h] < 3072)
++            assert np.array_equal(stage[:40, h][own], data[ids[:, h][own]])
++            assert not stage[:40, h][~own].any()
++        assert not stage[:, [0, 3]].any() and not stage[40:].any()
++
++
++def test_scan_scales_refuses_bad_scale():
++    data = _random_table(3000)
++    for bad in (np.float32(-1.0), np.float32(np.nan), np.float32(np.inf)):
++        d = data.copy()
++        d[2222, DIM:] = np.array([bad], np.float32).view(np.uint8)
++        with tempfile.TemporaryDirectory() as tmp:
++            path = _write(tmp, d)
++            start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++            t = ple_ram.PleRamTable(1000, 3000, ROW, max_slab_bytes=1 << 15, tail_bytes=2048)
++            t.load(path, start)
++            with pytest.raises(ValueError, match="row 2222"):
++                t.scan_scales(DIM, step=97)
++
++
++# 3. dequant vs the BF16 table ------------------------------------------------
++
++def test_dequant_matches_reference_and_bf16():
++    b70_ple_nvme, b70_ple_ram = _vllm_ram()
++    rows = 5000
++    g = torch.Generator().manual_seed(0)
++    bf16 = (torch.randn(rows, DIM, generator=g) * 0.02).to(torch.bfloat16)
++    bf16[17] = 0  # zero row: scale 0, dequant 0
++    packed = _quantize(bf16)
++    with tempfile.TemporaryDirectory() as tmp:
++        path = _write(tmp, packed)
++        start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++        ids = np.random.default_rng(9).integers(0, rows, size=(256, 3))
++        heads = np.arange(3)
++        stage_sum = np.zeros((256, 3, ROW), np.int64)
++        for tp_start, tp_end in _ranges(rows, 4):
++            t = ple_ram.PleRamTable(tp_start, tp_end, ROW, max_slab_bytes=1 << 16, tail_bytes=4096)
++            t.load(path, start)
++            stage = np.zeros((256, 3, ROW), np.uint8)
++            t.gather_into(stage, ids, heads)
++            stage_sum += stage
++        # The consumer's ETP reduce is an int8 byte sum (exact, one owner per row).
++        reduced = torch.from_numpy(stage_sum.astype(np.uint8))
++        got = b70_ple_nvme.int8_dequantize(reduced, DIM, torch.bfloat16)
++        # Row-exact vs the file: q * s in fp32, one rounding.
++        rows_bytes = torch.from_numpy(packed[ids])
++        q = rows_bytes[..., :DIM].view(torch.int8).to(torch.float32)
++        s = rows_bytes[..., DIM:].contiguous().view(torch.float32)
++        assert torch.equal(got, (q * s).to(torch.bfloat16))
++        assert not got[(ids == 17)].any()
++        # rel-L2 vs the BF16 table (the 76427c71 table measures 0.0066).
++        want = bf16[torch.from_numpy(ids)].to(torch.float32)
++        rel = float(torch.linalg.vector_norm(got.float() - want) / torch.linalg.vector_norm(want))
++        assert rel < 0.01, rel
++
++
++def test_bf16_crosscheck_on_loaded_rows(monkeypatch):
++    b70_ple_nvme, b70_ple_ram = _vllm_ram()
++    rows = 6000
++    g = torch.Generator().manual_seed(1)
++    bf16 = (torch.randn(rows, DIM, generator=g) * 0.03).to(torch.bfloat16)
++    with tempfile.TemporaryDirectory() as tmp:
++        path = _write(tmp, _quantize(bf16))
++        ref = os.path.join(tmp, "ple_table.pt")
++        torch.save({"table": bf16}, ref)
++        start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++        t = ple_ram.PleRamTable(1500, 3000, ROW, max_slab_bytes=1 << 16, tail_bytes=4096)
++        t.load(path, start)
++        monkeypatch.setenv("PLE_TABLE_PATH", ref)
++        read = lambda r: b70_ple_ram._crosscheck_rows(t, r, path)  # noqa: E731
++        rel = b70_ple_nvme.bf16_crosscheck(read, DIM, rows, path, "test")
++        assert rel is not None and rel < 0.01
++        # A row-shifted table (wrong file or order) is refused.
++        shifted = os.path.join(tmp, "shift.safetensors")
++        os.rename(_write(tmp, np.roll(_quantize(bf16), 1, axis=0)), shifted)
++        t2 = ple_ram.PleRamTable(1500, 3000, ROW, max_slab_bytes=1 << 16, tail_bytes=4096)
++        t2.load(shifted, start)
++        read2 = lambda r: b70_ple_ram._crosscheck_rows(t2, r, shifted)  # noqa: E731
++        with pytest.raises(ValueError, match="disagrees"):
++            b70_ple_nvme.bf16_crosscheck(read2, DIM, rows, shifted, "test")
++        monkeypatch.setenv("B70_PLE_INT8_CROSSCHECK", "0")
++        assert b70_ple_nvme.bf16_crosscheck(read2, DIM, rows, shifted, "test") is None
++
++
++# 4. the class: stage fill, flags --------------------------------------------
++
++def test_fill_stage_uses_ram_rows():
++    _, b70_ple_ram = _vllm_ram()
++    rows = 4096
++    with tempfile.TemporaryDirectory() as tmp:
++        data = _random_table(rows, seed=2)
++        path = _write(tmp, data)
++        start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++        emb = object.__new__(b70_ple_ram.Qwen4ExpPLEInt8RAMEmbedding)
++        emb._table = ple_ram.PleRamTable(2048, 4096, ROW, max_slab_bytes=1 << 15, tail_bytes=2048)
++        emb._table.load(path, start)
++        emb._own_heads = np.array([2, 3])
++        emb._stage_np = np.full((32, 4, ROW), 7, np.uint8)
++        emb._dirty = 32
++        ids = np.random.default_rng(4).integers(0, rows, size=(20, 4))
++        emb._fill_stage(ids, 20, 24)
++        for h in range(4):
++            own = (ids[:, h] >= 2048) & (h >= 2)
++            assert np.array_equal(emb._stage_np[:20, h][own], data[ids[:, h][own]])
++            assert not emb._stage_np[:20, h][~own].any()
++        assert not emb._stage_np[20:].any()  # padding and the previous step's rows cleared
++        assert emb._dirty == 20
++        emb._fill_stage(None, 0, 8)
++        assert not emb._stage_np.any() and emb._dirty == 0
++
++
++@pytest.mark.parametrize("ram,nvme,path,ok", [
++    ("1", "0", "x", True), ("1", None, "x", True), ("0", "1", "x", False),
++    (None, None, None, False), ("1", "1", "x", "conflict"), ("1", "0", None, "path")])
++def test_flags(monkeypatch, ram, nvme, path, ok):
++    _, b70_ple_ram = _vllm_ram()
++    for name, value in (("B70_PLE_INT8", ram), ("B70_PLE_INT8_NVME", nvme),
++                        ("B70_PLE_INT8_PATH", path)):
++        if value is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, value)
++    if ok == "conflict":
++        with pytest.raises(ValueError, match="exclusive"):
++            b70_ple_ram.enabled()
++        with pytest.raises(ValueError, match="exclusive"):  # also when built directly
++            b70_ple_ram.Qwen4ExpPLEInt8RAMEmbedding(1, 1)
++    elif ok == "path":
++        with pytest.raises(ValueError, match="B70_PLE_INT8_PATH"):
++            b70_ple_ram.enabled()
++    else:
++        assert b70_ple_ram.enabled() is ok
++
++
++def test_selection_order_in_ngram_embedding():
++    """The RAM gate runs first, so both flags set raise before the NVMe class is picked."""
++    with open(os.path.join(NVIDIA, "ngram_embedding.py")) as f:
++        src = f.read()
++    ram = src.index("if _b70_ple_int8_ram():")
++    nvme = src.index("elif _b70_ple_int8_nvme():")
++    assert ram < nvme
++    assert "embedding_cls = Qwen4ExpPLEInt8RAMEmbedding" in src[ram:nvme]
++
++
++# 5. the real table (optional) -------------------------------------------------
++
++@pytest.mark.skipif(not os.path.exists(os.environ.get("B70_PLE_INT8_TEST_PATH", "/nonexistent")),
++                    reason="B70_PLE_INT8_TEST_PATH (the real INT8 table) not present")
++def test_real_table_slice():
++    path = os.environ["B70_PLE_INT8_TEST_PATH"]
++    start, shape, dt = ple_nvme.safetensors_tensor_location(path, "table")
++    assert dt == "U8" and shape[1] == ROW
++    lo = shape[0] // 4 + 12345
++    t = ple_ram.PleRamTable(lo, lo + 200_000, ROW, max_slab_bytes=1 << 22)
++    t.load(path, start, threads=4)
++    t.scan_scales(DIM)
++    ids = np.random.default_rng(0).integers(lo, lo + 200_000, size=2000)
++    store = ple_nvme.PleNvmeRowStore(path, start, ROW, shape[0], io_threads=8, reader="py")
++    assert np.array_equal(t.rows(ids), store.read_rows(ids))
++    store.close()
++    ref_path = os.environ.get("PLE_TABLE_PATH")
++    if ref_path:
++        ref = torch.load(ref_path, mmap=True, weights_only=True)
++        ref = ref["table"] if isinstance(ref, dict) else ref
++        b = torch.from_numpy(t.rows(ids))
++        got = b[:, :DIM].view(torch.int8).float() * b[:, DIM:].contiguous().view(torch.float32)
++        want = ref[torch.from_numpy(ids)].float()
++        rel = float(torch.linalg.vector_norm(got - want) / torch.linalg.vector_norm(want))
++        assert rel < 0.02, rel
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+index 104ff20da2..9a7b345c75 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+@@ -72,6 +72,33 @@ def int8_dequantize(packed: torch.Tensor, logical_dim: int,
+     return (values * scales).to(output_dtype)
+ 
+ 
++def bf16_crosscheck(read_rows, dim: int, org_vocab_size: int, path: str,
++                    label: str) -> float | None:
++    """Rel-L2 of dequantised INT8 rows vs the BF16 table (PLE_TABLE_PATH, 4096 rows).
++
++    ``read_rows(global_rows: np.ndarray) -> uint8 [n, dim + 4]``. Skipped (None)
++    without PLE_TABLE_PATH or with B70_PLE_INT8_CROSSCHECK=0; raises above
++    B70_PLE_INT8_MAX_REL_ERR (default 0.02; the 76427c71 table measures ~0.0066).
++    """
++    ref_path = os.environ.get("PLE_TABLE_PATH")
++    if not ref_path or os.environ.get("B70_PLE_INT8_CROSSCHECK", "1") != "1":
++        return None
++    ref = torch.load(ref_path, mmap=True, weights_only=True)
++    ref = ref["table"] if isinstance(ref, dict) else ref
++    g = torch.Generator().manual_seed(20260928)
++    rows = torch.randint(0, min(ref.shape[0], org_vocab_size), (4096,), generator=g)
++    picked = torch.from_numpy(np.ascontiguousarray(read_rows(rows.numpy())))
++    got = int8_dequantize(picked, dim, torch.float32)
++    want = ref.index_select(0, rows).to(torch.float32)
++    rel = float(torch.linalg.vector_norm(got - want)) / max(
++        float(torch.linalg.vector_norm(want)), 1e-30)
++    lim = float(os.environ.get("B70_PLE_INT8_MAX_REL_ERR", "0.02"))
++    logger.info("%s cross-check vs %s: rel L2 %.4f (limit %.3f)", label, ref_path, rel, lim)
++    if not rel <= lim:
++        raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
++    return rel
++
++
+ def safetensors_metadata(path: str) -> dict:
+     with open(path, "rb") as f:
+         (n,) = struct.unpack("<Q", f.read(8))
+@@ -82,6 +109,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+     """INT8 row-scale PLE rows from NVMe through a pinned row cache (B70 0013)."""
+ 
+     host_prepared: ClassVar[bool] = True
++    # The env flag and log label of this storage mode (B70-PLE-RAM subclasses).
++    _flag: ClassVar[str] = "B70_PLE_INT8_NVME"
++    _label: ClassVar[str] = "B70 PLE NVMe"
+ 
+     def __init__(self, num_embeddings: int, embedding_dim: int, *,
+                  params_dtype: torch.dtype, padding_size: int, prefix: str,
+@@ -90,22 +120,22 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+                  data_parallel_rank: int = 0, reduce_results: bool = True) -> None:
+         bad = [n for n in CONFLICTING if os.environ.get(n, "0") == "1"]
+         if bad:
+-            raise ValueError(f"B70_PLE_INT8_NVME=1 conflicts with {bad}")
++            raise ValueError(f"{self._flag}=1 conflicts with {bad}")
+         if not current_platform.is_xpu():
+-            raise ValueError("B70_PLE_INT8_NVME=1 is XPU-only")
++            raise ValueError(f"{self._flag}=1 is XPU-only")
+         if not isinstance(embedding_method, Qwen4ExpPLEUnquantizedEmbeddingMethod):
+-            raise ValueError("B70_PLE_INT8_NVME=1 needs the unquantized (BF16) PLE method "
++            raise ValueError(f"{self._flag}=1 needs the unquantized (BF16) PLE method "
+                              f"in the checkpoint, got {type(embedding_method).__name__}")
+         config = get_current_vllm_config()
+         if config.parallel_config.data_parallel_size != 1:
+-            raise ValueError("B70_PLE_INT8_NVME=1 requires DP=1")
++            raise ValueError(f"{self._flag}=1 requires DP=1")
+         Qwen4ExpPLEEmbedding.__init__(
+             self, num_embeddings, embedding_dim, params_dtype=params_dtype,
+             padding_size=padding_size, prefix=prefix, embedding_method=embedding_method,
+             num_ngram_heads=num_ngram_heads, max_total_tokens=max_total_tokens,
+             data_parallel_rank=data_parallel_rank, reduce_results=reduce_results)
+         if self.etp_data_parallel_size != 1:
+-            raise ValueError("B70_PLE_INT8_NVME=1 requires ETP = TP (no DP span)")
++            raise ValueError(f"{self._flag}=1 requires ETP = TP (no DP span)")
+         self._stream_mod = torch.xpu
+         self._out_dtype = params_dtype
+         self._capacity = int(max_total_tokens)
+@@ -117,7 +147,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         self._stage = torch.zeros(self._capacity, self._heads, self._storage,
+                                   dtype=torch.uint8, device="cpu", pin_memory=True)
+         if not self._stage.is_pinned():
+-            raise RuntimeError("B70 PLE NVMe stage failed to pin")
++            raise RuntimeError(f"{self._label} stage failed to pin")
+         self._stage_np = self._stage.numpy()
+         self._server = None
+         self._slab_np = None
+@@ -166,22 +196,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             reader=os.environ.get("B70_PLE_INT8_NVME_READER", "py"))
+         tp_start = self.shard_indices.org_vocab_start_index
+         tp_end = self.shard_indices.org_vocab_end_index
+-        ref_path = os.environ.get("PLE_TABLE_PATH")
+-        if ref_path and os.environ.get("B70_PLE_INT8_CROSSCHECK", "1") == "1":
+-            ref = torch.load(ref_path, mmap=True, weights_only=True)
+-            ref = ref["table"] if isinstance(ref, dict) else ref
+-            g = torch.Generator().manual_seed(20260928)
+-            rows = torch.randint(0, min(ref.shape[0], self.org_vocab_size), (4096,), generator=g)
+-            picked = torch.from_numpy(store.read_rows(rows.numpy()))
+-            got = int8_dequantize(picked, dim, torch.float32)
+-            want = ref.index_select(0, rows).to(torch.float32)
+-            rel = float(torch.linalg.vector_norm(got - want)) / max(
+-                float(torch.linalg.vector_norm(want)), 1e-30)
+-            lim = float(os.environ.get("B70_PLE_INT8_MAX_REL_ERR", "0.02"))
+-            logger.info("B70 PLE NVMe cross-check vs %s: rel L2 %.4f (limit %.3f)", ref_path, rel, lim)
+-            if not rel <= lim:
+-                raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
+-            del ref
++        bf16_crosscheck(store.read_rows, dim, self.org_vocab_size, path, self._label)
+         sample = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
+         own = own_bytes = None
+         if sample > 0 and tp_end > tp_start:
+@@ -232,11 +247,11 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+     # -- producer (host, before forward / FULL replay) ---------------------
+     def _check_capacity(self, num_tokens: int) -> None:
+         if not 0 <= num_tokens <= self._capacity:
+-            raise ValueError(f"B70 PLE NVMe stage overflow: {num_tokens} > {self._capacity}")
++            raise ValueError(f"{self._label} stage overflow: {num_tokens} > {self._capacity}")
+         if self._failed:
+-            raise RuntimeError("B70 PLE NVMe stage is quarantined")
++            raise RuntimeError(f"{self._label} stage is quarantined")
+         if self._stream_mod.is_current_stream_capturing():
+-            raise RuntimeError("B70 PLE NVMe host preparation cannot run inside capture")
++            raise RuntimeError(f"{self._label} host preparation cannot run inside capture")
+ 
+     def _wait_for_stage(self) -> None:
+         if self._pending:
+@@ -264,9 +279,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+                 num_tokens_padded: int, host_ids: np.ndarray | None = None) -> None:
+         self._check_capacity(num_tokens_padded)
+         if not 0 <= num_tokens <= num_tokens_padded:
+-            raise ValueError("B70 PLE NVMe invalid actual/padded token counts")
++            raise ValueError(f"{self._label} invalid actual/padded token counts")
+         if not self._lock.acquire(blocking=False):
+-            raise RuntimeError("Concurrent B70 PLE NVMe stage preparation")
++            raise RuntimeError(f"Concurrent {self._label} stage preparation")
+         try:
+             stream = self._stream_mod.current_stream()
+             thread = threading.get_ident()
+@@ -277,13 +292,13 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             self._owner_stream, self._owner_thread = stream, thread
+             if host_ids is not None:
+                 if tuple(host_ids.shape) != (num_tokens, self._heads):
+-                    raise ValueError("B70 PLE NVMe: host ids shape mismatch")
++                    raise ValueError(f"{self._label}: host ids shape mismatch")
+                 self._fill_stage(host_ids, num_tokens, num_tokens_padded)
+             elif ngram_ids is None:
+                 self._fill_stage(None, 0, num_tokens_padded)
+             else:
+                 if tuple(ngram_ids.shape) != (num_tokens_padded, self._heads):
+-                    raise ValueError("B70 PLE NVMe: dispatch ids shape mismatch")
++                    raise ValueError(f"{self._label}: dispatch ids shape mismatch")
+                 ids = ngram_ids[:num_tokens].to("cpu", non_blocking=False).numpy()
+                 self._fill_stage(ids, num_tokens, num_tokens_padded)
+             if num_tokens_padded:
+@@ -306,7 +321,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+     @eager_break_during_capture
+     def _finalize_prefetch(self, prefetch_output, output) -> None:
+         if self._failed or self._prepared_tokens != output.shape[0]:
+-            raise RuntimeError("B70 PLE NVMe consumer has no matching prepared dispatch")
++            raise RuntimeError(f"{self._label} consumer has no matching prepared dispatch")
+         packed = prefetch_output[: output.shape[0]]
+         if self.tp_size > 1:
+             packed = self.parallel_group.all_reduce(packed.view(torch.int8)).view(torch.uint8)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py b/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
+new file mode 100644
+index 0000000000..170b8c2efb
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-PLE-RAM on vLLM 0.32: the INT8 row-scale PLE table native in pinned host RAM.
++
++Port of Lumnus 0008 (``B70_PLE_INT8``, v0.30). PLE is either RAM native
++or on SSD: ``B70_PLE_INT8=1`` is the RAM side, ``B70_PLE_INT8_NVME=1``
++(b70_ple_nvme.py) the SSD side; both set is refused at init.
++
++At boot each TP rank reads its owned row range [tp_start, tp_end) of
++``B70_PLE_INT8_PATH`` (160 int8 + float32 scale = 164 B per row) into pinned
++slabs (``ple_ram.PleRamTable``: O_DIRECT sequential chunks, power-of-two
++slabs so the caching host allocator does not round 12.2 GiB up to 16), then
++checks every owned row's scale, a random sample against O_DIRECT row reads of
++the file, and (with ``PLE_TABLE_PATH``) 4096 rows against the BF16 table.
++
++Per step the producer/consumer of the 0.32 host-prepared path (the NVMe class,
++inherited unchanged) runs with one difference: ``_fill_stage`` gathers the
++looked-up rows straight out of the slabs by row id (``row - tp_start``) into
++the pinned stage. Then one H2D of the stage; the consumer (an eager break in
++the FULL graph) all-reduces the packed bytes over ETP (one owner per row, the
++int8 byte sum is exact) and dequantises per row, q * s in float32, one rounding
++to BF16.
++
++Gather choice: host gather into the pinned stage + one H2D, not 0008's
++device-side UVA Triton gather. The 0.32 B70 step already takes its one host
++sync for the n-gram ids (B70_PLE_HOST_IDS=1 hashes on the host), so the ids
++are on the host for free; a host gather from DRAM costs ~0.1 us/row and the
++H2D is one contiguous DMA, where a UVA gather issues one PCIe read per 164-B
++row from the GPU. The stock 0.32 pinned-UVA class (CUDA stream API) has not
++run on XPU, the host-prepared path has (FULL replay gated on the NVMe engine).
++
++Env: B70_PLE_INT8=1, B70_PLE_INT8_PATH (the table),
++B70_PLE_INT8_LOAD_THREADS (reads in flight per rank, default 4),
++B70_PLE_INT8_LOAD_CHUNK_MIB (default 64), B70_PLE_INT8_BOOT_SAMPLE (rows
++re-read with O_DIRECT and compared, default 4096), PLE_TABLE_PATH +
++B70_PLE_INT8_CROSSCHECK + B70_PLE_INT8_MAX_REL_ERR (BF16 cross-check).
++"""
++
++import os
++import time
++from typing import ClassVar
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++from .b70_ple_nvme import (
++    INT8_FORMAT,
++    SCALE_BYTES,
++    Qwen4ExpPLEInt8NVMeEmbedding,
++    bf16_crosscheck,
++    safetensors_metadata,
++)
++
++logger = init_logger(__name__)
++
++
++def enabled() -> bool:
++    """B70_PLE_INT8=1 (RAM native). Raises when B70_PLE_INT8_NVME=1 is also set."""
++    on = os.environ.get("B70_PLE_INT8", "0") == "1"
++    if on and os.environ.get("B70_PLE_INT8_NVME", "0") == "1":
++        raise ValueError(
++            "B70_PLE_INT8=1 and B70_PLE_INT8_NVME=1 are exclusive: the INT8 PLE table is "
++            "either RAM native (B70_PLE_INT8) or on SSD (B70_PLE_INT8_NVME); unset one")
++    if on and not os.environ.get("B70_PLE_INT8_PATH"):
++        raise ValueError("B70_PLE_INT8=1 requires B70_PLE_INT8_PATH (the INT8 PLE .safetensors)")
++    return on
++
++
++class Qwen4ExpPLEInt8RAMEmbedding(Qwen4ExpPLEInt8NVMeEmbedding):
++    """INT8 row-scale PLE rows resident in pinned host RAM (B70-PLE-RAM, port of 0008)."""
++
++    _flag: ClassVar[str] = "B70_PLE_INT8"
++    _label: ClassVar[str] = "B70 PLE INT8 RAM"
++
++    def __init__(self, *args, **kwargs) -> None:
++        enabled()  # the flag conflict, also when the class is built directly
++        super().__init__(*args, **kwargs)
++        self._table = None
++        self._slab_tensors: list[torch.Tensor] = []
++
++    def _pinned_slab(self, rows: int, row_bytes: int) -> np.ndarray:
++        t = torch.empty(rows, row_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
++        if not t.is_pinned():
++            raise RuntimeError(f"B70 PLE INT8 RAM: {rows * row_bytes / 2**30:.2f} GiB slab "
++                               "failed to pin")
++        self._slab_tensors.append(t)  # the numpy view does not own the storage
++        return t.numpy()
++
++    def weight_loader(self, *args, **kwargs) -> None:
++        raise RuntimeError("B70 PLE INT8 RAM rejects checkpoint PLE rows (filtered index expected)")
++
++    def host_loaded(self) -> bool:
++        return self._table is not None
++
++    def load_host_table(self, owner) -> None:
++        """Read the rank's rows into pinned slabs and check them (once)."""
++        from vllm.distributed import get_tp_group
++
++        from .ple_nvme import PleNvmeRowStore, owned_heads, safetensors_tensor_location
++        from .ple_ram import PleRamTable, pinned_bytes
++
++        if self._table is not None:
++            raise RuntimeError("B70 PLE INT8 RAM rejects reload")
++        path = os.environ["B70_PLE_INT8_PATH"]
++        fmt = safetensors_metadata(path).get("format")
++        if fmt != INT8_FORMAT:
++            raise ValueError(f"INT8 PLE file {path} has format {fmt!r}, expected {INT8_FORMAT!r}")
++        dim = self.embedding_dim
++        data_start, shape, dtype = safetensors_tensor_location(path, "table")
++        if dtype != "U8" or shape != [self.org_vocab_size, self._storage]:
++            raise ValueError(f"INT8 PLE {path}: table {dtype} {shape}, expected U8 "
++                             f"[{self.org_vocab_size}, {self._storage}]")
++        tp_start = self.shard_indices.org_vocab_start_index
++        tp_end = self.shard_indices.org_vocab_end_index
++        rank = get_tp_group().rank_in_group
++        t0 = time.perf_counter()
++        table = PleRamTable(tp_start, tp_end, self._storage, alloc=self._pinned_slab)
++        alloc_s = time.perf_counter() - t0
++        info = table.load(
++            path, data_start,
++            threads=int(os.environ.get("B70_PLE_INT8_LOAD_THREADS", "4")),
++            chunk_bytes=int(float(os.environ.get("B70_PLE_INT8_LOAD_CHUNK_MIB", "64")) * (1 << 20)))
++        loaded_s = time.perf_counter() - t0
++        t1 = time.perf_counter()
++        table.scan_scales(dim)
++        sample = int(os.environ.get("B70_PLE_INT8_BOOT_SAMPLE", "4096"))
++        if sample > 0 and tp_end > tp_start:
++            g = torch.Generator().manual_seed(20260929 + tp_start)
++            own = torch.unique(torch.randint(tp_start, tp_end, (sample,), generator=g)).numpy()
++            store = PleNvmeRowStore(path, data_start, self._storage, shape[0], io_threads=8,
++                                    reader="py")
++            try:
++                if not np.array_equal(table.rows(own), store.read_rows(own)):
++                    raise ValueError(f"INT8 PLE {path}: loaded rows differ from row reads "
++                                     f"(rank {rank}, {own.shape[0]} sampled rows)")
++            finally:
++                store.close()
++        if tp_end > tp_start:
++            bf16_crosscheck(lambda rows: _crosscheck_rows(table, rows, path), dim,
++                            self.org_vocab_size, path, self._label)
++        check_s = time.perf_counter() - t1
++        sizes = owner.ngram_heads_vocab_sizes.detach().cpu().numpy()
++        offsets = owner.ngram_heads_offsets.detach().cpu().numpy()
++        self._own_heads = owned_heads(sizes, offsets, tp_start, tp_end)
++        self._table = table
++        pinned = pinned_bytes(table.slab_rows, self._storage)
++        logger.info(
++            "B70 PLE INT8 RAM (rank %d): %d rows, %.2f GiB pinned, loaded in %.1f s "
++            "(alloc %.1f s, read %.2f GB/s%s, %d slabs; checks %.1f s), own heads %s, "
++            "rows [%d, %d), %s", rank, table.num_rows, pinned / 2**30, loaded_s, alloc_s,
++            info["gbps"], "" if info["direct"] else " buffered", info["slabs"], check_s,
++            self._own_heads.tolist(), tp_start, tp_end, path)
++
++    def _fill_stage(self, ids: np.ndarray, num_tokens: int, num_padded: int) -> None:
++        stage = self._stage_np
++        stage[: max(self._dirty, num_padded)].fill(0)
++        self._dirty = 0
++        if num_tokens == 0 or self._table is None:
++            return
++        self._table.gather_into(stage, ids[:num_tokens][:, self._own_heads], self._own_heads)
++        self._dirty = num_tokens
++
++
++def _crosscheck_rows(table, rows: np.ndarray, path: str) -> np.ndarray:
++    """Cross-check rows: the rank's own rows from RAM, the others read from the file."""
++    rows = np.asarray(rows, dtype=np.int64)
++    out = np.empty((rows.size, table.row_bytes), dtype=np.uint8)
++    own = (rows >= table.tp_start) & (rows < table.tp_end)
++    if own.any():
++        out[own] = table.rows(rows[own])
++    if (~own).any():
++        from .ple_nvme import PleNvmeRowStore, safetensors_tensor_location
++
++        start, shape, _ = safetensors_tensor_location(path, "table")
++        store = PleNvmeRowStore(path, start, table.row_bytes, shape[0], io_threads=8, reader="py")
++        try:
++            out[~own] = store.read_rows(rows[~own])
++        finally:
++            store.close()
++    return out
++
++
++__all__ = ["Qwen4ExpPLEInt8RAMEmbedding", "enabled", "SCALE_BYTES"]
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 9426443e09..4e81aa8863 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -31,6 +31,8 @@ from ..common.ops.ple import ple_ngram_ids
+ from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
+ from .b70_ple_nvme import Qwen4ExpPLEInt8NVMeEmbedding
+ from .b70_ple_nvme import enabled as _b70_ple_int8_nvme
++from .b70_ple_ram import Qwen4ExpPLEInt8RAMEmbedding
++from .b70_ple_ram import enabled as _b70_ple_int8_ram
+ 
+ logger = init_logger(__name__)
+ 
+@@ -222,7 +224,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         )
+         if os.environ.get("B70_PLE_DISK_BF16") == "1":
+             embedding_cls = Qwen4ExpPLEDiskBF16Embedding
+-        if _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
++        # PLE is either RAM native or on SSD; both flags set raises here.
++        if _b70_ple_int8_ram():  # B70-PLE-RAM (port of 0008): INT8 rows in pinned RAM
++            embedding_cls = Qwen4ExpPLEInt8RAMEmbedding
++        elif _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
+             embedding_cls = Qwen4ExpPLEInt8NVMeEmbedding
+         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
+         self.use_reduce_scatter = (
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_nvme.py b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+index a6dc7b84e2..2362d2dfc8 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+@@ -21,7 +21,8 @@ Per TP rank, per step:
+      owned by this rank, or a padding token: nothing stored, stays zero).
+ 
+ Env contract (read in ngram_embedding.py, documented here):
+-  B70_PLE_INT8_NVME=1               enable (requires B70_PLE_INT8=1)
++  B70_PLE_INT8_NVME=1               enable (v0.30: with B70_PLE_INT8=1; 0.32: exclusive
++                                    with B70_PLE_INT8=1, the RAM-native b70_ple_ram path)
+   B70_PLE_INT8_NVME_PATH            table file (default B70_PLE_INT8_PATH)
+   B70_PLE_INT8_NVME_CACHE_GIB       row cache, TOTAL over the TP ranks (default 8)
+   B70_PLE_INT8_NVME_IO_THREADS      reader threads per rank (default 16)
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_ram.py b/vllm/models/qwen4_exp/nvidia/ple_ram.py
+new file mode 100644
+index 0000000000..d9c2366eca
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ple_ram.py
+@@ -0,0 +1,167 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-PLE-RAM: the rank's INT8 row-scale PLE rows, resident in host RAM (host side).
++
++Port of Lumnus 0008 (``B70_PLE_INT8``, v0.30) onto the 0.32 host-prepared PLE
++path. Host-only (numpy / os / threads) and free of vLLM imports, so the tests
++load it standalone, as ``ple_nvme``.
++
++PLE is either RAM native or on SSD. This is the RAM-native side: the
++rank's owned row range [tp_start, tp_end) of the table file is read once at
++boot into pinned slabs and addressed directly by row id. No row cache, no
++slot map, no reader on the step path.
++
++Slabs: the torch caching host allocator rounds every pinned request up to the
++next power of two (``CachingHostAllocator.h``, ``pinned_max_round_threshold``
++defaults to SIZE_MAX), so one 12.2 GiB request would pin 16 GiB; and torch
++2.13+xpu returned pageable memory above 2^34 B (Lumnus 0002). ``plan_slabs``
++cuts the range into slabs that each fill a power of two to within one row
++(at most ``max_bytes``, default 8 GiB), plus one tail slab under 1 MiB, so the
++pinned footprint is the table's own size.
++"""
++
++from __future__ import annotations
++
++import time
++from collections.abc import Callable
++
++import numpy as np
++
++try:
++    from .ple_nvme import preload_range
++except ImportError:  # loaded standalone by the tests
++    from ple_nvme import preload_range
++
++SCALE_BYTES = 4
++MAX_SLAB_BYTES = 1 << 33
++TAIL_BYTES = 1 << 20
++
++
++def pow2_ceil(n: int) -> int:
++    return 1 << max(0, int(n) - 1).bit_length() if n > 0 else 0
++
++
++def plan_slabs(rows: int, row_bytes: int, max_bytes: int = MAX_SLAB_BYTES,
++               tail_bytes: int = TAIL_BYTES) -> list[int]:
++    """Rows per slab: each slab is the largest power of two <= min(left, max_bytes)
++    worth of whole rows; whatever is left under ``tail_bytes`` is one last slab."""
++    if rows < 0 or row_bytes <= 0 or max_bytes < row_bytes:
++        raise ValueError(f"plan_slabs: rows={rows} row_bytes={row_bytes} max_bytes={max_bytes}")
++    out: list[int] = []
++    left = int(rows)
++    while left > 0:
++        nbytes = left * row_bytes
++        if nbytes <= tail_bytes:
++            out.append(left)
++            break
++        cap = 1 << (min(nbytes, max_bytes).bit_length() - 1)
++        take = min(left, cap // row_bytes)
++        out.append(take)
++        left -= take
++    return out
++
++
++def pinned_bytes(slab_rows: list[int], row_bytes: int) -> int:
++    """Bytes the power-of-two caching host allocator takes for these slabs."""
++    return sum(pow2_ceil(r * row_bytes) for r in slab_rows)
++
++
++class PleRamTable:
++    """The rank's owned rows [tp_start, tp_end) of a packed INT8 table, in slabs.
++
++    ``alloc(rows, row_bytes) -> uint8 ndarray [rows, row_bytes]`` makes one slab
++    (the embedding passes pinned torch storage; tests pass numpy).
++    """
++
++    def __init__(self, tp_start: int, tp_end: int, row_bytes: int, *,
++                 alloc: Callable[[int, int], np.ndarray] | None = None,
++                 max_slab_bytes: int = MAX_SLAB_BYTES, tail_bytes: int = TAIL_BYTES) -> None:
++        if not 0 <= tp_start <= tp_end:
++            raise ValueError(f"PLE RAM: bad row range [{tp_start}, {tp_end})")
++        self.tp_start = int(tp_start)
++        self.tp_end = int(tp_end)
++        self.row_bytes = int(row_bytes)
++        self.num_rows = self.tp_end - self.tp_start
++        self.slab_rows = plan_slabs(self.num_rows, self.row_bytes, max_slab_bytes, tail_bytes)
++        alloc = alloc or (lambda r, b: np.empty((r, b), dtype=np.uint8))
++        self.slabs: list[np.ndarray] = []
++        for r in self.slab_rows:
++            slab = alloc(r, self.row_bytes)
++            if (slab.dtype != np.uint8 or slab.shape != (r, self.row_bytes)
++                    or not slab.flags.c_contiguous):
++                raise ValueError("PLE RAM: slab allocator returned the wrong array")
++            self.slabs.append(slab)
++        # Local row starts of each slab (+ the end), for the slab lookup.
++        self.bounds = np.concatenate(
++            [[0], np.cumsum(self.slab_rows, dtype=np.int64)]).astype(np.int64)
++        self.loaded = False
++
++    @property
++    def nbytes(self) -> int:
++        return self.num_rows * self.row_bytes
++
++    def load(self, path: str, data_start: int, *, direct: bool = True, threads: int = 4,
++             chunk_bytes: int = 64 << 20) -> dict:
++        """Read file bytes of rows [tp_start, tp_end) into the slabs (sequential
++        page-aligned chunks, O_DIRECT when the filesystem takes it)."""
++        t0 = time.perf_counter()
++        used_direct = True
++        for i, slab in enumerate(self.slabs):
++            first = self.tp_start + int(self.bounds[i])
++            used_direct &= preload_range(path, int(data_start) + first * self.row_bytes, slab,
++                                         direct=direct, threads=threads, chunk_bytes=chunk_bytes)
++        seconds = time.perf_counter() - t0
++        self.loaded = True
++        return {"rows": self.num_rows, "bytes": self.nbytes, "seconds": seconds,
++                "gbps": self.nbytes / max(seconds, 1e-9) / 1e9, "direct": bool(used_direct),
++                "slabs": len(self.slabs)}
++
++    def _locate(self, local: np.ndarray) -> np.ndarray:
++        return np.searchsorted(self.bounds, local, side="right") - 1
++
++    def rows(self, global_rows: np.ndarray) -> np.ndarray:
++        """uint8 [n, row_bytes] copies of owned rows (global ids)."""
++        g = np.asarray(global_rows, dtype=np.int64).reshape(-1)
++        if g.size and (g.min() < self.tp_start or g.max() >= self.tp_end):
++            raise IndexError(f"PLE RAM: rows outside [{self.tp_start}, {self.tp_end})")
++        out = np.empty((g.size, self.row_bytes), dtype=np.uint8)
++        self._copy(out, np.arange(g.size), g - self.tp_start)
++        return out
++
++    def _copy(self, out: np.ndarray, dst: np.ndarray | tuple, local: np.ndarray) -> None:
++        if len(self.slabs) == 1:
++            out[dst] = self.slabs[0][local]
++            return
++        which = self._locate(local)
++        for s in np.unique(which):
++            sel = which == s
++            d = tuple(x[sel] for x in dst) if isinstance(dst, tuple) else dst[sel]
++            out[d] = self.slabs[s][local[sel] - self.bounds[s]]
++
++    def gather_into(self, stage: np.ndarray, ids: np.ndarray, heads: np.ndarray) -> int:
++        """stage[t, heads[c]] = row(ids[t, c]) for every owned id; others untouched.
++
++        ``stage`` uint8 [T', H, row_bytes]; ``ids`` int64 [T, len(heads)] global
++        row ids of this rank's heads. Returns the number of rows written.
++        """
++        ids = np.asarray(ids, dtype=np.int64)
++        mask = (ids >= self.tp_start) & (ids < self.tp_end)
++        tok, col = np.nonzero(mask)
++        if tok.size == 0:
++            return 0
++        local = ids[tok, col] - self.tp_start
++        self._copy(stage, (tok, np.asarray(heads, dtype=np.int64)[col]), local)
++        return int(tok.size)
++
++    def scan_scales(self, logical_dim: int, step: int = 1 << 22) -> None:
++        """Every owned row's float32 scale is finite and >= 0 (0008's full slab scan)."""
++        for i, slab in enumerate(self.slabs):
++            for start in range(0, slab.shape[0], step):
++                part = slab[start:start + step]
++                sc = np.ndarray((part.shape[0],), dtype="<f4", buffer=part,
++                                offset=logical_dim, strides=(self.row_bytes,))
++                if not bool(np.isfinite(sc).all()) or bool((sc < 0).any()):
++                    bad = start + int(np.nonzero(~(np.isfinite(sc) & (sc >= 0)))[0][0])
++                    raise ValueError(
++                        f"INT8 PLE: non-finite or negative row scale at row "
++                        f"{self.tp_start + int(self.bounds[i]) + bad}")

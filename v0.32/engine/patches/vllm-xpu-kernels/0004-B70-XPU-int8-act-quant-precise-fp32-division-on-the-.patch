@@ -1,7 +1,7 @@
 From e3d70f3629df918516ce793657ac7bd281de3a92 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Thu, 29 Oct 2026 02:44:28 +0000
-Subject: [PATCH 4/5] [B70][XPU] int8 act quant: precise fp32 division on the
+Subject: [PATCH 04/15] [B70][XPU] int8 act quant: precise fp32 division on the
  device
 
 '#pragma float_control' is ignored for spir64. icpx's default fast fp model
@@ -9,14 +9,9 @@ decorated every FDiv in the kernel with FPMaxErrorDecorationINTEL 2.5 ulp and
 FPFastMathMode (SPIR-V of the TU). Compile int8_quant.cpp with
 -ffp-model=precise -foffload-fp32-prec-div instead: no fast-math or max-error
 decorations remain, so x / scale is correctly rounded as in the reference.
----
- CMakeLists.txt                           | 5 +++++
- csrc/quantization/int8/int8_quant.cpp    | 4 ----
- csrc/quantization/int8/int8_quant_math.h | 8 ++++----
- 3 files changed, 9 insertions(+), 8 deletions(-)
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3b06d2a45e..99ede77cc0 100644
+index 3b06d2a..99ede77 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -609,6 +609,11 @@ if(BASIC_KERNELS_ENABLED)
@@ -32,7 +27,7 @@ index 3b06d2a45e..99ede77cc0 100644
    define_gpu_extension_target(
      _C
 diff --git a/csrc/quantization/int8/int8_quant.cpp b/csrc/quantization/int8/int8_quant.cpp
-index 61a2ca5754..35f98cfc8d 100644
+index 61a2ca5..35f98cf 100644
 --- a/csrc/quantization/int8/int8_quant.cpp
 +++ b/csrc/quantization/int8/int8_quant.cpp
 @@ -16,8 +16,6 @@
@@ -54,7 +49,7 @@ index 61a2ca5754..35f98cfc8d 100644
  
  template <typename scalar_t, typename scale_t, int VEC>
 diff --git a/csrc/quantization/int8/int8_quant_math.h b/csrc/quantization/int8/int8_quant_math.h
-index 78fabb9361..7f0c31898d 100644
+index 78fabb9..7f0c318 100644
 --- a/csrc/quantization/int8/int8_quant_math.h
 +++ b/csrc/quantization/int8/int8_quant_math.h
 @@ -13,9 +13,10 @@
@@ -76,3 +71,6 @@ index 78fabb9361..7f0c31898d 100644
  }  // namespace vllm
  
 -#pragma float_control(pop)
+-- 
+2.43.0
+

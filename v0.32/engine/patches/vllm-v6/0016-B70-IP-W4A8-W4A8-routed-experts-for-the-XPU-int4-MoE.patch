@@ -1,0 +1,555 @@
+From dbee42a701cc2b5fe7cc1715b54ed505f8b6df7f Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 18:06:59 +0000
+Subject: [PATCH 16/51] B70-IP-W4A8: W4A8 routed experts for the XPU int4 MoE
+ (B70_MOE_W4A8=1)
+
+int4 g128 weights read as XpuFusedMoe stores them (no copy, no repack), int8
+per-token dynamic activations, int4->int8 unpack in registers, int8 x int8 ->
+int32 DPAS per 128-group with the group scale applied to the int32 partial.
+Stock remap_hidden_states (int8 bytes routed as e4m3) and moe_gather; SiLU*up
+fused into the gemm2 activation quantizer. Wired in XPUExperts.apply and the
+hot/cold hot + staged-cold impls for batches >= B70_MOE_W4A8_MIN_TOKENS (64);
+cold experts over UVA only with B70_MOE_W4A8_UVA=1. CPU tests (interpreter).
+---
+ tests/kernels/moe/test_b70_moe_w4a8.py        | 157 +++++++++
+ .../layers/fused_moe/b70_hotcold.py           |  16 +-
+ .../layers/fused_moe/b70_moe_w4a8.py          | 301 ++++++++++++++++++
+ .../layers/fused_moe/experts/xpu_moe.py       |  11 +-
+ 4 files changed, 479 insertions(+), 6 deletions(-)
+ create mode 100644 tests/kernels/moe/test_b70_moe_w4a8.py
+ create mode 100644 vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
+
+diff --git a/tests/kernels/moe/test_b70_moe_w4a8.py b/tests/kernels/moe/test_b70_moe_w4a8.py
+new file mode 100644
+index 0000000000..ae44e2f7b6
+--- /dev/null
++++ b/tests/kernels/moe/test_b70_moe_w4a8.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-K: CPU tests (TRITON_INTERPRET=1) for the W4A8 MoE kernels in b70_moe_w4a8.
++
++Run: TRITON_INTERPRET=1 python -m pytest tests/kernels/moe/test_b70_moe_w4a8.py
++The weights are built as GPTQ int32 and pushed through the same transforms the
++XPU loader applies (transpose, int32 -> uint8 view, implement_zp), so the test
++checks that the kernel reads the bytes XpuFusedMoe holds."""
++
++import os
++
++import pytest
++import torch
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++pytestmark = pytest.mark.skipif(not INTERPRET,
++                                reason='CPU test: needs TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=""')
++
++
++def _patch_interpreter_bf16() -> None:
++    """Test harness only (as IP-F's test): the Triton 3.8 interpreter keeps bf16 as raw
++    uint16 and casts int<->bf16 on the bit patterns; route bf16 casts through fp32."""
++    import triton.language as tl
++    from triton.runtime import interpreter as interp
++
++    builder = interp.InterpreterBuilder
++    if getattr(builder, "_b70_ip_bf16", False):
++        return
++    cast_impl = builder.cast_impl
++
++    def bf16_cast(self, src, dst_type):
++        s, d = src.dtype.scalar, dst_type.scalar
++        if (s == tl.bfloat16) != (d == tl.bfloat16) and tl.float32 not in (s, d):
++            return cast_impl(self, cast_impl(self, src, tl.float32), dst_type)
++        return cast_impl(self, src, dst_type)
++
++    builder.cast_impl = bf16_cast
++    builder._b70_ip_bf16 = True
++
++
++if INTERPRET:
++    _patch_interpreter_bf16()
++
++
++def implement_zp(qweight: torch.Tensor) -> torch.Tensor:
++    """Copy of vllm_xpu_kernels.fused_moe_interface.implement_zp (u4 -> s4, nibble positions kept)."""
++    high = ((qweight >> 4) & 0x0F).to(torch.int8) - 8
++    low = (qweight & 0x0F).to(torch.int8) - 8
++
++    def enc(x):
++        return ((x < 0).to(torch.uint8) << 3) | (x.view(torch.uint8) & 0x7)
++
++    return (enc(high) << 4) | enc(low)
++
++
++def gptq_random(e, k, n, gen):
++    """GPTQ qweight [E, K/8, N] int32 (8 nibbles per word, ascending K), scales [E, K/128, N]."""
++    nib = torch.randint(0, 16, (e, k, n), generator=gen, dtype=torch.int64)
++    q = torch.zeros((e, k // 8, n), dtype=torch.int64)
++    for i in range(8):
++        q |= nib[:, i::8, :] << (4 * i)
++    q = q.to(torch.int64).where(q < 2**31, q - 2**32).to(torch.int32)
++    scales = (torch.rand((e, k // 128, n), generator=gen) * 0.02 + 0.001).to(torch.bfloat16)
++    return q, scales, nib - 8
++
++
++def to_xpu_layout(q, scales):
++    """int_wna16._process_weights_xpu + implement_zp: [E, N, K/2] int8, scales [E, N, K/128]."""
++    packed = q.transpose(1, 2).contiguous().view(torch.uint8)
++    return implement_zp(packed).view(torch.int8), scales.transpose(1, 2).contiguous()
++
++
++def deinterleave_inverse(xq):
++    """Undo the per-128-group (evens, odds) layout."""
++    r, k = xq.shape
++    g = xq.view(r, k // 128, 2, 64)
++    return torch.stack((g[:, :, 0], g[:, :, 1]), dim=-1).reshape(r, k)
++
++
++@pytest.fixture(scope="module")
++def mod():
++    from vllm.model_executor.layers.fused_moe import b70_moe_w4a8
++
++    return b70_moe_w4a8
++
++
++def test_quant_rows_layout_and_scale(mod):
++    gen = torch.Generator().manual_seed(0)
++    x = (torch.randn((5, 256), generator=gen) * 3).to(torch.bfloat16)
++    x[3] = 0
++    xq, xs = mod.quant_rows(x)
++    plain = deinterleave_inverse(xq).to(torch.float32)
++    xf = x.float()
++    amax = xf.abs().amax(1)
++    assert torch.allclose(xs[:3], amax[:3] / 127, rtol=1e-6)
++    ref = torch.clamp(torch.round(xf / xs[:, None]), -127, 127)
++    assert (plain - ref).abs().max() <= 1  # only half-way ties may differ
++    assert plain.abs().max() == 127 and torch.all(plain[3] == 0)
++
++
++def test_quant_rows_silu(mod):
++    gen = torch.Generator().manual_seed(1)
++    inter = 256
++    g1 = (torch.randn((7, 2 * inter), generator=gen) * 2).to(torch.bfloat16)
++    n_valid = torch.tensor([5], dtype=torch.int32)
++    xq, xs = mod.quant_rows(g1, n_valid, silu_inter=inter)
++    act = torch.nn.functional.silu(g1[:, :inter].float()) * g1[:, inter:].float()
++    a5 = act[:5]
++    assert torch.allclose(xs[:5], a5.abs().amax(1) / 127, rtol=1e-5)
++    ref = torch.clamp(torch.round(a5 / xs[:5, None]), -127, 127)
++    plain = deinterleave_inverse(xq)[:5].float()
++    assert (plain - ref).abs().max() <= 1
++    # the int8 noise of a heavy-tailed SiLU*up row: a few % (rows 5, 6 are past n_valid: not written)
++    rel = (plain * xs[:5, None] - a5).norm() / a5.norm()
++    assert rel < 0.03, rel
++
++
++def test_tile_map(mod):
++    counts = torch.tensor([0, 5, 64, 65, 0, 130, 1], dtype=torch.int32)
++    tile_e, tile_r0, seg_end = mod.tile_map(counts, int(counts.sum()), 64)
++    got = [(int(e), int(r)) for e, r in zip(tile_e, tile_r0) if e >= 0]
++    starts = [0, 0, 5, 69, 134, 134, 264]
++    want = []
++    for e, c in enumerate(counts.tolist()):
++        for t in range((c + 63) // 64):
++            want.append((e, starts[e] + 64 * t))
++    assert got == want
++    assert seg_end.tolist() == torch.cumsum(counts, 0).tolist()
++
++
++@pytest.mark.parametrize("bm,bn", [(16, 32), (32, 64)])
++def test_grouped_gemm_exact(mod, bm, bn):
++    """Kernel == float64 reference of (int8 A) x (int4 W from the GPTQ words) with both scales."""
++    gen = torch.Generator().manual_seed(2)
++    e, k, n = 3, 256, 64
++    q, scales, w_int = gptq_random(e, k, n, gen)  # w_int [E, K, N] in [-8, 7]
++    w, ws = to_xpu_layout(q, scales)
++    counts = torch.tensor([3, 0, 37], dtype=torch.int32)
++    rows = int(counts.sum())
++    x = (torch.randn((rows + 4, k), generator=gen)).to(torch.bfloat16)
++    aq, a_s = mod.quant_rows(x)
++    tile_e, tile_r0, seg_end = mod.tile_map(counts, rows + 4, bm)
++    out = torch.zeros((rows + 4, n), dtype=torch.float32)
++    mod.grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, (bm, bn, 4))
++    a_plain = deinterleave_inverse(aq).double()
++    start = 0
++    for ex, c in enumerate(counts.tolist()):
++        if not c:
++            continue
++        a = a_plain[start:start + c]
++        acc = torch.zeros((c, n), dtype=torch.float64)
++        for g in range(k // 128):
++            sl = slice(g * 128, (g + 1) * 128)
++            acc += (a[:, sl] @ w_int[ex, sl].double()) * scales[ex, g].double()[None, :]
++        ref = acc * a_s[start:start + c].double()[:, None]
++        torch.testing.assert_close(out[start:start + c].double(), ref, rtol=2e-6, atol=1e-6)
++        start += c
++    assert torch.all(out[rows:] == 0)  # rows past the last expert untouched
+diff --git a/vllm/model_executor/layers/fused_moe/b70_hotcold.py b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+index 1b276dfebb..25d1f26c64 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_hotcold.py
++++ b/vllm/model_executor/layers/fused_moe/b70_hotcold.py
+@@ -987,8 +987,13 @@ class HotColdPlan:
+             if min_tokens and hidden_states.shape[0] >= min_tokens:
+                 logger.info_once("B70 hot/cold: graph capture at %d tokens reads cold experts over "
+                                  "UVA (prefetch is eager-only)", hidden_states.shape[0])
+-            cold.apply(output=output, hidden_states=hidden_states,
+-                       topk_weights=topk_weights, topk_ids=topk_ids)
++            from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
++
++            # B70-IP-K: W4A8 reads the cold weights over UVA only on request (B70_MOE_W4A8_UVA=1)
++            if not (_w4a8.uva_enabled()
++                    and _w4a8.maybe_apply(cold, output, hidden_states, topk_weights, topk_ids)):
++                cold.apply(output=output, hidden_states=hidden_states,
++                           topk_weights=topk_weights, topk_ids=topk_ids)
+             return
+         import copy
+ 
+@@ -996,8 +1001,11 @@ class HotColdPlan:
+         staged = copy.copy(cold)
+         staged.w13, staged.w2 = buf["w13"].view(torch.int8), buf["w2"].view(torch.int8)
+         staged.gemm1_wei_scales, staged.gemm2_wei_scales = buf["w13_scales"], buf["w2_scales"]
+-        staged.apply(output=output, hidden_states=hidden_states,
+-                     topk_weights=topk_weights, topk_ids=topk_ids)
++        from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
++
++        if not _w4a8.maybe_apply(staged, output, hidden_states, topk_weights, topk_ids):
++            staged.apply(output=output, hidden_states=hidden_states,
++                         topk_weights=topk_weights, topk_ids=topk_ids)
+         _PREFETCH.release_and_prefetch(self)
+ 
+     def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:
+diff --git a/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py b/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
+new file mode 100644
+index 0000000000..938fce2d43
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
+@@ -0,0 +1,301 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-IP-K: W4A8 routed experts for the XPU int4 MoE (B70_MOE_W4A8=1).
++
++The int4 expert weights stay exactly the bytes ``XpuFusedMoe`` holds (GPTQ
++nibble order, signed int4 after ``implement_zp``: byte p of a row holds input
++k = 2p in the low nibble and k = 2p + 1 in the high nibble; bf16 scales
++[E, N, K/128]). No copy, no repack. Activations are quantized per token to
++symmetric int8 (dynamic). The GEMM unpacks int4 -> int8 in registers (exact)
++and runs int8 x int8 -> int32 DPAS per 128-wide K group; each group's int32
++partial sum is scaled by the weight scale of (row of W, group) into an fp32
++accumulator, and the token's activation scale is applied once at the end.
++
++To avoid an interleave shuffle in registers, the activation quantizer writes
++each 128-wide K group de-interleaved: the 64 even k first, then the 64 odd k.
++The low nibbles of a 64-byte weight block then pair with the first half and
++the high nibbles with the second half: two K=64 dots per group.
++
++Routing (remap_hidden_states), SiLU-and-mul semantics and the weighted gather
++(moe_gather) are the stock XpuFusedMoe ops; only the two grouped GEMMs (and the
++activation quantization feeding them) change.
++"""
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++
++GROUP = 128
++
++# (BLOCK_M, BLOCK_N, num_warps, large GRF) per GEMM; override with
++# B70_MOE_W4A8_CFG1 / B70_MOE_W4A8_CFG2 = "BM,BN,warps,grf".
++_DEFAULT_CFG1 = (64, 128, 8, 0)
++_DEFAULT_CFG2 = (64, 128, 8, 0)
++
++
++def enabled() -> bool:
++    return os.environ.get("B70_MOE_W4A8", "0") == "1"
++
++
++def min_tokens() -> int:
++    return int(os.environ.get("B70_MOE_W4A8_MIN_TOKENS", "64"))
++
++
++def uva_enabled() -> bool:
++    """Hot/cold: also run the cold experts read over UVA (pinned host) through W4A8."""
++    return os.environ.get("B70_MOE_W4A8_UVA", "0") == "1"
++
++
++def _cfg(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    vals = [int(x) for x in raw.split(",")]
++    return tuple(vals + [0] * (4 - len(vals)))
++
++
++@triton.jit
++def _b70_w4a8_pair(base, c, j, SILU: tl.constexpr, INTER: tl.constexpr):
++    """Even and odd elements (64 each) of 128-wide group ``c`` of one row, fp32.
++    SILU: the row is [gate(INTER) | up(INTER)] and the value is silu(gate) * up."""
++    off = c * 128 + 2 * j
++    if SILU:
++        ge = tl.load(base + off).to(tl.float32)
++        go = tl.load(base + off + 1).to(tl.float32)
++        ue = tl.load(base + INTER + off).to(tl.float32)
++        uo = tl.load(base + INTER + off + 1).to(tl.float32)
++        ve = ge / (1.0 + tl.exp(-ge)) * ue
++        vo = go / (1.0 + tl.exp(-go)) * uo
++    else:
++        ve = tl.load(base + off).to(tl.float32)
++        vo = tl.load(base + off + 1).to(tl.float32)
++    return ve, vo
++
++
++@triton.jit
++def _b70_w4a8_round(v):
++    # round half away from zero, clamp to the symmetric int8 range
++    r = tl.where(v >= 0, tl.floor(v + 0.5), -tl.floor(-v + 0.5))
++    return tl.minimum(tl.maximum(r, -127.0), 127.0).to(tl.int8)
++
++
++@triton.jit
++def _b70_w4a8_quant_kernel(
++    X, Xq, Xs, n_valid_ptr, stride_x,
++    K: tl.constexpr, SILU: tl.constexpr, INTER: tl.constexpr, HAS_N_VALID: tl.constexpr,
++):
++    """Per-row symmetric int8: Xq[row] (de-interleaved per 128 group), Xs[row] = amax / 127."""
++    row = tl.program_id(0)
++    if HAS_N_VALID:
++        if row >= tl.load(n_valid_ptr):
++            return
++    j = tl.arange(0, 64)
++    base = X + row.to(tl.int64) * stride_x
++    amax = tl.zeros([64], dtype=tl.float32)
++    for c in tl.static_range(K // 128):
++        ve, vo = _b70_w4a8_pair(base, c, j, SILU, INTER)
++        amax = tl.maximum(amax, tl.maximum(tl.abs(ve), tl.abs(vo)))
++    m = tl.max(amax, 0)
++    scale = tl.maximum(m, 1e-20) / 127.0
++    tl.store(Xs + row, scale)
++    out = Xq + row.to(tl.int64) * K
++    for c in tl.static_range(K // 128):
++        ve, vo = _b70_w4a8_pair(base, c, j, SILU, INTER)
++        tl.store(out + c * 128 + j, _b70_w4a8_round(ve / scale))
++        tl.store(out + c * 128 + 64 + j, _b70_w4a8_round(vo / scale))
++
++
++@triton.jit
++def _b70_w4a8_gemm_kernel(
++    A, As, W, Ws, Out, tile_e_ptr, tile_r0_ptr, seg_end_ptr,
++    N, stride_we, stride_se,
++    K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++):
++    """Out[r, n] = As[r] * sum_g Ws[e, n, g] * sum_{k in g} A[r, k] * W[e, n, k] for the rows r of
++    one expert tile. A int8 [R, K] (groups de-interleaved), W int4 packed [E, N, K/2]."""
++    pid_n = tl.program_id(0)
++    pid_t = tl.program_id(1)
++    e = tl.load(tile_e_ptr + pid_t)
++    if e < 0:
++        return
++    r0 = tl.load(tile_r0_ptr + pid_t)
++    r_end = tl.load(seg_end_ptr + e)
++    n0 = pid_n * BN
++    KP: tl.constexpr = K // 2
++    G: tl.constexpr = K // 128
++    a_lo = tl.make_block_ptr(A, shape=(r_end, K), strides=(K, 1), offsets=(r0, 0),
++                             block_shape=(BM, 64), order=(1, 0))
++    a_hi = tl.make_block_ptr(A, shape=(r_end, K), strides=(K, 1), offsets=(r0, 64),
++                             block_shape=(BM, 64), order=(1, 0))
++    w_p = tl.make_block_ptr(W + e.to(tl.int64) * stride_we, shape=(KP, N), strides=(1, KP),
++                            offsets=(0, n0), block_shape=(64, BN), order=(0, 1))
++    offs_n = n0 + tl.arange(0, BN)
++    s_ptr = Ws + e.to(tl.int64) * stride_se + offs_n * G
++    acc = tl.zeros([BM, BN], dtype=tl.float32)
++    for g in range(G):
++        al = tl.load(a_lo, boundary_check=(0,))
++        ah = tl.load(a_hi, boundary_check=(0,))
++        pw = tl.load(w_p)
++        wl = (pw << 4) >> 4  # low nibble, sign-extended: even k
++        wh = pw >> 4  # high nibble (arithmetic shift): odd k
++        part = tl.dot(al, wl, out_dtype=tl.int32)
++        part = tl.dot(ah, wh, acc=part, out_dtype=tl.int32)
++        sc = tl.load(s_ptr + g).to(tl.float32)
++        acc += part.to(tl.float32) * sc[None, :]
++        a_lo = tl.advance(a_lo, (0, 128))
++        a_hi = tl.advance(a_hi, (0, 128))
++        w_p = tl.advance(w_p, (64, 0))
++    offs_m = r0 + tl.arange(0, BM)
++    asc = tl.load(As + offs_m, mask=offs_m < r_end, other=0.0)
++    acc = acc * asc[:, None]
++    o = tl.make_block_ptr(Out, shape=(r_end, N), strides=(N, 1), offsets=(r0, n0),
++                          block_shape=(BM, BN), order=(1, 0))
++    tl.store(o, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
++
++
++def tile_map(rows_per_expert: torch.Tensor, max_rows: int, bm: int):
++    """Device-side (no host sync) tile -> (expert, first row) map over expert-contiguous rows.
++    Returns tile_e [T] (-1 = idle program), tile_r0 [T], seg_end [E] (int32)."""
++    counts = rows_per_expert.to(torch.int64)
++    n_exp = counts.numel()
++    tiles = (counts + bm - 1) // bm
++    cum = torch.cumsum(tiles, 0)
++    seg_end = torch.cumsum(counts, 0)
++    n_tiles = (max_rows + bm - 1) // bm + n_exp
++    t = torch.arange(n_tiles, device=counts.device, dtype=torch.int64)
++    e = torch.searchsorted(cum, t, right=True)
++    ec = e.clamp(max=n_exp - 1)
++    local = t - (cum - tiles)[ec]
++    r0 = (seg_end - counts)[ec] + local * bm
++    tile_e = torch.where(e < n_exp, ec, torch.full_like(ec, -1))
++    return tile_e.to(torch.int32), r0.to(torch.int32), seg_end.to(torch.int32)
++
++
++def quant_rows(x: torch.Tensor, n_valid: torch.Tensor | None = None, silu_inter: int = 0):
++    """int8 de-interleaved rows + fp32 per-row scales. silu_inter > 0: x is [R, 2*I] gate|up."""
++    rows = x.shape[0]
++    k = silu_inter if silu_inter else x.shape[1]
++    assert k % GROUP == 0 and x.stride(1) == 1
++    xq = torch.empty((rows, k), dtype=torch.int8, device=x.device)
++    xs = torch.empty((rows,), dtype=torch.float32, device=x.device)
++    if rows:
++        _b70_w4a8_quant_kernel[(rows,)](
++            x, xq, xs, n_valid if n_valid is not None else xs, x.stride(0),
++            K=k, SILU=bool(silu_inter), INTER=silu_inter, HAS_N_VALID=n_valid is not None,
++            num_warps=1,
++        )
++    return xq, xs
++
++
++def grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, cfg):
++    """out[R, N] (bf16) for expert-contiguous int8 rows ``aq`` [R, K] and int4 weights ``w`` [E, N, K/2]."""
++    bm, bn, warps, grf = (tuple(cfg) + (0,))[:4]
++    extra = {"grf_mode": "256"} if grf and os.environ.get("TRITON_INTERPRET") != "1" else {}
++    n_exp, n, kp = w.shape
++    k = kp * 2
++    assert ws.shape == (n_exp, n, k // GROUP) and n % bn == 0 and aq.shape[1] == k
++    grid = (n // bn, tile_e.numel())
++    _b70_w4a8_gemm_kernel[grid](
++        aq, a_s, w, ws, out, tile_e, tile_r0, seg_end,
++        n, w.stride(0), ws.stride(0),
++        K=k, BM=bm, BN=bn, num_warps=warps, **extra,
++    )
++    return out
++
++
++def eligible(impl) -> str | None:
++    """None if ``impl`` (an XpuFusedMoe) can run W4A8, else the reason."""
++    if not getattr(impl, "is_int4", False):
++        return "not an int4 MoE"
++    if impl.activation != "silu" or impl.gemm1_clamp_limit:
++        return f"activation {impl.activation} / clamp {impl.gemm1_clamp_limit}"
++    if impl.w13_bias is not None or impl.w2_bias is not None:
++        return "expert biases"
++    if getattr(impl, "_astra_groups", None) is not None:
++        return "astra group ownership re-laid out the weights"
++    for w, s in ((impl.w13, impl.gemm1_wei_scales), (impl.w2, impl.gemm2_wei_scales)):
++        if w.element_size() != 1 or w.dim() != 3 or not w.is_contiguous():
++            return f"weight {w.dtype} {tuple(w.shape)}"
++        if s is None or s.dim() != 3 or s.shape[-1] * GROUP != w.shape[-1] * 2 or not s.is_contiguous():
++            return "scales are not [E, N, K/128] contiguous"
++    if impl.w13.shape[1] != 2 * impl.inter_size or impl.inter_size % GROUP:
++        return f"inter size {impl.inter_size}"
++    return None
++
++
++def apply(impl, output, hidden_states, topk_weights, topk_ids, expert_map=None) -> None:
++    """Drop-in for XpuFusedMoe._apply_kernel (stock routing ops, W4A8 GEMMs)."""
++    num_rows, hidden = hidden_states.shape
++    topk = impl.n_experts_per_token
++    n_moe = num_rows * topk
++    if expert_map is None and impl.ep_size > 1:
++        expert_map = impl.expert_map
++    dev = hidden_states.device
++    # Same as stock: rows routed nowhere (all -1) are zeroed before the remap.
++    invalid = (topk_ids < 0).all(dim=1)
++    hs = hidden_states.masked_fill(invalid.unsqueeze(1), 0)
++    # Quantize the M token rows once, then route the int8 bytes with their scales through the
++    # stock remap (as e4m3 bytes: the remap copies, it does not convert).
++    hq, hs_scale = quant_rows(hs)
++    remapped = torch.empty((n_moe, hidden), dtype=torch.float8_e4m3fn, device=dev)
++    remapped_scales = torch.empty((n_moe, 1), dtype=torch.float32, device=dev)
++    rows_per_expert = torch.zeros((impl.num_experts,), dtype=torch.int32, device=dev)
++    unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=hq.view(torch.float8_e4m3fn),
++        hidden_states_scales=hs_scale.view(num_rows, 1),
++        remapped_hidden_states=remapped,
++        remapped_hidden_states_scales=remapped_scales,
++        expert_map=expert_map,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unp,
++        topk_ids=topk_ids,
++        total_experts_num=impl.total_experts_num,
++        local_experts_num=impl.local_experts_num,
++    )
++    cfg1 = _cfg("B70_MOE_W4A8_CFG1", _DEFAULT_CFG1)
++    cfg2 = _cfg("B70_MOE_W4A8_CFG2", _DEFAULT_CFG2)
++    tile_e, tile_r0, seg_end = tile_map(rows_per_expert, n_moe, cfg1[0])
++    inter = impl.inter_size
++    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
++    grouped_gemm(remapped.view(torch.int8), remapped_scales.view(-1), impl.w13,
++                 impl.gemm1_wei_scales, g1, tile_e, tile_r0, seg_end, cfg1)
++    aq2, as2 = quant_rows(g1, seg_end[-1:], silu_inter=inter)
++    if cfg2[0] != cfg1[0]:
++        tile_e, tile_r0, seg_end = tile_map(rows_per_expert, n_moe, cfg2[0])
++    g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
++    grouped_gemm(aq2, as2, impl.w2, impl.gemm2_wei_scales, g2, tile_e, tile_r0, seg_end, cfg2)
++    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp, impl.num_experts)
++
++
++_LOGGED = False
++
++
++def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
++    """W4A8 when B70_MOE_W4A8=1, the batch has >= B70_MOE_W4A8_MIN_TOKENS tokens and ``impl`` is a
++    plain int4 g128 SiLU XpuFusedMoe; False = caller runs the stock path."""
++    global _LOGGED
++    if not enabled() or hidden_states.shape[0] < min_tokens():
++        return False
++    ok = getattr(impl, "_b70_w4a8_ok", None)
++    if ok is None:
++        why = eligible(impl)
++        ok = why is None
++        impl._b70_w4a8_ok = ok
++        if why is not None:
++            logger.warning_once("B70-IP-K: MoE W4A8 refused (%s); stock W4A16 path", why)
++    if not ok:
++        return False
++    if not _LOGGED:
++        _LOGGED = True
++        logger.info("B70-IP-K: MoE W4A8 on: int4 g128 weights as stored, int8 per-token activations, "
++                    "int8 x int8 -> int32 DPAS, batches >= %d tokens (B70_MOE_W4A8_MIN_TOKENS); "
++                    "cfg1 %s cfg2 %s", min_tokens(), _cfg("B70_MOE_W4A8_CFG1", _DEFAULT_CFG1),
++                    _cfg("B70_MOE_W4A8_CFG2", _DEFAULT_CFG2))
++    apply(impl, output, hidden_states, topk_weights, topk_ids)
++    return True
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index fe8e72494f..7a54278a30 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -190,6 +190,10 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+             # expert not owned by this rank so they are skipped.
+             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
+             topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
++        from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
++
++        if _w4a8.maybe_apply(self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids):
++            return
+         self.fused_moe_impl.apply(
+             output=output,
+             hidden_states=hidden_states,
+@@ -429,8 +433,11 @@ class XPUExpertsWNA16(XPUExperts):
+             topk_ids = remap_unrouted(topk_ids, self.b70_hotcold.num_global, self.moe_config.ep_rank)
+         if not (activation.value == "silu" and self.gemm1_clamp_limit is None
+                 and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
+-            hot.apply(output=output, hidden_states=hidden_states,
+-                      topk_weights=topk_weights, topk_ids=topk_ids)
++            from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
++
++            if not _w4a8.maybe_apply(hot, output, hidden_states, topk_weights, topk_ids):
++                hot.apply(output=output, hidden_states=hidden_states,
++                          topk_weights=topk_weights, topk_ids=topk_ids)
+             cold_out = torch.empty_like(output)
+             self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
+             output.add_(cold_out)

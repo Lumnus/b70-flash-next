@@ -10,33 +10,39 @@ this page is for changing them. Each model's numbers and gates are on its page i
    diverges from the first token, and in an agent session the model re-issues tool calls it has already finished. Every
    preset ships 0 and the engine forces it off under `mamba_cache_mode=align` (`v0.32/engine/patches/vllm-models/` 0008).
    What it would buy, CPU-tier reuse one block below the replay boundary, is small; GPU prefix-cache hits do not depend on it.
-2. **fp8 is the 8-bit KV type; `int8_per_token_head` is not.** fp8 (e4m3, scale 1.0) on the XPU FlashAttention backend
-   serves correctly and is what fits the 27B's 147K context on one card. `int8_per_token_head` exists only on `TRITON_ATTN`
-   and answered nonsense from the first greedy token on XPU.
+2. **`int8_per_token_head` is the KV type of every Flash-Next preset, and it needs this release's engine and kernels.**
+   FlashAttention serves it through the native INT8 paged decode (`B70_PTH_FA_DECODE=1`; without the switch it raises
+   rather than answer), and the QSA kernels read and write it. Against BF16 KV it is at the repeat floor past 8K tokens and
+   visible below that, mostly on prose ([model page](../v0.32/models/qwen38-flash-next/meta.md#numbers)). On earlier builds
+   the type existed only on `TRITON_ATTN` and answered nonsense from the first greedy token on XPU. The Qwen3.8-27B 1-card
+   preset runs fp8 (e4m3, scale 1.0) instead, which is what fits its 147K context on one card.
 3. **Leave oneCCL's `LL` algorithm at its default.** `LL=twoshots` corrupts output on this stack (burst gate 64 of 150 bad).
-4. **The GDN op comes from `libgdn_index64.so`.** The stock `_xpu_C` GDN op of vllm-xpu-kernels 0.1.16.2 has 32-bit
-   conv-state offsets (upstream #658 is on main, in no release; the PyPI build fails `tests/gdn_attn/test_causal_conv1d.py
-   -k large_state_offset`); an int32 wrap at block id ≥ 5,042 killed engines. The engine calls `torch.ops._gdn_index64`.
+4. **The GDN op comes from `libgdn_index64.so`.** The PyPI `_xpu_C` GDN op of vllm-xpu-kernels 0.1.16.2 has 32-bit
+   conv-state offsets (upstream #658 is merged on main, in no release; the PyPI build fails `tests/gdn_attn/test_causal_conv1d.py
+   -k large_state_offset`); an int32 wrap at block id ≥ 5,042 killed engines. Our kernels carry the 64-bit offsets, and the
+   engine still calls `torch.ops._gdn_index64`.
 5. **Plain `B70_QSA_TOPK=native` is not launch-repeatable** (equal scores ordered differently); `native_det` is the
    qualified native mode and the preset value.
 6. **Do not capture the sparse attention path in graphs** (`B70_QSA_EAGER_BREAK=0`): beyond 2K tokens the output degrades.
 7. **Expandable segments only with the patched oneCCL plugin.** With the stock plugin, oneCCL treats a virtual-memory
-   device buffer as host memory and libfabric segfaults ([the engine page](../v0.32/README.md#what-the-032-engine-tunes-flash-next), item 8).
+   device buffer as host memory and libfabric segfaults ([engine details](engine-details.md#what-the-engine-tunes-flash-next), item 8).
 8. **Keep capture sizes at multiples of 1 + K** (8 for DFlash K = 7) up to slots × 8: a FULL graph that pads a speculative
    decode step writes recurrent state into the shared null block.
 
 ## 2. Choosing a configuration
 
-1. **Flash-Next: sparse or dense attention.** Sparse (QSA, the default) wins where the context is long: prefill 1.06× dense
-   at 131K and 1.31× at 260K, agent-session replays 204.7 s against 230–235 s, long-context tasks 80/78 % against 72/72 %
-   at 128K. Dense is 3–11 % faster on short single streams and at 8 streams, and holds about 13 % more GPU KV (397,309
-   against 344,706 tokens). Both are the same engine; the attention parameter is on the
-   [Flash-Next page](../v0.32/models/qwen38-flash-next/meta.md#parameters).
+1. **Flash-Next: sparse or dense attention.** The presets come in both (D for dense, S for sparse), on the same engine.
+   Sparse (QSA) wins where the context is long: on the b70.4 build prefill was 1.06× dense at 131K and 1.31× at 260K,
+   agent-session replays 204.7 s against 230–235 s, long-context tasks 80/78 % against 72/72 % at 128K
+   ([measurements](measurements/v0.32-qsa.md)). Dense is faster on short single streams. On two cards of this release,
+   D8-6 decodes 72 / 107 tok/s (prose / code, one stream) and S8-6 67 / 92, while S8-6 holds more GPU KV (503,866 against
+   426,060 tokens) and prefills 128K slightly faster (2,505 against 2,412 tok/s). Composing the other one is in
+   [the model page](../v0.32/models/qwen38-flash-next/meta.md#composing-other-modes).
 2. **Flash-Next: 4 or 2 cards.** 4 cards for speed. 2 cards free the other pair for a second model: 145 experts per layer
-   per rank live in host RAM and are read over PCIe, so one stream decodes at about 0.37× the 4-card preset. Turn on the
-   asynchronous swap (the 2-card preset does): it follows a change of traffic without stalling decode. The fused hot+cold
+   per rank live in host RAM and are read over PCIe, so one stream decodes at about 0.6× the 4-card preset (72 against 124 tok/s on prose with D8-6). Turn on the
+   asynchronous swap (the 2-card presets do): it follows a change of traffic without stalling decode. The fused hot+cold
    decode op with bf16 scales differs from all-experts-in-VRAM at relative L2 ≤ 2.9e-3; teacher-forced fidelity of the
-   2-card preset is at the TP4 floor.
+   2-card presets is at the TP4 floor.
 3. **One card or two for the 27B and the 35B.** One card trades about a third of decode speed and half the prefill for a
    free card; the 27B needs fp8 KV and the W8A8 drafter to reach 147K context there. The 35B holds four full 262K requests
    in GPU KV on two cards.
@@ -53,13 +59,13 @@ this page is for changing them. Each model's numbers and gates are on its page i
    completion, and give it ≥ 180 s under load (a saturated engine queues).
 3. **Pinned memory escapes container limits.** The KV tier, the PLE row cache and the cold experts are pinned host memory;
    watch the host's MemAvailable, not the container's. Three engines on one 256 GB host leave 41–43 GiB
-   ([the engine page](../v0.32/README.md#host-ram-with-three-engines)).
+   ([engine details](engine-details.md#host-ram-with-three-engines); the engine page has the host RAM of the current presets).
 4. **One pinned allocation ≥ ~31 GiB is refused by compute-runtime** unless the engine env carries `NEOReadDebugKeys=1
-   AllowUnrestrictedSize=1`; the 4-card preset's 32 GiB per rank needs it. Size the tier as a power of two times the card count.
+   AllowUnrestrictedSize=1`; the 4-card presets' 32 GiB per rank need it. Size the tier as a power of two times the card count.
 5. **A cold Triton cache needs `CL/cl.h` in the venv** (build step 2 has the check); a warm cache hides the gap.
-6. **Our kernel build has FlashAttention-2, MQA-logits and Xe3P off,** as in every build we serve: the attention libraries
-   come from the PyPI wheel, and the fp8 MQA-logits ops are not registered. A model that needs them needs an MQA-on build,
-   which needs more than 64 GiB of RAM on the builder.
+6. **Our kernels are built as a whole wheel,** with FlashAttention-2 and MQA-logits on and Xe3P off, and installed whole:
+   a cold build took 5 h 27 min and peaked near 120 GiB of RAM at 16 jobs ([kernels](kernels.md)). Do not lay a reduced
+   build over the PyPI libraries and expect the attention paths of this release.
 
 ## 4. Measuring and testing
 

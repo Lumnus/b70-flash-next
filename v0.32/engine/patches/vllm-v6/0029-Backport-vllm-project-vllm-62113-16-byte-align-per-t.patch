@@ -1,0 +1,245 @@
+From 383fd20ccd9fe670e0fcb5af08c613859e1b9e3f Mon Sep 17 00:00:00 2001
+From: noon-at-cgn <75719527+noon-at-cgn@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:39:56 +0000
+Subject: [PATCH 29/51] Backport vllm-project/vllm#62113: 16-byte-align
+ per-token-head KV slots so Triton vectorizes loads
+
+[Perf][Attention] TRITON_ATTN packs per-token-head int8/fp8 KV as
+[K | k_scale | V | v_scale]; customize_spec now pads each K/V half to 16 bytes
+(head_size 256 int8: 520 -> 544 B per slot, V at +272; 128: 264 -> 288).
+INT4 stays unpadded. _ensure_scale_caches takes the head size from the impl
+instead of inferring it from the content width.
+
+Open upstream (vllm-project/vllm#62113, head 9c3f9f8798bc, needs-rebase);
+retire this pick when upstream merges. Applied by hand (the upstream diff does
+not apply to this base). Dropped: the .buildkite/intel_jobs deselect (file not
+in this tree) and the test's split-K parametrization (needs upstream's
+_spy_reduce_segments helper, not in this base). Kept: the backend
+read-through in test_per_token_kv_cache and the parametrized
+test_unpadded_page_size_includes_per_token_head_scales.
+---
+ tests/quantization/test_per_token_kv_cache.py | 54 ++++++++++++++++---
+ tests/v1/core/test_kv_cache_utils.py          | 25 ++++++---
+ vllm/v1/attention/backends/triton_attn.py     | 24 +++++----
+ 3 files changed, 82 insertions(+), 21 deletions(-)
+
+diff --git a/tests/quantization/test_per_token_kv_cache.py b/tests/quantization/test_per_token_kv_cache.py
+index 4d61932118..60c5330ef1 100644
+--- a/tests/quantization/test_per_token_kv_cache.py
++++ b/tests/quantization/test_per_token_kv_cache.py
+@@ -526,6 +526,7 @@ def test_process_weights_sets_placeholder_scales(kv_cache_dtype: str):
+     [
+         [(1, 128)],
+         [(1, 64), (1, 32)],
++        [(4, 128), (4, 97)],
+     ],
+ )
+ @pytest.mark.parametrize("num_heads", [(4, 4)])
+@@ -541,7 +542,19 @@ def test_triton_unified_attention_per_token_head_scale(
+ ):
+     """End-to-end: quantized KV with per-token-head scale caches."""
+     from vllm.utils.math_utils import next_power_of_2
++    from vllm.v1.attention.backends.triton_attn import (
++        TritonAttentionBackend,
++        TritonAttentionImpl,
++    )
+     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++    from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++    if (
++        qcfg is FP8_CONFIG
++        and current_platform.is_cuda()
++        and not current_platform.has_device_capability(89)
++    ):
++        pytest.skip("fp8e4nv is not supported on CUDA arch < 89")
+ 
+     torch.set_default_device(DEVICE_TYPE)
+     set_random_seed(0)
+@@ -635,6 +648,34 @@ def test_triton_unified_attention_per_token_head_scale(
+             qcfg.cache_dtype
+         )
+ 
++    # Read through the backend's packed cache, as when serving.
++    impl = TritonAttentionImpl(
++        num_heads=num_query_heads,
++        head_size=head_size,
++        scale=scale,
++        num_kv_heads=num_kv_heads,
++        alibi_slopes=None,
++        sliding_window=None,
++        kv_cache_dtype=qcfg.kv_cache_dtype_str,
++    )
++    spec = FullAttentionSpec(
++        block_size=block_size,
++        num_kv_heads=num_kv_heads,
++        head_size=head_size,
++        dtype=qcfg.cache_dtype,
++        kv_quant_mode=qcfg.kv_quant_mode,
++    )
++    content = TritonAttentionBackend.customize_spec(spec).state_content_size_bytes
++    kv_cache = torch.empty(
++        num_blocks, num_kv_heads, block_size, content, dtype=qcfg.cache_dtype
++    )
++    key_cache, value_cache = impl._pth_key_value_caches(kv_cache)
++    key_cache[..., : key_cache_q.shape[-1]].copy_(key_cache_q)
++    value_cache[..., : value_cache_q.shape[-1]].copy_(value_cache_q)
++    assert impl._k_scale_cache is not None and impl._v_scale_cache is not None
++    k_scale_cache = impl._k_scale_cache.copy_(k_scale_cache)
++    v_scale_cache = impl._v_scale_cache.copy_(v_scale_cache)
++
+     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+         dim=0, dtype=torch.int32
+     )
+@@ -648,24 +689,25 @@ def test_triton_unified_attention_per_token_head_scale(
+     head_size_padded = next_power_of_2(head_size)
+     seq_threshold_3D = 0
+     num_par_softmax_segments = 16
++    scratch_rows = seq_threshold_3D * max_query_len
+     softmax_segm_output = torch.empty(
+-        (seq_threshold_3D, num_query_heads, num_par_softmax_segments, head_size_padded),
++        (scratch_rows, num_query_heads, num_par_softmax_segments, head_size_padded),
+         dtype=torch.float32,
+     )
+     softmax_segm_max = torch.empty(
+-        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
++        (scratch_rows, num_query_heads, num_par_softmax_segments),
+         dtype=torch.float32,
+     )
+     softmax_segm_expsum = torch.empty(
+-        (seq_threshold_3D, num_query_heads, num_par_softmax_segments),
++        (scratch_rows, num_query_heads, num_par_softmax_segments),
+         dtype=torch.float32,
+     )
+ 
+     output_q = torch.empty_like(query)
+     unified_attention(
+         q=query,
+-        k=key_cache_q,
+-        v=value_cache_q,
++        k=key_cache,
++        v=value_cache,
+         out=output_q,
+         cu_seqlens_q=cu_query_lens,
+         seqused_k=kv_lens_t,
+@@ -707,7 +749,7 @@ def test_triton_unified_attention_per_token_head_scale(
+         q_descale=None,
+         k_descale=None,
+         v_descale=None,
+-        seq_threshold_3D=seq_threshold_3D,
++        seq_threshold_3D=0,
+         num_par_softmax_segments=num_par_softmax_segments,
+         softmax_segm_output=softmax_segm_output,
+         softmax_segm_max=softmax_segm_max,
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index b06479f1ca..13f4571b43 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -3698,21 +3698,34 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
+     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
+ 
+ 
+-def test_unpadded_page_size_includes_per_token_head_scales():
++@pytest.mark.parametrize(
++    "kv_quant_mode,head_size,slot_bytes",
++    [
++        (KVQuantMode.FP8_PER_TOKEN_HEAD, 64, 2 * 80),
++        (KVQuantMode.INT8_PER_TOKEN_HEAD, 128, 2 * 144),
++        (KVQuantMode.INT8_PER_TOKEN_HEAD, 256, 2 * 272),
++        (KVQuantMode.INT4_PER_TOKEN_HEAD, 256, 2 * 132),
++    ],
++)
++def test_unpadded_page_size_includes_per_token_head_scales(
++    kv_quant_mode, head_size, slot_bytes
++):
+     # Per-token-head quant carries inline fp32 scales that are carved from the
+     # raw KV allocation, so they must be budgeted into the offload width. The
+-    # packing is published by the owning backend's customize_spec hook.
++    # packing is published by the owning backend's customize_spec hook, which
++    # pads each INT8/FP8 K/V half to 16 bytes.
+     from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+ 
+-    dense = new_kv_cache_spec(dtype=torch.uint8)
+     spec = TritonAttentionBackend.customize_spec(
+         new_kv_cache_spec(
+-            dtype=torch.uint8, kv_quant_mode=KVQuantMode.FP8_PER_TOKEN_HEAD
++            head_size=head_size, dtype=torch.uint8, kv_quant_mode=kv_quant_mode
+         )
+     )
+-    scales = 2 * spec.block_size * spec.num_kv_heads * 4
+-    assert spec.unpadded_page_size_bytes == dense.unpadded_page_size_bytes + scales
++    num_slots = spec.block_size * spec.num_kv_heads
++    assert spec.unpadded_page_size_bytes == num_slots * slot_bytes
+     assert spec.page_size_bytes == spec.unpadded_page_size_bytes
++    if kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD:
++        assert spec.state_content_size_bytes // 2 % 16 == 0
+ 
+ 
+ def test_page_size_padded_wins():
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index f1f9b8a137..ee273ba4d8 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -18,7 +18,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+-from vllm.utils.math_utils import cdiv, next_power_of_2
++from vllm.utils.math_utils import cdiv, next_power_of_2, round_up
+ from vllm.utils.torch_utils import get_dtype_size, is_quantized_kv_cache
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -283,15 +283,21 @@ class TritonAttentionBackend(AttentionBackend):
+     @classmethod
+     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+         """Per-token-head modes pack inline fp32 scales after each head's
+-        data, so the content is (data + one scale) per K/V side."""
++        data, so the content is (data + one scale) per K/V side. INT8/FP8
++        pad each side to 16 bytes so Triton can vectorize the K/V loads."""
+         mode = spec.kv_quant_mode
+         if spec.state_content_bytes is not None or not mode.is_per_token_head:
+             return spec
+         hs_k, hs_v = spec.head_size, spec.head_size_v
++        align = 16
+         if mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+             hs_k, hs_v = hs_k // 2, hs_v // 2
++            align = 1
+         scale_bytes = get_dtype_size(torch.float32)
+-        content = (hs_k + hs_v) * get_dtype_size(spec.dtype) + 2 * scale_bytes
++        dtype_size = get_dtype_size(spec.dtype)
++        content = sum(
++            round_up(hs * dtype_size + scale_bytes, align) for hs in (hs_k, hs_v)
++        )
+         return replace(spec, state_content_bytes=content)
+ 
+     supported_dtypes: ClassVar[list[torch.dtype]] = [
+@@ -391,10 +397,10 @@ class TritonAttentionImpl(AttentionImpl):
+         """Extract per-head scale views from the padded content dimension.
+ 
+         The KV cache is packed as logical shape
+-        ``(num_blocks, nkv, block_size, 2 * (hs + pad))`` where
+-        ``pad = sizeof(float32) / sizeof(cache_dtype)``.  The content dim holds
++        ``(num_blocks, nkv, block_size, 2 * (hs + pad))``, ``pad`` set by
++        ``customize_spec``.  The content dim holds
+         ``[K(hs) | K_scale(pad) | V(hs) | V_scale(pad)]`` per (head, slot); the
+-        last ``pad`` elements of each half hold one float32 scale.  We create
++        first 4 bytes of each ``pad`` hold one float32 scale.  We create
+         strided float32 views over those bytes.  ``kv_cache`` must be the
+         packed logical tensor (call before any transpose), but may have HND or
+         NHD physical strides.
+@@ -403,13 +409,13 @@ class TritonAttentionImpl(AttentionImpl):
+         """
+         if self._k_scale_cache is not None:
+             return
+-        from vllm.utils.torch_utils import get_dtype_size
+ 
+         num_blocks, nkv, block_size, content = kv_cache.shape
+         dtype_sz = kv_cache.element_size()
+-        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # e.g. 4
+         padded_hs = content // 2
+-        hs = padded_hs - scale_pad
++        hs = self.head_size
++        if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
++            hs //= 2
+ 
+         raw = kv_cache.untyped_storage()
+         base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(

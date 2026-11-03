@@ -1,0 +1,223 @@
+From b4d0e19cdb02884d711a08b08d01e109ab091d4c Mon Sep 17 00:00:00 2001
+From: riceharvest <myappleiddarimaan@gmail.com>
+Date: Sat, 31 Oct 2026 22:58:20 +0000
+Subject: [PATCH 28/51] B70-V6x: riceharvest gdn_mixed_no_sync (default off,
+ B70_GDN_MIXED_NO_SYNC)
+
+riceharvest/vllm b70/v0.32 4cc29dd3ef patch_gdn_mixed_no_sync: in a mixed
+step (spec decodes + prefills), GDNAttentionMetadataBuilder.build() builds
+the spec / non-spec row indices and both query_start_loc cumsums on the host
+and sends them in one async H2D copy, instead of six host-mask gathers of
+device tensors (each a blocking index copy). The row indices travel in the
+metadata (b70_spec_rows / b70_non_spec_rows), so update_block_table() for
+the other GDN KV-cache groups gathers with them too. Same values.
+
+Hand-merged with #64479 (already in this trunk: supports_update_block_table
+on XPU, the xpu seq_lens assert in mamba_utils): the cherry-pick applies
+clean on top, and with #64479 the update_block_table() branch is the one the
+XPU path takes for the extra groups.
+
+B70-V6x change: rice's gate defaults on ("1", off with =0). Here it is
+opt-in, B70_GDN_MIXED_NO_SYNC=1; unset, build() and update_block_table() run
+the stock mask gathers (b70_* rows stay None). The cookbook marks it "not
+yet GPU-tested"; not GPU-tested here either.
+
+Generated from patches/b70/patch_gdn_mixed_no_sync.py of
+riceharvest/b70-qwen38-cookbook@9f7fa83.
+---
+ vllm/v1/attention/backends/gdn_attn.py | 129 +++++++++++++++++++------
+ 1 file changed, 101 insertions(+), 28 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 9898c88757..a7837bf1bd 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Backend for GatedDeltaNet attention."""
+ 
++import os
+ from dataclasses import dataclass, replace
+ from typing import Literal
+ 
+@@ -55,6 +56,10 @@ class GDNAttentionMetadata:
+ 
+     checkpoint: MambaPrefillCheckpointMetadata | None = None
+     has_initial_state: torch.Tensor | None = None
++    # B70_GDN_MIXED_NO_SYNC: device row indices of a mixed step's spec / non-spec
++    # rows, for update_block_table() of the other GDN KV-cache groups.
++    b70_spec_rows: torch.Tensor | None = None
++    b70_non_spec_rows: torch.Tensor | None = None
+ 
+     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
+     non_spec_query_start_loc: torch.Tensor | None = (
+@@ -285,6 +290,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+ 
+         uniform_spec_sequence_length = None
+         spec_sequence_masks_cpu: torch.Tensor | None = None
++        # B70_GDN_MIXED_NO_SYNC: device row indices of the spec / non-spec rows
++        # of a mixed step (None = use the host-mask gathers).
++        _b70_spec_rows: torch.Tensor | None = None
++        _b70_non_spec_rows: torch.Tensor | None = None
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+             spec_sequence_masks = None
+             num_spec_decodes = 0
+@@ -414,33 +423,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                 non_spec_token_indx = index[:num_non_spec_tokens]
+                 spec_token_indx = index[num_non_spec_tokens:]
+ 
+-                spec_state_indices_tensor = block_table_tensor[
+-                    spec_sequence_masks_cpu, : self.num_spec + 1
+-                ]
+-                non_spec_state_indices_tensor = block_table_tensor[
+-                    non_spec_sequence_masks_cpu, 0
+-                ]
+-
+-                spec_query_start_loc = torch.zeros(
+-                    num_spec_decodes + 1,
+-                    dtype=torch.int32,
+-                    device=query_start_loc.device,
+-                )
+-                torch.cumsum(
+-                    query_lens[spec_sequence_masks_cpu],
+-                    dim=0,
+-                    out=spec_query_start_loc[1:],
+-                )
+-                non_spec_query_start_loc = torch.zeros(
+-                    query_lens.size(0) - num_spec_decodes + 1,
+-                    dtype=torch.int32,
+-                    device=query_start_loc.device,
+-                )
+-                torch.cumsum(
+-                    query_lens[non_spec_sequence_masks_cpu],
+-                    dim=0,
+-                    out=non_spec_query_start_loc[1:],
+-                )
+                 non_spec_query_start_loc_cpu = torch.zeros(
+                     query_lens_cpu.size(0) - num_spec_decodes + 1,
+                     dtype=torch.int32,
+@@ -450,10 +432,85 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+                     dim=0,
+                     out=non_spec_query_start_loc_cpu[1:],
+                 )
++                if os.environ.get("B70_GDN_MIXED_NO_SYNC", "0") == "1":
++                    # B70_GDN_MIXED_NO_SYNC=1 (opt-in, default off; GPU-untested).
++                    # A host-mask gather of a device tensor
++                    # is a blocking H2D index copy (= full device sync). Build the
++                    # row indices and both cumsums on the host, one async copy.
++                    _b70_spec_qsl_cpu = torch.zeros(
++                        num_spec_decodes + 1, dtype=torch.int32
++                    )
++                    torch.cumsum(
++                        query_lens_cpu[spec_sequence_masks_cpu],
++                        dim=0,
++                        out=_b70_spec_qsl_cpu[1:],
++                    )
++                    _b70_num_non_spec_rows = query_lens_cpu.size(0) - num_spec_decodes
++                    _b70_packed = async_tensor_h2d(
++                        torch.cat(
++                            [
++                                spec_sequence_masks_cpu.nonzero().flatten().int(),
++                                non_spec_sequence_masks_cpu.nonzero().flatten().int(),
++                                _b70_spec_qsl_cpu,
++                                non_spec_query_start_loc_cpu,
++                            ]
++                        ),
++                        device=query_start_loc.device,
++                    )
++                    (
++                        _b70_spec_rows,
++                        _b70_non_spec_rows,
++                        spec_query_start_loc,
++                        non_spec_query_start_loc,
++                    ) = _b70_packed.split(
++                        [
++                            num_spec_decodes,
++                            _b70_num_non_spec_rows,
++                            num_spec_decodes + 1,
++                            _b70_num_non_spec_rows + 1,
++                        ]
++                    )
++                    spec_state_indices_tensor = block_table_tensor[
++                        :, : self.num_spec + 1
++                    ].index_select(0, _b70_spec_rows)
++                    non_spec_state_indices_tensor = block_table_tensor[
++                        :, 0
++                    ].index_select(0, _b70_non_spec_rows)
++                else:
++                    spec_state_indices_tensor = block_table_tensor[
++                        spec_sequence_masks_cpu, : self.num_spec + 1
++                    ]
++                    non_spec_state_indices_tensor = block_table_tensor[
++                        non_spec_sequence_masks_cpu, 0
++                    ]
++                    spec_query_start_loc = torch.zeros(
++                        num_spec_decodes + 1,
++                        dtype=torch.int32,
++                        device=query_start_loc.device,
++                    )
++                    torch.cumsum(
++                        query_lens[spec_sequence_masks_cpu],
++                        dim=0,
++                        out=spec_query_start_loc[1:],
++                    )
++                    non_spec_query_start_loc = torch.zeros(
++                        query_lens.size(0) - num_spec_decodes + 1,
++                        dtype=torch.int32,
++                        device=query_start_loc.device,
++                    )
++                    torch.cumsum(
++                        query_lens[non_spec_sequence_masks_cpu],
++                        dim=0,
++                        out=non_spec_query_start_loc[1:],
++                    )
+ 
+             assert num_accepted_tokens is not None
+             if num_prefills == 0 and num_decodes == 0:
+                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
++            elif _b70_spec_rows is not None:
++                num_accepted_tokens = num_accepted_tokens.index_select(
++                    0, _b70_spec_rows
++                )
+             else:
+                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+ 
+@@ -506,7 +563,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             context_lens_tensor = m.compute_num_computed_tokens()
+             has_initial_state = context_lens_tensor > 0
+             if spec_sequence_masks_cpu is not None:
+-                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
++                if _b70_non_spec_rows is not None:
++                    has_initial_state = has_initial_state.index_select(
++                        0, _b70_non_spec_rows
++                    )
++                else:
++                    has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+                 assert non_spec_query_start_loc_cpu is not None
+             nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                 compute_causal_conv1d_metadata(
+@@ -607,6 +669,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             num_actual_tokens=m.num_actual_tokens,
+             checkpoint=checkpoint,
+             has_initial_state=has_initial_state,
++            b70_spec_rows=_b70_spec_rows,
++            b70_non_spec_rows=_b70_non_spec_rows,
+             chunk_indices=chunk_indices,
+             chunk_offsets=chunk_offsets,
+             prefill_query_start_loc=prefill_query_start_loc,
+@@ -682,6 +746,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         elif m.num_prefills == 0:
+             # Same as build(): padded sequences trail the spec decodes.
+             spec_indices = blk_table[: m.num_spec_decodes, : self.num_spec + 1]
++        elif m.b70_spec_rows is not None and m.b70_non_spec_rows is not None:
++            # B70_GDN_MIXED_NO_SYNC: the device row indices build() sent, no
++            # host-mask gather (= blocking H2D index copy) per extra group.
++            spec_indices = blk_table[:, : self.num_spec + 1].index_select(
++                0, m.b70_spec_rows
++            )
++            non_spec_indices = prefill_indices = blk_table[:, 0].index_select(
++                0, m.b70_non_spec_rows
++            )
+         else:
+             spec_indices = blk_table[masks, : self.num_spec + 1]
+             non_spec_indices = prefill_indices = blk_table[~masks, 0]

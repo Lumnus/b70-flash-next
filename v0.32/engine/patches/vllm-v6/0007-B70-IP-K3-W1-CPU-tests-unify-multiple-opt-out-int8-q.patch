@@ -1,0 +1,93 @@
+From 81019c5865774f5360c68175513e0734a54f210a Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 14:24:13 +0000
+Subject: [PATCH 07/51] B70-IP-K3/W1: CPU tests (unify multiple, opt-out, int8
+ quantizer, selection regexes)
+
+---
+ tests/v1/core/test_b70_ip_k3_w1.py | 76 ++++++++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+ create mode 100644 tests/v1/core/test_b70_ip_k3_w1.py
+
+diff --git a/tests/v1/core/test_b70_ip_k3_w1.py b/tests/v1/core/test_b70_ip_k3_w1.py
+new file mode 100644
+index 0000000000..4035e82fa6
+--- /dev/null
++++ b/tests/v1/core/test_b70_ip_k3_w1.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-K3 (KV page unify by integer multiple) and B70-IP-W1 (dense int8), CPU."""
++
++import torch
++
++from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
++from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++
++def _spec(block, heads, hs=256, dtype=torch.bfloat16):
++    return FullAttentionSpec(block_size=block, num_kv_heads=heads, head_size=hs, dtype=dtype)
++
++
++def test_k3_non_divisible_takes_integer_multiple(monkeypatch):
++    monkeypatch.delenv("B70_KV_UNIFY_MULTIPLE", raising=False)
++    target = _spec(16, 2)
++    draft = _spec(16, 4)
++    # make the draft page 2.03x the target's: pad it a little
++    from dataclasses import replace
++
++    draft = replace(draft, page_size_padded=int(draft.page_size_bytes * 1.015))
++    out = unify_kv_cache_spec_page_size({"t": target, "d": draft})
++    t = out["t"]
++    assert t.page_size_bytes == draft.page_size_bytes
++    assert t.block_size == 32  # 2 x 16, not left at 16
++    assert t.unpadded_page_size_bytes == 2 * target.page_size_bytes
++
++
++def test_k3_opt_out_pads_only(monkeypatch):
++    monkeypatch.setenv("B70_KV_UNIFY_MULTIPLE", "0")
++    from dataclasses import replace
++
++    target = _spec(16, 2)
++    draft = replace(_spec(16, 4), page_size_padded=int(_spec(16, 4).page_size_bytes * 1.015))
++    out = unify_kv_cache_spec_page_size({"t": target, "d": draft})
++    assert out["t"].block_size == 16
++
++
++def test_k3_divisible_unchanged(monkeypatch):
++    monkeypatch.delenv("B70_KV_UNIFY_MULTIPLE", raising=False)
++    out = unify_kv_cache_spec_page_size({"t": _spec(16, 2), "d": _spec(16, 4)})
++    assert out["t"].block_size == 32 and out["t"].page_size_padded is None
++
++
++def test_w1_quantize_roundtrip():
++    from vllm.model_executor.layers.b70_dense_int8 import quantize_weight_int8
++
++    torch.manual_seed(0)
++    w = torch.randn(300, 513, dtype=torch.bfloat16)
++    q, s = quantize_weight_int8(w)
++    assert q.dtype == torch.int8 and s.shape == (300, 1)
++    assert q.abs().max() <= 127
++    deq = q.float() * s
++    rel = (deq - w.float()).norm() / w.float().norm()
++    assert rel < 0.01
++
++
++def test_w1_selection(monkeypatch):
++    import vllm.model_executor.layers.b70_dense_int8 as d
++
++    class L(torch.nn.Module):
++        def __init__(self, prefix, n=2048, k=2048):
++            super().__init__()
++            self.prefix = prefix
++            self.weight = torch.nn.Parameter(torch.zeros(n, k, dtype=torch.bfloat16), requires_grad=False)
++
++    monkeypatch.delenv("B70_DENSE_INT8_INCLUDE", raising=False)
++    monkeypatch.delenv("B70_DENSE_INT8_EXCLUDE", raising=False)
++    assert d._wanted(L("model.layers.3.self_attn.qkv_proj"))[0]
++    assert d._wanted(L("model.layers.3.mlp.shared_expert.down_proj"))[0]
++    assert not d._wanted(L("model.layers.3.mlp.gate"))[0]
++    assert not d._wanted(L("model.layers.3.linear_attn.in_proj_a"))[0]
++    assert not d._wanted(L("lm_head"))[0]
++    assert not d._wanted(L("model.layers.3.self_attn.qkv_proj", n=64, k=64))[0]
++    monkeypatch.setenv("B70_DENSE_INT8_INCLUDE", r"self_attn")
++    assert not d._wanted(L("model.layers.3.mlp.shared_expert.down_proj"))[0]

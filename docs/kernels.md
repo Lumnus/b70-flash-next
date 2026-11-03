@@ -1,13 +1,47 @@
 # Our vllm-xpu-kernels builds
 
-Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Four builds:
+Fork: [Lumnus/vllm-xpu-kernels](https://github.com/Lumnus/vllm-xpu-kernels). Five builds:
 
 | build | for | source | state |
 |---|---|---|---|
-| **`0.1.16.2` + five patches, + `libgdn_index64`** | torch 2.14, oneAPI 2026.1.1 (the current 0.32 line, b70.5; b70.4 had the first two patches) | upstream `6b30c9b` (the source of the PyPI 0.1.16.2 wheel) + [`v0.32/engine/patches/vllm-xpu-kernels/`](../v0.32/engine/patches/vllm-xpu-kernels/) (#660, #662, the native per-token int8 activation quantisation and oneDNN W8A8 GEMM ops with their precise-division flag, vllm-project/vllm-xpu-kernels#605); the same five as commits: branch [`b70/v0.1.16`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.16) @ `4473199c` (tree `49952057`, identical to `git am` of the patches); FlashAttention-2, MQA-logits and Xe3P off, oneDNN on; the attention libraries from the PyPI wheel; our `libgdn_index64.so` ([`v0.32/engine/patches/libgdn-index64/`](../v0.32/engine/patches/libgdn-index64/)) for the 64-bit GDN conv-state offset (#658 is merged upstream on main only); the astra Python modules from [`v0.32/engine/patches/vllm-xpu-kernels-py/`](../v0.32/engine/patches/vllm-xpu-kernels-py/) | **the current line's kernels**; recipe in [v0.32/README.md](../v0.32/README.md#build-and-run) steps 3–5 |
+| **`0.1.16.2+b70.6`, a whole wheel** | torch 2.14, oneAPI 2026.1.0 (the current 0.32 line, b70.6) | upstream `6b30c9b` + [`v0.32/engine/patches/vllm-xpu-kernels/`](../v0.32/engine/patches/vllm-xpu-kernels/), 15 commits (below); the same 15 as commits: branch [`b70/v0.1.16-b70.6`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.16-b70.6) (tree `d87547a135efb1fb2f1a5d4388af82dfeb708c79`, identical to `git am` of the patches); built with sycl-tla pull 859 ([`v0.32/engine/patches/sycl-tla/`](../v0.32/engine/patches/sycl-tla/)) for the fast fp16 + e4m3 KV path; FlashAttention-2, MQA-logits, oneDNN on, Xe3P off; installed whole, with its own attention libraries | **the current line's kernels**; recipe in [the engine page](../v0.32/README.md#build-and-run) step 3 |
+| `0.1.16.2` + five patches, + `libgdn_index64` (b70.5) | torch 2.14, oneAPI 2026.1.1 (b70.5; b70.4 had the first two patches) | upstream `6b30c9b` + the first five of the 15 patches above (#660, #662, the native per-token int8 activation quantisation and oneDNN W8A8 GEMM ops with their precise-division flag, vllm-project/vllm-xpu-kernels#605); the same five as commits: branch [`b70/v0.1.16`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.16) @ `4473199c` (tree `49952057`); FlashAttention-2, MQA-logits and Xe3P off, the eight compiled libraries laid over the PyPI wheel | the build behind the 27B and 35B numbers |
 | `release/0.1.15.4` + our PRs (retired in b70.4) | torch 2.14, oneAPI 2026.1.1 (the 0.32 line through b70.3) | upstream `release/0.1.15.4` (`ddf336d`) + vllm-xpu-kernels #660, #658, #662 from their pull refs, oneDNN on, plus wu1ff's Python hunks | served through b70.3; the replay, long-prefill and sparse-against-dense numbers of b70.1–b70.4 were taken on it |
 | **`0.1.14.1+b70.3`** | torch 2.13, oneAPI 2026.0 (the previous 0.30 line) | tag [`v0.1.14.1+b70.3`](https://github.com/Lumnus/vllm-xpu-kernels/tree/v0.1.14.1%2Bb70.3) on branch `b70/v0.1.14` = upstream tag `0.1.14.1` (`6d92b1bf`) + 7 commits | the 0.30 line's kernels (served 2026-10-03 to 2026-10-23); wheel attached to the [0.30.0-b70.2 release](https://github.com/Lumnus/b70-flash-next/releases/tag/v0.30.0-b70.2) |
 | `0.1.15.4+b70.1` | torch 2.14, oneAPI 2026.1 (the edge line) | [`b70/v0.1.15`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.15) @ `69b823f9` = upstream `release/0.1.15.4` + the 64-bit fix | ran on the edge line; not recommended ([known issues](../v0.30/docs/known-issues.md) item 5) |
+
+## 0.1.16.2+b70.6: the series
+
+[`v0.32/engine/patches/vllm-xpu-kernels/`](../v0.32/engine/patches/vllm-xpu-kernels/), one file per commit, 15 commits on upstream `6b30c9b`.
+`git am` of the 15 files on `6b30c9b` gives the tree of the branch above. The first five are b70.5's.
+
+| # | what | for |
+|---|---|---|
+| 1 | GDN: skip rows whose state index is `NULL_BLOCK_ID` (#660, merged upstream) | graph padding rows no longer write recurrent state into the shared null block |
+| 2 | `swap_blocks_batch`: `snapshot_src=False` (#662) | pinned host sources copy directly |
+| 3, 4 | native per-token int8 activation quantisation, oneDNN int8 W8A8 GEMM, precise fp32 division | INT8 execution |
+| 5 | grouped GEMM scale-prefetch pitch guard (#605, Guancheng Fu) | the 35B's expert shapes |
+| 6 | W4A8 grouped GEMM (s8 x s4 DPAS) | `B70_MOE_W4A8=2` |
+| 7 | GDN conv-state offsets in 64 bits (#658, merged upstream) | block ids above 5,042 |
+| 8 | spec-decode adaptive verification in FlashAttention (#647, Yan Ma, merged upstream) | verify batches with unequal query lengths |
+| 9, 10 | INT8 per-token-head KV for paged decode, and its tests (wiesion) | `int8_per_token_head` KV |
+| 11 | INT8 KV: head-size guard and a B70 check | |
+| 12, 13 | int4 GEMV for decode-sized grouped GEMMs, and its test (riceharvest) | MoE decode |
+| 14 | fast e4m3 to half KV conversion on Xe2 (riceharvest) | active only with sycl-tla #859 built in, fp16 Q and e4m3 K/V; the presets run bf16 Q, so it is inactive for them |
+| 15 | no fallback to the reference attention during graph capture | a missing kernel configuration raises at capture; the whole wheel compiles every configuration, including the TP2 row `16,256,64,false,false,false` |
+
+**Behaviour that changes without a flag.** (1) The int4 GEMV is on by default: int4 grouped GEMMs with 8 rows or fewer
+(`K % 512 == 0`, group size a multiple of 32, no bias) take `moe_int4_gemv`; `VLLM_XPU_FUSED_MOE_INT4_GEMV=0` turns it off.
+(2) The spec-decode fast path (#647) no longer requires a uniform query length. (3) #658 is on, with the same values where the
+32-bit product did not overflow. The Qwen3.8-27B and Qwen3.6-35B-A3B numbers were taken before these, so they do not apply to
+this build: see their pages.
+
+**Build.** `setup.py bdist_wheel --py-limited-api=cp38` with oneAPI DPC++/C++ 2026.1.0, gcc-toolset-13, Python 3.12,
+`VLLM_XPU_ENABLE_XE3P=OFF VLLM_XPU_ENABLE_ONEDNN=ON VLLM_XPU_XE2_AOT_DEVICES=bmg-g31-a0 VLLM_XPU_AOT_DEVICES=bmg-g31-a0
+VLLM_VERSION_OVERRIDE=0.1.16.2+b70.6`, `VLLM_CUTLASS_SRC_DIR` pointing at a sycl-tla `87f6850` checkout with the two #859 patches. A cold
+build took 5 h 27 min at 16 jobs and peaked near 120 GiB of RAM (1,360 compile calls); the wheel is about 205 MB. Without
+#859 the build succeeds and the fast conversion stays off. The native libraries of wu1ff stay where the engine page's step 5 puts
+them: they are not in the wheel.
 
 ## 0.1.14.1+b70.3: the series
 

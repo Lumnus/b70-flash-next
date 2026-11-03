@@ -1,0 +1,204 @@
+From 042dcebd1a07379e29857985ddb3adc155ed6b18 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 11:58:14 +0000
+Subject: [PATCH 48/51] B70-V2-MOE: accept the v7 wheel (W4A8 apply with the
+ fused gemm1 epilogue branch)
+
+v7 wheel: XpuFusedMoe._apply_kernel unchanged (32c13063d42ad5ae);
+b70_moe_w4a8.apply gained the B70_W4A8_FUSED_ACT load_glu_op branch (2bdb73e8f7e4f4b8). The
+cutlass replica now carries that branch (absent on v6, so v6 behaviour is unchanged) and both
+fingerprints are accepted. Tests run the replica against the v6 and v7 bodies, fused on/off.
+---
+ tests/kernels/test_b70_v2_kcut.py             | 56 +++++++++++----
+ .../layers/fused_moe/b70_moe_kcut.py          | 72 +++++++++++++------
+ 2 files changed, 95 insertions(+), 33 deletions(-)
+
+diff --git a/tests/kernels/test_b70_v2_kcut.py b/tests/kernels/test_b70_v2_kcut.py
+index 71a605dc9c..d2ad0ead90 100644
+--- a/tests/kernels/test_b70_v2_kcut.py
++++ b/tests/kernels/test_b70_v2_kcut.py
+@@ -23,6 +23,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
+ 
+ os.environ.setdefault("TRITON_INTERPRET", "1")
+ WHEEL = os.environ.get("B70_V2_WHEEL_DIR", "")
++# Several wheel copies (e.g. v6:v7) for the W4A8 replica; defaults to WHEEL.
++WHEELS = [w for w in os.environ.get("B70_V2_WHEEL_DIRS", WHEEL).split(":") if w]
+ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+ 
+@@ -195,7 +197,7 @@ def _wheel_fn(path, qual, glb):
+     code = textwrap.dedent("\n".join(lines))
+     assert (
+         kcut.fingerprint_node(ast.parse(code).body[0])
+-        == kcut._FP[
++        in kcut._FP[
+             "XpuFusedMoe._apply_kernel"
+             if "XpuFusedMoe" in qual
+             else "b70_moe_w4a8.apply"
+@@ -303,26 +305,54 @@ def _quant_rows(x):
+     return torch.round(xf / s).clamp_(-128, 127).to(torch.int8), s
+ 
+ 
+-@needs_wheel
++def _glu_ref(A, A_scale, B, B_scale, bias, aq, asc, rows_per_expert, inter, K, E):
++    """CPU stand-in for cutlass_grouped_gemm_w4a8_silu_quant (shared by both sides)."""
++    g = grouped_ref(A, B, rows_per_expert, torch.float32, a_scale=A_scale)
++    act = (torch.nn.functional.silu(g[:, :inter]) * g[:, inter:]).view(
++        -1, inter // 128, 128
++    )
++    sc = (act.abs().amax(dim=-1) / 127.0).clamp_min(1e-10)
++    aq.copy_(
++        torch.round(act / sc[..., None])
++        .clamp_(-128, 127)
++        .view(-1, inter)
++        .to(torch.int8)
++    )
++    asc.copy_(sc)
++
++
++@pytest.mark.skipif(not WHEELS, reason="B70_V2_WHEEL_DIR(S) not set")
++@pytest.mark.parametrize("wheel", WHEELS)
++@pytest.mark.parametrize("fused", [False, True])
+ @pytest.mark.parametrize("T", [1, 8, 64])
+-def test_w4a8_cutlass_replica_bitwise(T):
++def test_w4a8_cutlass_replica_bitwise(T, fused, wheel):
+     ref = RefOps()
+     _install_ops(ref)
+ 
+     def op(A, A_scale, B, B_scale, bias, D, rows_per_expert, N, K, E):
+         D.copy_(grouped_ref(A, B, rows_per_expert, D.dtype, a_scale=A_scale))
+ 
++    path = os.path.join(wheel, "b70_moe_w4a8.py")
++    with open(path) as f:
++        has_glu = "def load_glu_op" in f.read()
++    glb = {
++        "torch": torch,
++        "load_op": lambda: op,
++        "quant_rows": _quant_rows,
++        "Optional": __import__("typing").Optional,
++    }
+     mod = types.SimpleNamespace(load_op=lambda: op, quant_rows=_quant_rows)
+-    stock = _wheel_fn(
+-        os.path.join(WHEEL, "b70_moe_w4a8.py"),
+-        "apply",
+-        {
+-            "torch": torch,
+-            "load_op": mod.load_op,
+-            "quant_rows": _quant_rows,
+-            "Optional": __import__("typing").Optional,
+-        },
+-    )
++    if has_glu:
++        glb.update(
++            load_glu_op=lambda: _glu_ref,
++            fused_act_enabled=lambda: fused,
++            _LOGGED_FUSED=False,
++        )
++        mod.load_glu_op, mod.fused_act_enabled = (lambda: _glu_ref), (lambda: fused)
++        mod._LOGGED_FUSED = False
++    elif fused:
++        pytest.skip("this wheel has no fused gemm1 epilogue")
++    stock = _wheel_fn(path, "apply", glb)
+     impl = FakeImpl(rank=2, seed=T)
+     hs, ids, w, sentinel = _routing(T, impl, seed=T, nan_rows=(0,) if T > 1 else ())
+     ids_s = torch.where(ids < 0, sentinel, ids)
+diff --git a/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py b/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
+index f6d738106d..2a397a6c71 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
++++ b/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
+@@ -40,8 +40,9 @@ logger = init_logger(__name__)
+ # AST fingerprints of the wheel functions the replicas were copied from
+ # (the v6 vllm_xpu_kernels wheel).
+ _FP = {
+-    "XpuFusedMoe._apply_kernel": "32c13063d42ad5ae",
+-    "b70_moe_w4a8.apply": "8e77c64b832b5251",
++    "XpuFusedMoe._apply_kernel": {"32c13063d42ad5ae"},  # v6, v7 (unchanged)
++    # v6; v7 (adds the B70_W4A8_FUSED_ACT branch)
++    "b70_moe_w4a8.apply": {"8e77c64b832b5251", "2bdb73e8f7e4f4b8"},
+ }
+ 
+ _ENABLED = os.environ.get("B70_MOE_KCUT", "0") == "1"
+@@ -79,11 +80,11 @@ def _armed(key: str, func) -> bool:
+             got = fingerprint(func)
+         except (OSError, TypeError, SyntaxError) as e:
+             got = f"unreadable ({e})"
+-        ok = got == _FP[key]
++        ok = got in _FP[key]
+         _FP_OK[key] = ok
+         if not ok:
+             logger.warning(
+-                "B70-V2-MOE: %s fingerprint %s != %s (wheel changed); "
++                "B70-V2-MOE: %s fingerprint %s not in %s (wheel changed); "
+                 "the wheel's own function runs",
+                 key,
+                 got,
+@@ -319,22 +320,53 @@ def apply_w4a8_cutlass(
+         local_experts_num=impl.local_experts_num,
+     )
+ 
+-    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
+-    op(
+-        remapped.view(torch.int8),
+-        remapped_sc,
+-        impl.w13,
+-        impl.gemm1_wei_scales,
+-        impl.w13_bias,
+-        g1,
+-        rows_per_expert,
+-        2 * inter,
+-        hidden,
+-        impl.num_experts,
+-    )
+-    act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
+-    impl.act_func(act, g1)
+-    aq, asc = mod.quant_rows(act)
++    # v7: optional fused gemm1 epilogue (silu*up -> int8); v6 has no load_glu_op.
++    glu = None
++    if hasattr(mod, "load_glu_op") and mod.fused_act_enabled() and inter % 128 == 0:
++        glu = mod.load_glu_op()
++    if glu is not None:
++        if not getattr(mod, "_LOGGED_FUSED", True):
++            mod._LOGGED_FUSED = True
++            import logging
++
++            logging.getLogger("vllm_xpu_kernels").warning(
++                "B70-K1: W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
++                "per-row x 128-col scales; inter=%d)",
++                inter,
++            )
++        aq = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
++        asc = torch.empty((n_moe, inter // 128), dtype=torch.float32, device=dev)
++        glu(
++            remapped.view(torch.int8),
++            remapped_sc,
++            impl.w13,
++            impl.gemm1_wei_scales,
++            impl.w13_bias,
++            aq,
++            asc,
++            rows_per_expert,
++            inter,
++            hidden,
++            impl.num_experts,
++        )
++    else:
++        g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
++        op(
++            remapped.view(torch.int8),
++            remapped_sc,
++            impl.w13,
++            impl.gemm1_wei_scales,
++            impl.w13_bias,
++            g1,
++            rows_per_expert,
++            2 * inter,
++            hidden,
++            impl.num_experts,
++        )
++        act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
++        impl.act_func(act, g1)
++        aq, asc = mod.quant_rows(act)
++
+     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
+     op(
+         aq,

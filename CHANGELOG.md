@@ -6,6 +6,29 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
+## 0.32.0-b70.6 — 2026-11-03: INT8 execution and INT8 KV on Qwen3.8-Flash-Next, six presets
+
+- **Engine: fork tag `v0.32.0-b70.6`**, b70.5's engine + 51 commits in the new `v0.32/engine/patches/vllm-v6/`: INT8 execution
+  (dense linears, lm_head, W4A8 routed experts, drafter), INT8 KV on FlashAttention and on the QSA kernels, the INT8 PLE table
+  in host RAM with the gather on the device in the graph, the kernel cuts (one MoE kernel for the EP sentinel, in-place
+  all-reduce, `hc_silu` fold), top-k-first sampling and verification, and picks of vllm-project/vllm#62113, #63421, #63819,
+  #62244 and #59260. Every lever is off unless a preset sets it, except `B70_PTH_PAD16`, `B70_PTH_TD_GUARD`,
+  `B70_KV_UNIFY_MULTIPLE` and `B70_PTH_FA_PREFILL` ([switches](docs/switches.md)). `check-series.sh --all` and
+  `check-trunk-tree.sh` cover five directories; `--no-v6` checks b70.5's four.
+- **Kernels: 15 commits** on vllm-xpu-kernels `6b30c9b` (b70.5's five, W4A8 grouped GEMM, #658 and #647, INT8 per-token-head KV,
+  int4 GEMV, fast e4m3 conversion, no fallback during graph capture), built and installed as a whole wheel; branch
+  `b70/v0.1.16-b70.6`. The fast fp16 + e4m3 path needs the two sycl-tla #859 patches in `v0.32/engine/patches/sycl-tla/`.
+  The int4 GEMV and the #647 spec-decode path are on by default ([kernels](docs/kernels.md)).
+- **Presets:** D8-6, D16e-6, S8-6 and S16e-6 on 4 cards, D8-6 and S8-6 on 2 cards, all with INT8 KV. They replace
+  `preset-4card` and `preset-2card`; the old presets and numbers are in
+  [earlier builds](docs/measurements/flash-next-earlier-builds.md). D8-6 on 4 cards: 124 / 303 tok/s at one stream (prose / code),
+  671 / 1,756 at 12 streams.
+- **Qwen3.8-27B and Qwen3.6-35B-A3B:** presets and numbers unchanged, measured on b70.5 and not re-measured on the new kernels.
+- **Layout.** The engine page moved to [docs/engine-details.md](docs/engine-details.md) (patch by patch), `v0.32/README.md` is now
+  the short engine page with the build, `RELEASE-NOTES-b70.5.md` moved to [docs/releases/b70.5.md](docs/releases/b70.5.md),
+  credits and upstream status to [docs/credits.md](docs/credits.md) and [docs/upstream.md](docs/upstream.md).
+- Release notes: [RELEASE-NOTES-b70.6.md](RELEASE-NOTES-b70.6.md).
+
 ## 0.32.0-b70.5 — 2026-10-31: sparse attention on B70 for Qwen3.8-Flash-Next, three models on one engine; the GDN backstep off in every preset
 
 - **Fix: `B70_OFFLOAD_GDN_BACKSTEP=0` in every preset.** b70.4's two presets (and the 0.30 engine files `s16-kv128-mtp3`,
@@ -57,7 +80,7 @@ Nothing yet.
   engine page and three model pages carry the details. New `docs/lessons-learned.md` (what works, what does not, tuning and
   testing advice) replaces the known-issues lists; the 0.30 line is listed as the previous line. `docs/switches.md` lists the new switches. Paths in the older entries below name the
   layout of their release.
-- Release notes: [RELEASE-NOTES-b70.5.md](RELEASE-NOTES-b70.5.md).
+- Release notes: [docs/releases/b70.5.md](docs/releases/b70.5.md).
 
 ## 0.32.0-b70.4 — 2026-10-26: one engine, one environment, two presets; sparse attention and hot/cold in the engine; kernels 0.1.16.2 with our PRs
 
@@ -78,7 +101,7 @@ One release (no intermediate b70.4 builds were published).
   rank, 64 GiB KV tier): 58.2 / 69.4 / 109.2 tok/s and GPU KV 273,169, measured at a 16 GiB tier (154.9 GiB host RAM left free; about 107 GiB expected at 64). They replace `serve.args`,
   `serve.env`, `serve-plugin.env`, `qsa-serve.args` and `qsa-serve.env`. Attention, cards, drafter, expert offload, KV offload
   size, slots, GPU memory, oneCCL plugin and two opt-outs are tabulated with their defaults and what each was measured at in
-  [v0.32/models/qwen38-flash-next/meta.md](v0.32/models/qwen38-flash-next/meta.md#parameters).
+  [docs/measurements/flash-next-earlier-builds.md](docs/measurements/flash-next-earlier-builds.md#parameters).
 - **Dense base: 50 patches.** 0001–0049 are the b70.1 series, unchanged in content (headers read `n/50`); **0050** backports
   vllm-project/vllm#54163 (merged upstream 2026-10-23): DFlash and DSpark no longer drop the trailing prefix-cache block, so
   `disable_eagle_block_drop` is no longer set (b70.1–b70.3 set it; agent-session replay 232 s against 266 s, dense, 8 slots).
@@ -185,7 +208,7 @@ The sparse variant:
 - **Status.** Working, experimental, slower than dense on multi-stream. Not run for days, no task-level comparison with
   dense. Not shipped: the engine-definition and card-sweep scripts we drove the measurements
   with (they run on our own host).
-- `v0.32/README.md`: the "in preparation" placeholder is now the section [Sparse attention (QSA)](v0.32/models/qwen38-flash-next/meta.md#sparse-attention-qsa)
+- `v0.32/README.md`: the "in preparation" placeholder is now the section [Sparse attention (QSA)](docs/measurements/flash-next-earlier-builds.md#sparse-attention-qsa)
   (anchor renamed from `#sparse-attention-qsa-in-preparation`).
 
 ## Repository changes — 2026-10-25: attribution and scope of the headline numbers and gates

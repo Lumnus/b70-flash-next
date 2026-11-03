@@ -1,0 +1,259 @@
+From 6001f71d7e3175dc0aece694d79333f792b9dcdd Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 14:24:13 +0000
+Subject: [PATCH 05/51] B70-IP-W1: BF16 dense linears as W8A8 int8 on XPU
+ (B70_DENSE_INT8=1)
+
+Opt-in. After loading, unquantized linears passing include/exclude regexes are
+quantized RTN int8 per output channel; activations int8 per token (native op);
+the GEMM is one opaque custom op (torch.ops.vllm.b70_int8_dense_mm): Triton
+int8 for M<=64 (decode), oneDNN int8_scaled_mm above (prefill). B70 graph-replay
+microbench, rotating weights: 1.5-2.0x faster than BF16 at M=1..4096, ~1.2% rel
+err per GEMM. Routers, GDN a/b, indexers, heads, embeddings, HC k-split layers
+stay BF16 by default. One summary log line.
+---
+ vllm/model_executor/layers/b70_dense_int8.py | 202 +++++++++++++++++++
+ vllm/model_executor/layers/linear.py         |   4 +
+ vllm/model_executor/model_loader/utils.py    |   5 +
+ 3 files changed, 211 insertions(+)
+ create mode 100644 vllm/model_executor/layers/b70_dense_int8.py
+
+diff --git a/vllm/model_executor/layers/b70_dense_int8.py b/vllm/model_executor/layers/b70_dense_int8.py
+new file mode 100644
+index 0000000000..70fe5d4aec
+--- /dev/null
++++ b/vllm/model_executor/layers/b70_dense_int8.py
+@@ -0,0 +1,202 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-IP-W1: BF16 dense linears as W8A8 INT8 on XPU (opt-in, B70_DENSE_INT8=1).
++
++Intel Xe2 XMX runs INT8 natively; BF16 linears read 2 bytes per weight in
++decode and run BF16 DPAS in prefill. With B70_DENSE_INT8=1, every unquantized
++linear whose prefix passes the include/exclude regexes is quantized once after
++loading: weights int8 symmetric per output channel (RTN), activations int8
++symmetric per token (dynamic, native SYCL op), GEMM on XMX. Measured on one
++B70 under graph replay with rotating weights (no L2 reuse): 1.5-2.0x faster
++than BF16 at M=1..4096, relative error ~1.2 % per GEMM.
++
++Kernel by M (rows): Triton int8 up to B70_DENSE_INT8_TRITON_MAX_M (default 64,
++decode; it wins there), oneDNN ``_xpu_C.int8_scaled_mm`` above (prefill; it
++wins at M >= 2048). Missing oneDNN op -> Triton everywhere.
++
++Env:
++  B70_DENSE_INT8=1                    turn it on (XPU only)
++  B70_DENSE_INT8_INCLUDE=<regex>      prefixes to convert (default: all)
++  B70_DENSE_INT8_EXCLUDE=<regex>      prefixes to keep BF16 (default below)
++  B70_DENSE_INT8_MIN_PARAMS=<n>       skip smaller weights (default 1<<20)
++  B70_DENSE_INT8_TRITON_MAX_M=<n>     Triton for M <= n (default 64)
++"""
++
++import os
++import re
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import LinearMethodBase
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++# Routers, the GDN a/b projections, the sparse-attention indexer, heads,
++# embeddings and vision stay BF16 by default: small, precision-sensitive, or
++# owned by another path (B70_HEAD_FP8).
++DEFAULT_EXCLUDE = (
++    r"(lm_head|embed|visual|vision|indexer|in_proj_a\b|in_proj_b\b|in_proj_ba\b"
++    r"|\.gate$|shared_expert_gate|router|\.ple)"
++)
++
++_stats = {"layers": 0, "bytes_saved": 0, "skipped": 0}
++_logged_first = False
++
++
++def _enabled() -> bool:
++    return os.environ.get("B70_DENSE_INT8", "0") == "1" and current_platform.is_xpu()
++
++
++def _wanted(layer: torch.nn.Module) -> tuple[bool, str]:
++    prefix = getattr(layer, "prefix", "") or ""
++    inc = os.environ.get("B70_DENSE_INT8_INCLUDE", "")
++    exc = os.environ.get("B70_DENSE_INT8_EXCLUDE", DEFAULT_EXCLUDE)
++    if inc and not re.search(inc, prefix):
++        return False, "not included"
++    if exc and re.search(exc, prefix):
++        return False, "excluded"
++    if getattr(layer, "hc_ksplit_prepare", None) is not None:
++        return False, "hyper-connection k-split layer"
++    w = getattr(layer, "weight", None)
++    if not isinstance(w, torch.Tensor) or w.dim() != 2:
++        return False, "no 2-D weight"
++    if w.dtype not in (torch.bfloat16, torch.float16):
++        return False, f"weight dtype {w.dtype}"
++    if w.numel() < int(os.environ.get("B70_DENSE_INT8_MIN_PARAMS", str(1 << 20))):
++        return False, "small"
++    return True, ""
++
++
++def quantize_weight_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """[N, K] float -> (int8 [N, K], fp32 scale [N, 1]); symmetric per row, RTN.
++
++    Chunked over rows so the fp32 temporary stays small for big weights.
++    """
++    n = w.shape[0]
++    q = torch.empty_like(w, dtype=torch.int8)
++    s = torch.empty((n, 1), dtype=torch.float32, device=w.device)
++    step = max(1, (64 << 20) // max(1, w.shape[1] * 4))
++    for i in range(0, n, step):
++        blk = w[i : i + step].float()
++        sc = (blk.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
++        q[i : i + step] = torch.round(blk / sc).clamp(-127, 127).to(torch.int8)
++        s[i : i + step] = sc
++    return q, s
++
++
++class B70Int8DenseMethod(LinearMethodBase):
++    """Replaces UnquantizedLinearMethod for one converted layer.
++
++    Deliberately not an UnquantizedLinearMethod: code that fuses or reads
++    BF16 weights directly when a layer is unquantized must take its
++    quantized fallback here.
++    """
++
++    def __init__(self, triton_max_m: int, has_onednn: bool):
++        self.triton_max_m = triton_max_m
++        self.has_onednn = has_onednn
++
++    def create_weights(self, *args, **kwargs):
++        raise RuntimeError("B70Int8DenseMethod is installed after loading")
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        return None
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        x_2d = x.reshape(-1, x.shape[-1])
++        out = torch.ops.vllm.b70_int8_dense_mm(
++            x_2d, layer.weight, layer.b70_int8_scale, bias, self.triton_max_m
++        )
++        return out.view(*x.shape[:-1], layer.weight.shape[0])
++
++
++def _b70_int8_dense_mm(
++    x: torch.Tensor,
++    w_q: torch.Tensor,
++    w_s: torch.Tensor,
++    bias: torch.Tensor | None,
++    triton_max_m: int,
++) -> torch.Tensor:
++    """One opaque op for torch.compile: native act quant + the int8 GEMM by M."""
++    from vllm import _custom_ops as ops
++
++    x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), None, None, True)
++    if x.shape[0] > triton_max_m and hasattr(torch.ops._xpu_C, "int8_scaled_mm"):
++        return torch.ops._xpu_C.int8_scaled_mm(
++            x_q, x_s.reshape(-1).to(torch.float32), w_q.t(), w_s.reshape(-1),
++            x.dtype, bias,
++        )
++    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
++        triton_scaled_mm,
++    )
++
++    return triton_scaled_mm(x_q, w_q.t(), x_s, w_s, x.dtype, bias)
++
++
++def _b70_int8_dense_mm_fake(
++    x: torch.Tensor,
++    w_q: torch.Tensor,
++    w_s: torch.Tensor,
++    bias: torch.Tensor | None,
++    triton_max_m: int,
++) -> torch.Tensor:
++    return torch.empty((x.shape[0], w_q.shape[0]), dtype=x.dtype, device=x.device)
++
++
++direct_register_custom_op(
++    "b70_int8_dense_mm",
++    _b70_int8_dense_mm,
++    fake_impl=_b70_int8_dense_mm_fake,
++)
++
++
++def maybe_convert(layer: torch.nn.Module) -> bool:
++    """Called from UnquantizedLinearMethod.process_weights_after_loading on XPU."""
++    global _logged_first
++    if not _enabled():
++        return False
++    ok, why = _wanted(layer)
++    if not ok:
++        _stats["skipped"] += 1
++        logger.debug("B70 dense int8: keep %s BF16 (%s)", getattr(layer, "prefix", "?"), why)
++        return False
++    w = layer.weight.data
++    q, s = quantize_weight_int8(w)
++    saved = w.numel() * w.element_size() - q.numel() - s.numel() * 4
++    layer.weight = torch.nn.Parameter(q, requires_grad=False)
++    layer.b70_int8_scale = s
++    del w
++    has_onednn = hasattr(torch.ops._xpu_C, "int8_scaled_mm")
++    tmax = int(os.environ.get("B70_DENSE_INT8_TRITON_MAX_M", "64"))
++    layer.quant_method = B70Int8DenseMethod(tmax, has_onednn)
++    _stats["layers"] += 1
++    _stats["bytes_saved"] += saved
++    if not _logged_first:
++        _logged_first = True
++        logger.info(
++            "B70-IP-W1 dense int8: BF16 linears -> W8A8 int8 (Triton M<=%d, %s above); "
++            "first: %s %s",
++            tmax,
++            "oneDNN" if has_onednn else "Triton",
++            getattr(layer, "prefix", "?"),
++            tuple(q.shape),
++        )
++    return True
++
++
++def report() -> None:
++    if _enabled():
++        logger.info(
++            "B70-IP-W1 dense int8: %d layers converted, %d kept BF16, %.2f GiB saved",
++            _stats["layers"],
++            _stats["skipped"],
++            _stats["bytes_saved"] / 2**30,
++        )
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 521f41752f..57e7fbbeaa 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -228,6 +228,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
+                 and weight.stride(0) != 1
+             ):
+                 layer.weight.data = weight.t().contiguous().t()
++            # B70-IP-W1: opt-in W8A8 int8 for BF16 dense linears (B70_DENSE_INT8=1).
++            from vllm.model_executor.layers.b70_dense_int8 import maybe_convert
++
++            maybe_convert(layer)
+ 
+     def apply(
+         self,
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 65d1ff2808..184c534de2 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -208,6 +208,11 @@ def process_weights_after_loading(
+     if model_config.quantization == "torchao":
+         set_torchao_reload_attrs(model, model_config)
+ 
++    # B70-IP-W1: one summary line when B70_DENSE_INT8=1.
++    from vllm.model_executor.layers.b70_dense_int8 import report as _b70_int8_report
++
++    _b70_int8_report()
++
+ 
+ @contextmanager
+ def device_loading_context(module: torch.nn.Module, target_device: torch.device):

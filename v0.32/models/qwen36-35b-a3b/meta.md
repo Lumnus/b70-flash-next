@@ -5,6 +5,8 @@ from Intel's mixed INT4 AutoRound checkpoint: the linears of attention, GDN and 
 oneDNN, the routed experts as int4 W4A16 through the XPU grouped GEMM. DFlash speculative decoding with 7 draft tokens. Two
 presets: one card (196,608-token context) and two cards (the full 262,144, 16 slots).
 
+Last measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`, which remain the reference for these numbers. On the current whole-wheel kernels decode takes a different path (int4 GEMV, spec-decode changes, per [kernels](../../../docs/kernels.md)), and has not been re-measured.
+
 | | |
 |---|---|
 | weights | `Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound` @ `65f69c73f17488236c85c85211f6ba28d7106157`; file list with object ids: [`weights.oid`](weights.oid) |

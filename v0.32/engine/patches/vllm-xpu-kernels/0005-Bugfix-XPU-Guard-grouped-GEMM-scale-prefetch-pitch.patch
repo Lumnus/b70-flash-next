@@ -1,18 +1,14 @@
 From 4473199ca0ad255654570f3f03d4e20df74c24a3 Mon Sep 17 00:00:00 2001
 From: Guancheng Fu <110874468+gc-fu@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 01:16:32 +0000
-Subject: [PATCH 5/5] [Bugfix][XPU] Guard grouped GEMM scale prefetch pitch
+Subject: [PATCH 05/15] [Bugfix][XPU] Guard grouped GEMM scale prefetch pitch
 
 Upstream: vllm-project/vllm-xpu-kernels#605 (commit 56b403b466)
 
 Signed-off-by: Guancheng Fu <110874468+gc-fu@users.noreply.github.com>
----
- csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp | 66 +++++++++--------
- tests/fused_moe/test_grouped_gemm.py    | 94 +++++++++++++++++++++++++
- 2 files changed, 132 insertions(+), 28 deletions(-)
 
 diff --git a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
-index 4c4ba52ebb..0ac9c06f56 100644
+index 4c4ba52..0ac9c06 100644
 --- a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
 +++ b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
 @@ -356,6 +356,12 @@ CUTE_DEVICE void xe_gemm_4bits(
@@ -103,7 +99,7 @@ index 4c4ba52ebb..0ac9c06f56 100644
        }
      }
 diff --git a/tests/fused_moe/test_grouped_gemm.py b/tests/fused_moe/test_grouped_gemm.py
-index 1b58950176..be99a94273 100644
+index 1b58950..be99a94 100644
 --- a/tests/fused_moe/test_grouped_gemm.py
 +++ b/tests/fused_moe/test_grouped_gemm.py
 @@ -444,6 +444,100 @@ def test_xe_grouped_gemm_mxfp4(m, n, k, e, topk, dtype, has_bias):
@@ -207,3 +203,6 @@ index 1b58950176..be99a94273 100644
  def dequantize_mxfp8_wei_kn(wei, wei_scale, group_size=32):
      """Dequant MXFP8 weight [K, N] with scales [K/group, N] (E8M0 bits)."""
      scale_f = wei_scale.view(torch.float8_e8m0fnu).to(torch.float32)
+-- 
+2.43.0
+

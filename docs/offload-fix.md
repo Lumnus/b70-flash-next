@@ -1,5 +1,9 @@
 # The hybrid-model KV-offload miss, and patches 0014a–f
 
+The study behind the offload patches, written against vLLM v0.30.0; the 0.32 engine carries them as ports (the dense base, with
+vllm-project/vllm#63566 in place of 0014b). Every 0.32 preset sets `B70_OFFLOAD_GDN_BACKSTEP=0`: the 0014c row below was measured
+with the backstep on, which is no longer a recommended setting ([lessons learned](lessons-learned.md)).
+
 ## Symptom
 
 A long document is sent with question A, other traffic pushes it out of the GPU prefix cache, then the same document

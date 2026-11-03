@@ -1,0 +1,387 @@
+From 93b54344c4b85603322df74bc06416c0897c0375 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:20 +0000
+Subject: [PATCH 37/51] B70-V7-K4F: int8 KV prefill dequant without host reads
+ (B70_PTH_FA_PREFILL_FAST=1)
+
+K4 dequantised each sequence's blocks in a Python loop of 4-block slices per
+layer after seq_lens/query_start_loc .tolist() (D2H syncs), then built the
+remapped block table on the host. The builders now attach the scheduler's
+host copies (query_start_loc_cpu, seq_lens_cpu_upper_bound) and K4F groups
+from those, builds the scratch block table on the device with a uniform
+per-group stride, and dequantises K and V of every referenced block in one
+Triton launch per group. Same bytes as _dequant_blocks (bf16 roundings done
+on the integer bits, RTNE); FA output equal to the stock loop. Falls back to
+the loop with a log line when the host copies are missing.
+---
+ vllm/v1/attention/backends/b70_pth_fa.py  | 313 ++++++++++++++++++++++
+ vllm/v1/attention/backends/flash_attn.py  |   3 +
+ vllm/v1/attention/backends/triton_attn.py |   3 +
+ 3 files changed, 319 insertions(+)
+
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index eb64a1c34f..7027ceb121 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -38,6 +38,7 @@ import torch
+ 
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
+ 
+ logger = init_logger(__name__)
+ 
+@@ -110,6 +111,301 @@ def _dequant_fp8_blocks(src, scale, ids, dst, chunk=4):
+         dst[i : i + sel.numel()] = src[sel].to(dst.dtype) * sc
+ 
+ 
++# ---------------------------------------------------------------------------
++# B70-V7-K4F (B70_PTH_FA_PREFILL_FAST=1): the K4 dequant without host reads
++# ---------------------------------------------------------------------------
++_k4f_logged = False
++_k4f_fallback_logged = False
++
++
++def k4_fast_enabled() -> bool:
++    return os.environ.get("B70_PTH_FA_PREFILL_FAST", "0") == "1"
++
++
++def attach_host_lens(attn_metadata, common_attn_metadata) -> None:
++    """Builders call this so the K4F grouping reads host copies the scheduler
++    already has (query_start_loc_cpu exact; seq_lens_cpu_upper_bound, exact
++    for prefill rows and an upper bound for spec-decode rows) instead of
++    ``.tolist()`` on device tensors."""
++    if not k4_fast_enabled():
++        return
++    attn_metadata._b70_qsl_cpu = getattr(
++        common_attn_metadata, "query_start_loc_cpu", None
++    )
++    attn_metadata._b70_seq_lens_ub_cpu = getattr(
++        common_attn_metadata, "seq_lens_cpu_upper_bound", None
++    )
++
++
++@triton.jit
++def _rtne_bf16(x):
++    # fp32 -> bf16 bits, round to nearest even (torch's rounding for finite
++    # values), done on the integer bits so every backend rounds alike.
++    u = x.to(tl.uint32, bitcast=True)
++    u = u + 0x7FFF + ((u >> 16) & 1)
++    return u >> 16
++
++
++@triton.jit
++def _k4f_dequant(
++    k_ptr,
++    v_ptr,
++    ks_ptr,
++    vs_ptr,
++    bt_ptr,
++    sl_ptr,
++    ok_ptr,
++    ov_ptr,
++    s_kb,
++    s_kn,
++    s_kh,
++    s_vb,
++    s_vn,
++    s_vh,
++    s_ksb,
++    s_ksn,
++    s_ksh,
++    s_vsb,
++    s_vsn,
++    s_vsh,
++    s_bt,
++    stride_blocks,
++    BS: tl.constexpr,
++    NKV: tl.constexpr,
++    HS: tl.constexpr,
++    TOK: tl.constexpr,
++    NKV_P2: tl.constexpr,
++    HS_P2: tl.constexpr,
++    OUT_BF16: tl.constexpr,
++):
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    t = tl.program_id(2)
++    L = tl.load(sl_ptr + r)
++    nblk = (L + BS - 1) // BS
++    if c >= nblk:
++        return
++    src = tl.load(bt_ptr + r * s_bt + c).to(tl.int64)
++    dst = (r * stride_blocks + c).to(tl.int64)
++    tok = t * TOK + tl.arange(0, TOK)
++    h = tl.arange(0, NKV_P2)
++    d = tl.arange(0, HS_P2)
++    m_t = tok < BS
++    m3 = m_t[:, None, None] & (h < NKV)[None, :, None] & (d < HS)[None, None, :]
++    m2 = m_t[:, None] & (h < NKV)[None, :]
++    out_dt = ok_ptr.dtype.element_ty
++    o_off = (
++        (dst * BS + tok)[:, None, None] * (NKV * HS)
++        + h[None, :, None] * HS
++        + d[None, None, :]
++    )
++    # K
++    a = tl.load(
++        k_ptr
++        + src * s_kb
++        + tok[:, None, None] * s_kn
++        + h[None, :, None] * s_kh
++        + d[None, None, :],
++        mask=m3,
++        other=0,
++    )
++    sc = tl.load(
++        ks_ptr + src * s_ksb + tok[:, None] * s_ksn + h[None, :] * s_ksh,
++        mask=m2,
++        other=0.0,
++    )
++    if OUT_BF16:
++        sc = (_rtne_bf16(sc) << 16).to(tl.float32, bitcast=True)
++        y = a.to(tl.float32) * sc[:, :, None]
++        tl.store(ok_ptr + o_off, _rtne_bf16(y).to(tl.int16), mask=m3)
++    else:
++        sc = sc.to(out_dt).to(tl.float32)
++        y = a.to(tl.float32) * sc[:, :, None]
++        tl.store(ok_ptr + o_off, y.to(out_dt), mask=m3)
++    # V
++    a = tl.load(
++        v_ptr
++        + src * s_vb
++        + tok[:, None, None] * s_vn
++        + h[None, :, None] * s_vh
++        + d[None, None, :],
++        mask=m3,
++        other=0,
++    )
++    sc = tl.load(
++        vs_ptr + src * s_vsb + tok[:, None] * s_vsn + h[None, :] * s_vsh,
++        mask=m2,
++        other=0.0,
++    )
++    if OUT_BF16:
++        sc = (_rtne_bf16(sc) << 16).to(tl.float32, bitcast=True)
++        y = a.to(tl.float32) * sc[:, :, None]
++        tl.store(ov_ptr + o_off, _rtne_bf16(y).to(tl.int16), mask=m3)
++    else:
++        sc = sc.to(out_dt).to(tl.float32)
++        y = a.to(tl.float32) * sc[:, :, None]
++        tl.store(ov_ptr + o_off, y.to(out_dt), mask=m3)
++
++
++def _get_dequant_kernel():
++    """One Triton launch per group dequantizes every referenced block of K and
++    V: program (r, c, t) copies tokens [t*TOK, (t+1)*TOK) of block c of
++    sequence r into scratch block r*stride + c. Numerics equal
++    ``_dequant_blocks``: int8 -> bf16 is exact, the fp32 scale rounds once to
++    the output dtype, and the product rounds once (bf16 x bf16 is exact in
++    fp32); the bf16 roundings are done on the integer bits (RTNE)."""
++    return _k4f_dequant
++
++
++def dequant_group(
++    key_cache, value_cache, k_sc, v_sc, bt, seq_lens, ks, vs, stride, width, hs
++) -> None:
++    """Dequantize the blocks of sequences ``bt.shape[0]`` (device block table
++    rows and device seq_lens) into scratch blocks ``r*stride + c``."""
++    import triton
++
++    nb, bs, nkv, _ = key_cache.shape
++    g = bt.shape[0]
++    if g == 0 or width == 0:
++        return
++    TOK = 16 if hs * nkv <= 512 else 8
++    kern = _get_dequant_kernel()
++    bf16 = ks.dtype == torch.bfloat16
++    kern[(g, width, triton.cdiv(bs, TOK))](
++        key_cache,
++        value_cache,
++        k_sc,
++        v_sc,
++        bt,
++        seq_lens,
++        ks.view(torch.int16) if bf16 else ks,
++        vs.view(torch.int16) if bf16 else vs,
++        key_cache.stride(0),
++        key_cache.stride(1),
++        key_cache.stride(2),
++        value_cache.stride(0),
++        value_cache.stride(1),
++        value_cache.stride(2),
++        k_sc.stride(0),
++        k_sc.stride(1),
++        k_sc.stride(2),
++        v_sc.stride(0),
++        v_sc.stride(1),
++        v_sc.stride(2),
++        bt.stride(0),
++        stride,
++        BS=bs,
++        NKV=nkv,
++        HS=hs,
++        TOK=TOK,
++        NKV_P2=triton.next_power_of_2(nkv),
++        HS_P2=triton.next_power_of_2(hs),
++        OUT_BF16=bf16,
++    )
++
++
++def _fa_prefill_fast(
++    impl,
++    query,
++    key_cache,
++    value_cache,
++    output,
++    attn_metadata,
++    k_sc,
++    v_sc,
++    causal,
++    sinks,
++    window_size,
++) -> bool | None:
++    """K4 with no device-to-host reads: grouping from the builder's host
++    copies, block table built on the device (a uniform per-group stride),
++    one dequant launch and one FA call per group. Returns None when the host
++    copies are missing (caller falls back to the stock loop)."""
++    global _k4f_logged, _k4f_fallback_logged
++    qsl_cpu = getattr(attn_metadata, "_b70_qsl_cpu", None)
++    sl_cpu = getattr(attn_metadata, "_b70_seq_lens_ub_cpu", None)
++    if qsl_cpu is None or sl_cpu is None:
++        if not _k4f_fallback_logged:
++            _k4f_fallback_logged = True
++            logger.warning(
++                "B70-V7-K4F: metadata has no host query_start_loc / seq_lens "
++                "upper bound; K4 keeps the .tolist() loop"
++            )
++        return None
++    from vllm._xpu_ops import xpu_ops
++
++    nseq = attn_metadata.query_start_loc.numel() - 1
++    qsl = [int(x) for x in qsl_cpu[: nseq + 1].tolist()]
++    sl = [int(x) for x in sl_cpu[:nseq].tolist()]
++    if len(qsl) != nseq + 1 or len(sl) != nseq:
++        if not _k4f_fallback_logged:
++            _k4f_fallback_logged = True
++            logger.warning(
++                "B70-V7-K4F: host lens cover %d/%d seqs; K4 keeps the loop",
++                len(sl),
++                nseq,
++            )
++        return None
++    nb, bs, nkv, _ = key_cache.shape
++    hs = impl.head_size
++    ks, vs = _get_scratch(bs, nkv, hs, query.dtype, query.device, _max_len(impl))
++    cap = ks.shape[0]
++    nblks = [max(1, -(-s // bs)) for s in sl]
++    dev = query.device
++    i = 0
++    groups = 0
++    while i < nseq:
++        j, stride = i, 0
++        while j < nseq and (j - i + 1) * max(stride, nblks[j]) <= cap:
++            stride = max(stride, nblks[j])
++            j += 1
++        if j == i:  # one sequence longer than the scratch: never (max_model_len)
++            return False
++        g = j - i
++        bt = attn_metadata.block_table[i:j]
++        seq_dev = attn_metadata.seq_lens[i:j]
++        dequant_group(
++            key_cache, value_cache, k_sc, v_sc, bt, seq_dev, ks, vs, stride, stride, hs
++        )
++        new_bt = (
++            torch.arange(g, dtype=torch.int32, device=dev)[:, None] * stride
++            + torch.arange(stride, dtype=torch.int32, device=dev)[None, :]
++        )
++        q0, q1 = qsl[i], qsl[j]
++        cu = attn_metadata.query_start_loc[i : j + 1] - q0
++        xpu_ops.flash_attn_varlen_func(
++            query[q0:q1],
++            ks,
++            vs,
++            cu_seqlens_q=cu,
++            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(i, j)),
++            max_seqlen_k=max(sl[i:j]),
++            softmax_scale=impl.scale,
++            causal=causal,
++            out=output[q0:q1],
++            block_table=new_bt,
++            seqused_k=seq_dev,
++            window_size=window_size,
++            s_aux=sinks,
++        )
++        groups += 1
++        i = j
++    if not _k4f_logged:
++        _k4f_logged = True
++        logger.info(
++            "B70-V7-K4F int8 KV prefill via FA bf16 without host reads: first "
++            "batch %d seqs in %d groups, max q %d, max ctx (upper bound) %d, "
++            "head_size %d, kv heads %d",
++            nseq,
++            groups,
++            attn_metadata.max_query_len,
++            max(sl) if sl else 0,
++            hs,
++            nkv,
++        )
++    return True
++
++
+ def maybe_fa_prefill(
+     impl,
+     query: torch.Tensor,
+@@ -155,6 +451,23 @@ def maybe_fa_prefill(
+     sinks = getattr(impl, "sinks", None) if force else None
+     if not force:
+         window_size = None
++    if fp8_scales is None and k4_fast_enabled():
++        k_sc, v_sc = pth_scales or (impl._k_scale_cache, impl._v_scale_cache)
++        done = _fa_prefill_fast(
++            impl,
++            query,
++            key_cache,
++            value_cache,
++            output,
++            attn_metadata,
++            k_sc,
++            v_sc,
++            causal,
++            sinks,
++            window_size,
++        )
++        if done is not None:
++            return done
+     from vllm._xpu_ops import xpu_ops
+ 
+     nb, bs, nkv, _ = key_cache.shape
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 34b99132a0..6b8bdac084 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -993,6 +993,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             max_num_splits=max_num_splits,
+             causal=causal,
+         )
++        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
++
++        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
+ 
+         # Compute mm_prefix range tensor if the batch contains
+         # multimodal tokens with bidirectional ranges.  Built for every FA
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 7b0e99d5c0..0d386b1635 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -291,6 +291,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             softmax_segm_max=self.softmax_segm_max,
+             softmax_segm_expsum=self.softmax_segm_expsum,
+         )
++        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
++
++        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
+         if self.max_seqs_64_segments > 0 and (
+             self.max_seqs_64_segments < seq_lens.shape[0]
+             or self.softmax_segm_max.shape[0] < num_actual_tokens

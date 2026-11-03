@@ -1,0 +1,556 @@
+From b225c361406329212cc8410b07c6826def8b91ab Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 23:03:59 +0000
+Subject: [PATCH 22/51] B70-IP-D2: native INT8 per-token-head KV decode on XPU
+ FLASH_ATTN (B70_PTH_FA_DECODE=1)
+
+What: with B70_PTH_FA_DECODE=1 (default off) FLASH_ATTN on XPU accepts
+--kv-cache-dtype int8_per_token_head and decodes with the vllm-xpu-kernels
+INT8 per-token-head paged decode (vllm-xpu-kernels, port of
+wiesion's intel/llm-scaler#744).
+
+1. Spec: FlashAttentionBackend.customize_spec packs int8_per_token_head like
+   TRITON_ATTN (int8 K and V plus one fp32 scale each per token and KV head):
+   same page bytes, so the hybrid page alignment, unify and B70-IP-K3 see the
+   same pages as with TRITON_ATTN. Flag off: spec unchanged, dtype rejected.
+2. Layout: the FA impl reads each of its blocks as the kernel's block-local
+   split layout [int8 K|V (slot, head) | K scales | V scales] through views
+   (b70_pth_fa.split_layout_views): K/V int8 [B, N, H, D] strides
+   (page, H*2D, 2D, 1), V at +D, scales fp32 [B, N, H] strides (page/4, H, 1).
+   Every K/V surface base is 64-byte aligned. A layer's pages are only touched
+   by its own backend, so TRITON_ATTN (drafter) and QSA layers keep the inline
+   layout; the QSA impl hands its parent "auto" and is unaffected. The views
+   live in _k_scale_cache, which the runner clears after profiling.
+3. Writer: TRITON_ATTN's per-token-head Triton writer through the split views
+   (no SYCL writer exists for this layout); key/value cut to slot_mapping.
+4. Decode: max q <= the kernels' _SPEC_DECODE_MAX_QLEN (16) and causal -> one
+   flash_attn_varlen_func call with int8 K/V and the scale views as
+   k_descale/v_descale (q 1: paged decode; q 2..16, ragged included: the
+   kernels' per-position split-K route). Non-causal q <= 16 (DFlash draft
+   blocks on FA): one decode row per query row, graph-safe.
+5. Prefill / mixed / longer batches: K4's dequant-to-bf16 scratch + FA bf16,
+   forced on (ignores B70_PTH_FA_PREFILL and B70_PTH_FA_MIN_Q), with the
+   layer's causal flag, window and sinks. A full-graph capture of such a batch
+   raises (it syncs with the host).
+6. One-time log line "B70-IP-D2 int8_per_token_head KV on XPU FLASH_ATTN ...".
+
+K4/K5 behaviour without the flag is unchanged (the stock K4 call passes the
+same arguments; window/sinks stay None).
+
+Measured: CPU tests only (next commit). No GPU, no boot.
+---
+ vllm/v1/attention/backends/b70_pth_fa.py | 312 ++++++++++++++++++++++-
+ vllm/v1/attention/backends/flash_attn.py |  90 +++++++
+ 2 files changed, 388 insertions(+), 14 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index 191757c2e3..c06fddee83 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -17,6 +17,19 @@ memory-profile run) so the KV pool is sized around it. Sequences whose total
+ context exceeds it are processed in groups.
+ 
+ Env: B70_PTH_FA_PREFILL=0 turns it off; B70_PTH_FA_MIN_Q (default 64).
++
++B70-IP-D2 (``B70_PTH_FA_DECODE=1``, default off): FLASH_ATTN on XPU accepts
++``int8_per_token_head`` and decodes natively with the vllm-xpu-kernels INT8
++per-token-head paged decode (wiesion, intel/llm-scaler#744). Its layers keep the
++same bytes per block as TRITON_ATTN's inline layout (page sizes, hybrid unify
++and B70-IP-K3 unchanged) but arrange them as the kernel's block-local split
++layout ``[int8 K|V for all (slot, head) | K scales | V scales]``, so every K/V
++surface base is 64-byte aligned. Each layer's pages are only ever touched by its
++own backend, so the inline layout of TRITON_ATTN / QSA layers (drafter, QSA) is
++untouched. Batches with max q <= the kernels' spec-decode bound run the native
++decode (causal rows through the kernels' per-position split-K route,
++non-causal rows as one decode row each); everything else goes through the K4
++dequant-to-bf16 scratch, forced on (no B70_PTH_FA_MIN_Q threshold).
+ """
+ 
+ import os
+@@ -33,7 +46,14 @@ _logged = False
+ 
+ 
+ def _enabled() -> bool:
+-    return current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "1") != "0"
++    return (
++        current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "1") != "0"
++    )
++
++
++def fa_decode_enabled() -> bool:
++    """B70-IP-D2 gate: FLASH_ATTN serves int8_per_token_head on XPU."""
++    return current_platform.is_xpu() and os.environ.get("B70_PTH_FA_DECODE", "0") == "1"
+ 
+ 
+ def _get_scratch(block_size, nkv, hs, dtype, device, max_len):
+@@ -61,9 +81,9 @@ def _max_len(impl) -> int:
+     return int(v) if v else 131072
+ 
+ 
+-def ensure_scratch(impl, kv_cache: torch.Tensor, dtype) -> None:
++def ensure_scratch(impl, kv_cache: torch.Tensor, dtype, force: bool = False) -> None:
+     """Allocate at the first forward (profile run) so KV sizing sees it."""
+-    if not _enabled():
++    if not (force or _enabled()):
+         return
+     num_blocks, nkv, block_size, content = kv_cache.shape
+     hs = impl.head_size
+@@ -98,26 +118,42 @@ def maybe_fa_prefill(
+     attn_metadata,
+     num_actual_tokens: int,
+     fp8_scales: tuple | None = None,
++    pth_scales: tuple | None = None,
++    force: bool = False,
++    window_size: list[int] | None = None,
+ ) -> bool:
+     """int8 per-token-head (default) or, with fp8_scales=(k_scale, v_scale),
+-    an fp8 per-tensor cache (B70-IP-K5, FLASH_ATTN backend)."""
++    an fp8 per-tensor cache (B70-IP-K5, FLASH_ATTN backend).
++
++    pth_scales=(k_scale, v_scale) overrides the impl's inline scale views (the
++    B70-IP-D2 split layout). force=True (B70-IP-D2) ignores B70_PTH_FA_PREFILL
++    and B70_PTH_FA_MIN_Q, since the INT8 FA kernel has no prefill: it also
++    accepts non-causal batches, sinks and the caller's window_size."""
+     global _logged
+-    if not _enabled():
+-        return False
+-    if attn_metadata.max_query_len <= int(os.environ.get("B70_PTH_FA_MIN_Q", "64")):
+-        return False
++    if not force:
++        if not _enabled():
++            return False
++        if attn_metadata.max_query_len <= int(os.environ.get("B70_PTH_FA_MIN_Q", "64")):
++            return False
+     if (
+         impl.alibi_slopes is not None
+-        or getattr(impl, "sinks", None) is not None
+         or (getattr(impl, "logits_soft_cap", 0) or 0) != 0
+-        or tuple(impl.sliding_window or (-1, -1)) != (-1, -1)
+         or getattr(attn_metadata, "mm_prefix_range_tensor", None) is not None
+         or getattr(attn_metadata, "mm_prefix_query_range_tensor", None) is not None
+         or getattr(attn_metadata, "rswa_prefix_lens", None) is not None
+         or not isinstance(attn_metadata.causal, bool)
++    ):
++        return False
++    if not force and (
++        getattr(impl, "sinks", None) is not None
++        or tuple(impl.sliding_window or (-1, -1)) != (-1, -1)
+         or not attn_metadata.causal
+     ):
+         return False
++    causal = attn_metadata.causal if force else True
++    sinks = getattr(impl, "sinks", None) if force else None
++    if not force:
++        window_size = None
+     from vllm._xpu_ops import xpu_ops
+ 
+     nb, bs, nkv, _ = key_cache.shape
+@@ -135,12 +171,13 @@ def maybe_fa_prefill(
+         while j < nseq and used + nblks[j] <= cap:
+             used += nblks[j]
+             j += 1
+-        if j == i:  # one sequence longer than the scratch: cannot happen (max_model_len)
++        if j == i:  # one sequence longer than the scratch (max_model_len): never
+             return False
+         ids = torch.cat([bt[r, : nblks[r]] for r in range(i, j)]).to(torch.long)
+         if fp8_scales is None:
+-            _dequant_blocks(key_cache, impl._k_scale_cache, ids, ks, hs)
+-            _dequant_blocks(value_cache, impl._v_scale_cache, ids, vs, hs)
++            k_sc, v_sc = pth_scales or (impl._k_scale_cache, impl._v_scale_cache)
++            _dequant_blocks(key_cache, k_sc, ids, ks, hs)
++            _dequant_blocks(value_cache, v_sc, ids, vs, hs)
+         else:
+             _dequant_fp8_blocks(key_cache, fp8_scales[0], ids, ks)
+             _dequant_fp8_blocks(value_cache, fp8_scales[1], ids, vs)
+@@ -165,10 +202,12 @@ def maybe_fa_prefill(
+             max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(i, j)),
+             max_seqlen_k=max(seq_lens[i:j]),
+             softmax_scale=impl.scale,
+-            causal=True,
++            causal=causal,
+             out=output[q0:q1],
+             block_table=new_bt,
+             seqused_k=sk,
++            window_size=window_size,
++            s_aux=sinks,
+         )
+         i = j
+     if not _logged:
+@@ -182,3 +221,248 @@ def maybe_fa_prefill(
+             max(seq_lens),
+         )
+     return True
++
++
++# ---------------------------------------------------------------------------
++# B70-IP-D2: native INT8 per-token-head decode on the XPU FLASH_ATTN backend
++# ---------------------------------------------------------------------------
++_d2_logged = False
++
++
++def log_fa_decode_once(head_size: int, num_kv_heads: int) -> None:
++    global _d2_logged
++    if not _d2_logged:
++        _d2_logged = True
++        logger.info(
++            "B70-IP-D2 int8_per_token_head KV on XPU FLASH_ATTN: native INT8 paged "
++            "decode (vllm-xpu-kernels, q <= %d per row), prefill via dequant to a "
++            "bf16 scratch (K4), block-local split layout; head_size %d, kv heads %d",
++            spec_decode_max_qlen(),
++            head_size,
++            num_kv_heads,
++        )
++
++
++def spec_decode_max_qlen() -> int:
++    """Largest max_query_len that vllm-xpu-kernels runs through its split-K
++    decode kernel (the only kernel that reads INT8 KV); 1 when the module or
++    the bound is missing."""
++    try:
++        from vllm_xpu_kernels import flash_attn_interface as fai
++    except ImportError:
++        return 1
++    return max(1, int(getattr(fai, "_SPEC_DECODE_MAX_QLEN", 1)))
++
++
++def split_layout_views(
++    kv_cache: torch.Tensor, num_kv_heads: int, head_size: int
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Block-local split views over one layer's int8 per-token-head cache.
++
++    ``kv_cache`` is the logical ``(B, H, N, 2 * (D + 4))`` int8 layer view vLLM
++    allocates for the spec (same bytes as TRITON_ATTN's inline layout). Each
++    block is re-read as ``[int8 K|V (N, H, 2D) | K scales fp32 (N, H) |
++    V scales fp32 (N, H)]``. Returns key / value int8 ``[B, N, H, D]`` with
++    strides ``(page, H*2D, 2D, 1)`` (value = key + D bytes) and k_scale /
++    v_scale fp32 ``[B, N, H]`` with strides ``(page/4, H, 1)``: the contract of
++    vllm-xpu-kernels ``check_int8_kv_cache``. ``page`` is the tensor's block
++    stride, so padded pages work; the page itself must be one dense run of bytes
++    (a block-compact KV cache layout, B outside H, N, C).
++    """
++    if kv_cache.dtype != torch.int8:
++        raise ValueError(f"int8_per_token_head cache is int8, got {kv_cache.dtype}")
++    num_blocks, nkv, block_size, content = kv_cache.shape
++    if nkv != num_kv_heads or content != 2 * (head_size + 4):
++        raise ValueError(
++            f"int8_per_token_head cache shape {tuple(kv_cache.shape)} does not match "
++            f"num_kv_heads={num_kv_heads}, head_size={head_size}"
++        )
++    page_bytes = block_size * num_kv_heads * content
++    span = 1 + sum((kv_cache.shape[d] - 1) * kv_cache.stride(d) for d in (1, 2, 3))
++    if kv_cache.stride(3) != 1 or span != page_bytes:
++        raise ValueError(
++            "B70-IP-D2 needs a block-compact KV cache layout (each block's "
++            f"(H, N, C) bytes dense); got strides {kv_cache.stride()} for shape "
++            f"{tuple(kv_cache.shape)}"
++        )
++    page = kv_cache.stride(0) if num_blocks > 1 else page_bytes
++    if page < page_bytes or page % 64 != 0 or head_size % 64 != 0:
++        raise ValueError(
++            "B70-IP-D2: the INT8 decode kernel needs 64-byte aligned K/V surfaces "
++            f"(block stride {page} B, head_size {head_size}); both must be "
++            "multiples of 64"
++        )
++    data_bytes = block_size * num_kv_heads * 2 * head_size
++    scale_bytes = block_size * num_kv_heads * 4
++    data = torch.as_strided(
++        kv_cache,
++        (num_blocks, block_size, num_kv_heads, 2 * head_size),
++        (page, num_kv_heads * 2 * head_size, 2 * head_size, 1),
++    )
++
++    def scales(offset: int) -> torch.Tensor:
++        raw = torch.as_strided(
++            kv_cache,
++            (num_blocks, scale_bytes),
++            (page, 1),
++            kv_cache.storage_offset() + offset,
++        )
++        # int8 [B, N*H*4] -> fp32 [B, N*H] (stride page/4, 1) -> [B, N, H]
++        return raw.view(torch.float32).view(num_blocks, block_size, num_kv_heads)
++
++    return (
++        data[..., :head_size],
++        data[..., head_size:],
++        scales(data_bytes),
++        scales(data_bytes + scale_bytes),
++    )
++
++
++def pth_split_views(impl, kv_cache: torch.Tensor) -> tuple[torch.Tensor, ...]:
++    """Cached split views for the bound cache. They live in ``_k_scale_cache``
++    (a tuple here), which the runner clears after profiling, so no view keeps
++    the profiling cache alive."""
++    key = (kv_cache.data_ptr(), tuple(kv_cache.shape), tuple(kv_cache.stride()))
++    cached = impl._k_scale_cache
++    if not isinstance(cached, tuple) or cached[0] != key:
++        views = split_layout_views(kv_cache, impl.num_kv_heads, impl.head_size)
++        impl._k_scale_cache = cached = (key, views)
++    return cached[1]
++
++
++def _capturing() -> bool:
++    fn = getattr(getattr(torch, "xpu", None), "is_current_stream_capturing", None)
++    try:
++        return bool(fn()) if fn is not None else False
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def _noncausal_rows_decode(
++    query, key_cache, value_cache, k_scale, v_scale, output, attn_metadata, impl
++) -> None:
++    """Non-causal small-q rows (DFlash draft blocks): every query row attends
++    to its request's whole context, i.e. one q_len-1 decode row each. Graph-safe
++    (no host sync); padded rows past query_start_loc[-1] read one slot of block 0
++    and are zeroed."""
++    from vllm._xpu_ops import xpu_ops
++
++    total = query.shape[0]
++    qsl = attn_metadata.query_start_loc
++    batch = qsl.numel() - 1
++    cu = torch.arange(total + 1, dtype=torch.int32, device=query.device)
++    pos = cu[:-1]
++    req = torch.searchsorted(qsl[1:], pos, right=True).clamp_(max=batch - 1)
++    is_pad = pos >= qsl[-1]
++    used = (
++        attn_metadata.seq_lens.index_select(0, req)
++        .clamp(min=1)
++        .masked_fill(is_pad, 1)
++        .to(torch.int32)
++    )
++    bt = attn_metadata.block_table.index_select(0, req)
++    bt.masked_fill_(is_pad[:, None], 0)
++    xpu_ops.flash_attn_varlen_func(
++        query,
++        key_cache,
++        value_cache,
++        cu_seqlens_q=cu,
++        max_seqlen_q=1,
++        max_seqlen_k=attn_metadata.max_seq_len,
++        softmax_scale=impl.scale,
++        causal=True,
++        out=output,
++        block_table=bt,
++        seqused_k=used,
++        k_descale=k_scale,
++        v_descale=v_scale,
++        s_aux=impl.sinks,
++    )
++    output.masked_fill_(is_pad[:, None, None], 0)
++
++
++def fa_int8_forward(
++    impl,
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    attn_metadata,
++    output: torch.Tensor,
++    num_actual_tokens: int,
++    window: tuple[int, int] | None,
++) -> torch.Tensor:
++    """B70-IP-D2 forward for one FLASH_ATTN layer over an int8 per-token-head
++    cache. ``window`` is the impl's window after _maybe_symmetrize_window."""
++    from vllm._xpu_ops import xpu_ops
++
++    causal = attn_metadata.causal
++    if (
++        not isinstance(causal, bool)
++        or getattr(attn_metadata, "mm_prefix_query_range_tensor", None) is not None
++        or getattr(attn_metadata, "rswa_prefix_lens", None) is not None
++    ):
++        raise NotImplementedError(
++            "B70-IP-D2 int8_per_token_head FLASH_ATTN: per-request causal, "
++            "mm_prefix and R-SWA are not supported"
++        )
++    # The prefill scratch is allocated in the first forward (the profile run),
++    # so the KV pool is sized around it.
++    ensure_scratch(impl, kv_cache, query.dtype, force=True)
++    n = num_actual_tokens
++    q, out = query[:n], output[:n]
++    key_cache, value_cache, k_scale, v_scale = pth_split_views(impl, kv_cache)
++    window_size = list(window) if window is not None and window[0] >= 0 else None
++    max_q = attn_metadata.max_query_len
++
++    if max_q <= spec_decode_max_qlen() and (causal or max_q == 1):
++        # q 1: the INT8 paged decode. 1 < q <= bound, causal: the kernels'
++        # spec-decode route (one decode row per (request, position), exact
++        # per-position causal lengths; ragged q lengths included).
++        xpu_ops.flash_attn_varlen_func(
++            q,
++            key_cache,
++            value_cache,
++            cu_seqlens_q=attn_metadata.query_start_loc,
++            max_seqlen_q=max_q,
++            max_seqlen_k=attn_metadata.max_seq_len,
++            softmax_scale=impl.scale,
++            causal=True,
++            out=out,
++            block_table=attn_metadata.block_table,
++            seqused_k=attn_metadata.seq_lens,
++            window_size=window_size,
++            k_descale=k_scale,
++            v_descale=v_scale,
++            s_aux=impl.sinks,
++        )
++        return output
++    if max_q <= spec_decode_max_qlen() and window_size is None:
++        _noncausal_rows_decode(
++            q, key_cache, value_cache, k_scale, v_scale, out, attn_metadata, impl
++        )
++        return output
++
++    # Prefill or mixed batch: dequantize the referenced blocks into the K4
++    # scratch and run FA bf16 (the INT8 kernel has no prefill path).
++    if _capturing():
++        raise RuntimeError(
++            f"B70-IP-D2: a batch with max q {max_q} was captured into a full "
++            "graph; the int8 prefill path syncs with the host. Use "
++            "FULL_AND_PIECEWISE (full graphs for uniform decode only)."
++        )
++    if not maybe_fa_prefill(
++        impl,
++        q,
++        key_cache,
++        value_cache,
++        out,
++        attn_metadata,
++        n,
++        pth_scales=(k_scale, v_scale),
++        force=True,
++        window_size=window_size,
++    ):
++        raise NotImplementedError(
++            "B70-IP-D2 int8_per_token_head FLASH_ATTN: this batch is neither a "
++            "decode nor a dequantizable prefill (ALiBi / soft-cap / mm_prefix)"
++        )
++    return output
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index f3db539c9a..a2b591987e 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -294,6 +294,24 @@ class FlashAttentionBackend(AttentionBackend):
+     ]
+     head_size_v: int | None = None
+ 
++    @classmethod
++    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
++        """B70-IP-D2 (B70_PTH_FA_DECODE=1, XPU): int8_per_token_head gets
++        TRITON_ATTN's bytes per block (int8 K and V plus one fp32 scale each per
++        (token, KV head)), so page sizes, the hybrid page unify and B70-IP-K3
++        see the same pages as with TRITON_ATTN. The impl arranges those bytes as
++        the INT8 decode kernel's block-local split layout (b70_pth_fa)."""
++        spec = super().customize_spec(spec)
++        if spec.kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD:
++            return spec
++        from vllm.v1.attention.backends import b70_pth_fa
++
++        if not b70_pth_fa.fa_decode_enabled():
++            return spec
++        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
++
++        return TritonAttentionBackend.customize_spec(spec)
++
+     @staticmethod
+     def _get_sm90_fa4_fp8_kv_block_size(
+         kv_cache_spec: KVCacheSpec | None = None,
+@@ -433,6 +451,11 @@ class FlashAttentionBackend(AttentionBackend):
+     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+         if kv_cache_dtype is None:
+             return True
++        if kv_cache_dtype == "int8_per_token_head":
++            # B70-IP-D2: native INT8 paged decode in vllm-xpu-kernels (XPU).
++            from vllm.v1.attention.backends import b70_pth_fa
++
++            return b70_pth_fa.fa_decode_enabled()
+         if kv_cache_dtype not in cls.supported_kv_cache_dtypes:
+             return False
+         if is_quantized_kv_cache(kv_cache_dtype):
+@@ -1146,6 +1169,34 @@ class FlashAttentionImpl(AttentionImpl):
+                 " kv-cache on this device."
+             )
+ 
++        # B70-IP-D2: int8_per_token_head on XPU (B70_PTH_FA_DECODE=1). Subclass
++        # impls that run their own kernels (QSA) hand this constructor "auto".
++        self._b70_fa_int8 = kv_cache_dtype == "int8_per_token_head"
++        if self._b70_fa_int8:
++            from vllm.v1.attention.backends import b70_pth_fa
++
++            if not b70_pth_fa.fa_decode_enabled():
++                raise NotImplementedError(
++                    "FLASH_ATTN serves int8_per_token_head only on XPU with "
++                    "B70_PTH_FA_DECODE=1"
++                )
++            if (
++                alibi_slopes is not None
++                or self.logits_soft_cap
++                or attn_type != AttentionType.DECODER
++                or head_size % 64 != 0
++            ):
++                raise NotImplementedError(
++                    "B70-IP-D2 int8_per_token_head FLASH_ATTN: decoder layers "
++                    "without ALiBi or soft-cap, head_size a multiple of 64 (got "
++                    f"{head_size}, attn_type {attn_type})"
++                )
++            # Split-layout views (a tuple), cleared by the runner after the
++            # profile run like TRITON_ATTN's scale views.
++            self._k_scale_cache: Any = None
++            self._v_scale_cache: Any = None
++            b70_pth_fa.log_fa_decode_once(head_size, num_kv_heads)
++
+         self.sinks = sinks
+         if self.sinks is not None:
+             assert flash_attn_supports_sinks(), (
+@@ -1257,6 +1308,20 @@ class FlashAttentionImpl(AttentionImpl):
+                 layer,
+             )
+ 
++        if getattr(self, "_b70_fa_int8", False):
++            # B70-IP-D2: native INT8 per-token-head decode; prefill via K4.
++            from vllm.v1.attention.backends import b70_pth_fa
++
++            return b70_pth_fa.fa_int8_forward(
++                self,
++                query,
++                kv_cache,
++                attn_metadata,
++                output,
++                num_actual_tokens,
++                _maybe_symmetrize_window(self.sliding_window, attn_metadata.causal),
++            )
++
+         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
+@@ -1471,6 +1536,31 @@ class FlashAttentionImpl(AttentionImpl):
+             # we use direct Q, K, V tensors without caching
+             return
+ 
++        if getattr(self, "_b70_fa_int8", False):
++            # B70-IP-D2: TRITON_ATTN's per-token-head writer, through the
++            # block-local split views (no SYCL writer exists for this layout).
++            from vllm.v1.attention.backends import b70_pth_fa
++            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++                triton_reshape_and_cache_flash_per_token_head_quant,
++            )
++
++            key_cache, value_cache, k_scale, v_scale = b70_pth_fa.pth_split_views(
++                self, kv_cache
++            )
++            # The Triton writer sizes its grid by key; cut the padding rows.
++            num_slots = slot_mapping.shape[0]
++            triton_reshape_and_cache_flash_per_token_head_quant(
++                key[:num_slots],
++                value[:num_slots],
++                key_cache,
++                value_cache,
++                k_scale,
++                v_scale,
++                slot_mapping,
++                kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++            )
++            return
++
+         # Scatter write into the KV cache using slot_mapping indices.
+         # No TMA kernel is invoked here, so stride canonicalization is not needed.
+         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))

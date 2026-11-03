@@ -1,0 +1,216 @@
+From 4cb6980e3462c458efc010c661a02b335eb3521a Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:06 +0000
+Subject: [PATCH 43/51] B70-V2-AR: in-place XCCL all-reduce at caller-owned
+ sites (B70_AR_INPLACE=1)
+
+XpuCommunicator.all_reduce_inplace + GroupCoordinator.all_reduce_owned skip the input clone for
+RowParallelLinear (Unquantized/B70Int8Dense/CompressedTensors methods: fresh GEMM output),
+VocabParallelEmbedding (fresh lookup) and the MoE late all-reduce of shared+routed (fresh add).
+Falls back under Dynamo tracing, batch-invariant mode, world 1. 107 D2D copies per c=1 step.
+Default off; bitwise-identical (gloo test).
+---
+ vllm/distributed/communication_op.py          |  5 ++++
+ .../device_communicators/xpu_communicator.py  | 10 +++++++
+ vllm/distributed/parallel_state.py            | 30 +++++++++++++++++++
+ .../layers/fused_moe/runner/moe_runner.py     | 16 ++++++++--
+ vllm/model_executor/layers/linear.py          | 17 ++++++++++-
+ .../layers/vocab_parallel_embedding.py        |  7 +++--
+ 6 files changed, 79 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/distributed/communication_op.py b/vllm/distributed/communication_op.py
+index 5ad99e4e15..eb7427b870 100644
+--- a/vllm/distributed/communication_op.py
++++ b/vllm/distributed/communication_op.py
+@@ -14,6 +14,11 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     return get_tp_group().all_reduce(input_)
+ 
+ 
++def tensor_model_parallel_all_reduce_owned(input_: torch.Tensor) -> torch.Tensor:
++    """All-reduce a tensor the caller owns (B70-V2-AR: in place if B70_AR_INPLACE=1)."""
++    return get_tp_group().all_reduce_owned(input_)
++
++
+ def tensor_model_parallel_all_gather(
+     input_: torch.Tensor, dim: int = -1
+ ) -> torch.Tensor:
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 7a5913754f..3c868a7ac1 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -69,6 +69,16 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         dist.all_reduce(output, group=self.device_group)
+         return output
+ 
++    def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
++        """B70-V2-AR: the same XCCL all-reduce on ``input_`` itself (no clone).
++
++        Only for a buffer the caller owns and never reads again unreduced.
++        Batch-invariant mode keeps its gather."""
++        if envs.VLLM_BATCH_INVARIANT or not input_.is_contiguous():
++            return self.all_reduce(input_)
++        dist.all_reduce(input_, group=self.device_group)
++        return input_
++
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+         world_size = self.world_size
+ 
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index fea0c4e3c7..39f98da361 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
+ 
+ import contextlib
+ import gc
++import os
+ import pickle
+ import weakref
+ from collections import deque, namedtuple
+@@ -195,6 +196,12 @@ def resume_device_comms() -> None:
+     _apply_to_device_comms(lambda comm: comm.resume())
+ 
+ 
++# B70-V2-AR: in-place all-reduce at owned call sites
++# (GroupCoordinator.all_reduce_owned). Default off.
++_B70_AR_INPLACE = os.environ.get("B70_AR_INPLACE", "0") == "1"
++_B70_AR_INPLACE_LOGGED = False
++
++
+ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+     assert group_name in _groups, f"Group {group_name} is not found."
+     group = _groups[group_name]()
+@@ -744,6 +751,29 @@ class GroupCoordinator:
+         else:
+             return self._all_reduce_out_place(input_)
+ 
++    def all_reduce_owned(self, input_: torch.Tensor) -> torch.Tensor:
++        """B70-V2-AR (B70_AR_INPLACE=1): all-reduce a caller-owned tensor in place.
++
++        Owned = a fresh GEMM/add/embedding output that nothing else references or
++        reads again; saves the clone. Flag off, compile tracing, or a communicator
++        without the in-place path run ``all_reduce`` unchanged."""
++        if (
++            self.world_size == 1
++            or not _B70_AR_INPLACE
++            or torch.compiler.is_compiling()
++            or self.device_communicator is None
++            or not hasattr(self.device_communicator, "all_reduce_inplace")
++        ):
++            return self.all_reduce(input_)
++        global _B70_AR_INPLACE_LOGGED
++        if not _B70_AR_INPLACE_LOGGED:
++            _B70_AR_INPLACE_LOGGED = True
++            logger.info(
++                "B70-V2-AR: in-place all-reduce on caller-owned outputs "
++                "(B70_AR_INPLACE=1)"
++            )
++        return self.device_communicator.all_reduce_inplace(input_)
++
+     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+         if self.device_communicator is None:
+             raise ValueError("No device communicator found")
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index d220f8da36..51850c9946 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -485,6 +485,7 @@ class MoERunner(MoERunnerInterface):
+         states: torch.Tensor,
+         trunc_size: int | None,
+         output_is_reduced: bool | None = None,
++        states_owned: bool = False,
+     ) -> torch.Tensor:
+         """All-reduce the combined output if needed.
+ 
+@@ -512,7 +513,15 @@ class MoERunner(MoERunnerInterface):
+             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
+             and not output_is_reduced
+         ):
+-            states = tensor_model_parallel_all_reduce(states)
++            if states_owned:
++                # B70-V2-AR: ``states`` is this call's fresh shared + routed sum.
++                from vllm.distributed.communication_op import (
++                    tensor_model_parallel_all_reduce_owned,
++                )
++
++                states = tensor_model_parallel_all_reduce_owned(states)
++            else:
++                states = tensor_model_parallel_all_reduce(states)
+ 
+         return states[..., :trunc_size] if trunc_size is not None else states
+ 
+@@ -791,7 +800,10 @@ class MoERunner(MoERunnerInterface):
+             result = fused_output
+ 
+         result = self._maybe_reduce_final_output(
+-            result, og_hidden_dim_post_xform, fused_output_is_reduced
++            result,
++            og_hidden_dim_post_xform,
++            fused_output_is_reduced,
++            states_owned=shared_output is not None,
+         )
+ 
+         return self._maybe_add_zero_expert_output(result)
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 57e7fbbeaa..51044ba2ae 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -162,6 +162,13 @@ class LinearMethodBase(QuantizeMethodBase):
+         raise NotImplementedError
+ 
+ 
++# B70-V2-AR: linear methods whose apply() returns a freshly allocated output (or a
++# view of one), so RowParallelLinear may all-reduce it in place (B70_AR_INPLACE=1).
++_B70_AR_OWNED_METHODS = frozenset(
++    {"UnquantizedLinearMethod", "B70Int8DenseMethod", "CompressedTensorsLinearMethod"}
++)
++
++
+ class UnquantizedLinearMethod(LinearMethodBase):
+     """Linear method without quantization."""
+ 
+@@ -1785,7 +1792,15 @@ class RowParallelLinear(LinearBase):
+         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+ 
+         if self.reduce_results and self.tp_size > 1:
+-            output = tensor_model_parallel_all_reduce(output_parallel)
++            if type(self.quant_method).__name__ in _B70_AR_OWNED_METHODS:
++                # B70-V2-AR: a fresh GEMM output that nothing else holds.
++                from vllm.distributed.communication_op import (
++                    tensor_model_parallel_all_reduce_owned,
++                )
++
++                output = tensor_model_parallel_all_reduce_owned(output_parallel)
++            else:
++                output = tensor_model_parallel_all_reduce(output_parallel)
+         else:
+             output = output_parallel
+ 
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 92e65c839d..9759fba42c 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -15,8 +15,8 @@ from vllm.distributed import (
+     divide,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+-    tensor_model_parallel_all_reduce,
+ )
++from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_owned
+ from vllm.model_executor.custom_op import PluggableLayer
+ from vllm.model_executor.determinism.batch_invariant import (
+     linear_batch_invariant,
+@@ -556,10 +556,11 @@ class VocabParallelEmbedding(PluggableLayer):
+         if not self.use_fused_embedding:
+             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+         if self.reduce_results:
++            # B70-V2-AR: output_parallel is this call's fresh lookup (masked in place).
+             output_parallel = (
+-                self.parallel_group.all_reduce(output_parallel)
++                self.parallel_group.all_reduce_owned(output_parallel)
+                 if self.parallel_group is not None
+-                else tensor_model_parallel_all_reduce(output_parallel)
++                else tensor_model_parallel_all_reduce_owned(output_parallel)
+             )
+         return output_parallel.view(output_dtype)
+ 

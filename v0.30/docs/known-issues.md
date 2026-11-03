@@ -87,7 +87,7 @@ Each item: symptoms → cause → workaround. These are the 0.30 line's issues (
   rejects (the engine crashes on the first `json_schema` request). Fixed by upstream vllm-xpu-kernels #600, which is in
   our 0.1.14.1+b70.2/b70.3 builds; 0026 (on by default) avoids it with stock kernels.
 - **On the 0.32 line** speculative decoding is DFlash2 with async scheduling on, and its burst gate passes (0/150;
-  [v0.32/README.md](../../v0.32/models/qwen38-flash-next/meta.md#numbers-0320-b701-how-the-line-was-validated)); this item is about MTP on 0.30.
+  [v0.32/README.md](../../docs/measurements/flash-next-earlier-builds.md#numbers-0320-b701-how-the-line-was-validated)); this item is about MTP on 0.30.
 - **A quality note.** In hands-on use, games built through a multi-agent orchestrator came out slightly buggier with MTP
   on than off. Rejection sampling should leave the output distribution unchanged, so a real difference would point to
   numerics. A paired MTP on/off evaluation on one engine has not been run yet.

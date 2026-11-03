@@ -1,0 +1,348 @@
+From 4e8debfffc04fda5cb966e4a61375f98f25183b1 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:20 +0000
+Subject: [PATCH 39/51] B70-V7-PLEG: RAM-native INT8 PLE producer on the
+ device, in the graph (B70_PLE_DEVICE_GATHER=1)
+
+The host-prepared producer blocks on a D2H of the step's tokens (behind the
+drafter), hashes and gathers on the host and copies up before every replay:
+0.8 ms/step at c=1, 1.0-1.4 ms at c=8-12 with the GPU idle (B70_PHASE_TIMING,
+on the deployed engine). It cannot be overlapped from the host: the verify rows are the drafter's
+last output and the consumer is inlined into the FULL graph. Here the fused
+Triton n-gram hash (ple_ngram_ids) and a Triton gather over the pinned slabs'
+UVA device views run inside the forward next to the consumer; owned slots get
+their 164-B rows, all others and rows past the actual tokens zeros, as the
+host stage. prepare_inputs no longer syncs for PLE. The first real step runs
+both paths and compares the bytes once (raises on a difference).
+---
+ .../qwen4_exp/nvidia/b70_ple_devgather.py     | 179 ++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/b70_ple_ram.py   |  40 ++++
+ vllm/models/qwen4_exp/nvidia/model_state.py   |  18 ++
+ .../qwen4_exp/nvidia/ngram_embedding.py       |  20 ++
+ 4 files changed, 257 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_ple_devgather.py
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_devgather.py b/vllm/models/qwen4_exp/nvidia/b70_ple_devgather.py
+new file mode 100644
+index 0000000000..82833be46f
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_devgather.py
+@@ -0,0 +1,179 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-V7-PLEG (``B70_PLE_DEVICE_GATHER=1``): the RAM-native INT8 PLE producer
++inside the forward, on the device.
++
++The host-prepared producer (b70_ple_nvme ``prepare``) runs in ``prepare_inputs``
++before every replay: a blocking D2H of the step's tokens (it waits for the
++drafter, the last work of the previous step), the n-gram hash and the row
++gather on the host, then one H2D. Measured with B70_PHASE_TIMING on the deployed engine (RAM
++mode, 4 cards): 0.8 ms per step at c=1 and 1.0-1.4 ms at c=8-12 with the GPU
++idle, because the verify rows' tokens (last sampled + 7 drafts) only exist
++once the drafter has finished, and the consumer is inlined into the FULL graph
++(``eager_break_during_capture`` does not break FULL captures), so its bytes
++must be resident before the replay starts.
++
++Here the producer moves into the graph, next to the consumer:
++
++1. ``ple_ngram_ids`` (the fused Triton hash, one launch) computes the ids from
++   the same ``input_ids`` / ``query_start_loc`` / ``ngram_context`` buffers
++   the host path reads;
++2. ``device_gather`` (one Triton launch) reads each owned row straight from
++   the pinned slabs through their UVA device views
++   (``get_accelerator_view_from_cpu_tensor``) into the packed prefetch buffer:
++   owned (token, head) slots get the 164-B row, every other slot and every
++   row past the actual token count gets zeros, exactly what ``_fill_stage``
++   leaves in the stage;
++3. the consumer is unchanged (int8 all-reduce over ETP, dequant).
++
++No host sync, no host hash, no H2D per step. The host path stays the
++reference: the first real step runs both and compares the bytes
++(one sync, once), logging the result.
++
++Gates: RAM mode only (B70_PLE_INT8=1; the NVMe row cache is not addressable
++by row id), at most ``_MAX_SLABS`` slabs, UVA available.
++"""
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++
++_MAX_SLABS = 8
++
++
++def enabled() -> bool:
++    return os.environ.get("B70_PLE_DEVICE_GATHER", "0") == "1"
++
++
++@triton.jit
++def _pick(vals, slab, lo, hi, local, b, bmask, owned, ROW: tl.constexpr):
++    hit = owned & (local >= lo) & (local < hi)
++    v = tl.load(slab + (local - lo) * ROW + b, mask=bmask & hit, other=0)
++    return tl.where(hit, v, vals)
++
++
++@triton.jit
++def _ple_device_gather_kernel(
++    ids_ptr,  # int64 [T, H] global row ids
++    qsl_ptr,  # int32 query_start_loc, actual tokens at [num_reqs]
++    out_ptr,  # uint8 [T, H, ROW]
++    s0,
++    s1,
++    s2,
++    s3,
++    s4,
++    s5,
++    s6,
++    s7,  # uint8 slab device views (unused repeat s0)
++    b1,
++    b2,
++    b3,
++    b4,
++    b5,
++    b6,
++    b7,
++    b8,  # local row starts of slabs 1..7, then the end
++    tp_start,
++    tp_end,
++    num_reqs,
++    H: tl.constexpr,
++    ROW: tl.constexpr,
++    ROW_P2: tl.constexpr,
++    NUM_SLABS: tl.constexpr,
++):
++    t = tl.program_id(0)
++    h = tl.program_id(1)
++    n_actual = tl.load(qsl_ptr + num_reqs)
++    rid = tl.load(ids_ptr + t * H + h)
++    owned = (t < n_actual) & (rid >= tp_start) & (rid < tp_end)
++    local = tl.where(owned, rid - tp_start, 0).to(tl.int64)
++    b = tl.arange(0, ROW_P2)
++    bmask = b < ROW
++    vals = tl.zeros([ROW_P2], dtype=tl.uint8)
++    vals = _pick(vals, s0, 0, b1, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 1:
++        vals = _pick(vals, s1, b1, b2, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 2:
++        vals = _pick(vals, s2, b2, b3, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 3:
++        vals = _pick(vals, s3, b3, b4, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 4:
++        vals = _pick(vals, s4, b4, b5, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 5:
++        vals = _pick(vals, s5, b5, b6, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 6:
++        vals = _pick(vals, s6, b6, b7, local, b, bmask, owned, ROW)
++    if NUM_SLABS > 7:
++        vals = _pick(vals, s7, b7, b8, local, b, bmask, owned, ROW)
++    tl.store(out_ptr + (t * H + h).to(tl.int64) * ROW + b, vals, mask=bmask)
++
++
++class DeviceGather:
++    """UVA views of one rank's pinned slabs plus the launch."""
++
++    def __init__(
++        self,
++        slab_tensors: list[torch.Tensor],
++        bounds,
++        tp_start: int,
++        tp_end: int,
++        row_bytes: int,
++        view_fn=None,
++    ) -> None:
++        n = len(slab_tensors)
++        if not 1 <= n <= _MAX_SLABS:
++            raise ValueError(f"B70-V7-PLEG: {n} slabs (1..{_MAX_SLABS})")
++        if view_fn is None:
++            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++            view_fn = get_accelerator_view_from_cpu_tensor
++        self.views = [view_fn(t) for t in slab_tensors]
++        bnd = [int(x) for x in list(bounds)]
++        if len(bnd) != n + 1 or bnd[0] != 0:
++            raise ValueError(f"B70-V7-PLEG: bounds {bnd[:4]}... do not match {n} slabs")
++        # starts of slabs 1..n-1, then the end; unused slots never match (lo = hi).
++        self.bounds = bnd[1:] + [bnd[-1]] * (_MAX_SLABS - n)
++        self.tp_start = int(tp_start)
++        self.tp_end = int(tp_end)
++        self.row = int(row_bytes)
++
++    def __call__(
++        self, ids: torch.Tensor, query_start_loc: torch.Tensor, out: torch.Tensor
++    ) -> None:
++        T, H = ids.shape
++        if T == 0:
++            return
++        v = self.views + [self.views[0]] * (_MAX_SLABS - len(self.views))
++        _ple_device_gather_kernel[(T, H)](
++            ids,
++            query_start_loc,
++            out,
++            *v,
++            *self.bounds,
++            self.tp_start,
++            self.tp_end,
++            query_start_loc.numel() - 1,
++            H=H,
++            ROW=self.row,
++            ROW_P2=triton.next_power_of_2(self.row),
++            NUM_SLABS=len(self.views),
++        )
++
++
++_logged = False
++
++
++def log_once(rank_info: str) -> None:
++    global _logged
++    if not _logged:
++        _logged = True
++        logger.info(
++            "B70-V7-PLEG PLE producer on the device (in-graph hash + UVA "
++            "row gather, no per-step host sync): %s",
++            rank_info,
++        )
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py b/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
+index 170b8c2efb..e1bddfb122 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_ram.py
+@@ -79,6 +79,8 @@ class Qwen4ExpPLEInt8RAMEmbedding(Qwen4ExpPLEInt8NVMeEmbedding):
+         super().__init__(*args, **kwargs)
+         self._table = None
+         self._slab_tensors: list[torch.Tensor] = []
++        self._devgather = None  # B70-V7-PLEG
++        self._pleg_checked = False
+ 
+     def _pinned_slab(self, rows: int, row_bytes: int) -> np.ndarray:
+         t = torch.empty(rows, row_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+@@ -152,6 +154,44 @@ class Qwen4ExpPLEInt8RAMEmbedding(Qwen4ExpPLEInt8NVMeEmbedding):
+             "rows [%d, %d), %s", rank, table.num_rows, pinned / 2**30, loaded_s, alloc_s,
+             info["gbps"], "" if info["direct"] else " buffered", info["slabs"], check_s,
+             self._own_heads.tolist(), tp_start, tp_end, path)
++        from . import b70_ple_devgather
++
++        if b70_ple_devgather.enabled():
++            self._devgather = b70_ple_devgather.DeviceGather(
++                self._slab_tensors, table.bounds, tp_start, tp_end, self._storage)
++            b70_ple_devgather.log_once(
++                f"rank {rank}, {len(self._slab_tensors)} slabs, rows [{tp_start}, {tp_end}), "
++                f"{self._storage} B/row; prepare_inputs no longer syncs for PLE")
++
++    # -- B70-V7-PLEG: device producer ------------------------------------
++    def device_fill(self, ids: torch.Tensor, query_start_loc: torch.Tensor,
++                    out: torch.Tensor | None = None) -> None:
++        """In-forward producer: rows of ``ids`` [T, heads] into the packed buffer."""
++        if out is None:
++            out = self._prefetch_buffer[: ids.shape[0]]
++        self._devgather(ids, query_start_loc, out)
++
++    def prepare_device(self, num_tokens_padded: int) -> None:
++        """B70-V7-PLEG bookkeeping for the consumer: no host work, no copy."""
++        self._check_capacity(num_tokens_padded)
++        self._prepared_tokens = num_tokens_padded
++
++    def check_device_gather(self, ids_dev: torch.Tensor, query_start_loc: torch.Tensor,
++                            num_tokens_padded: int) -> None:
++        """Once, on the first real step after ``prepare`` filled the stage on the host:
++        the device ids + gather must reproduce the stage bytes exactly."""
++        self._pleg_checked = True
++        tmp = torch.empty_like(self._prefetch_buffer[:num_tokens_padded])
++        self.device_fill(ids_dev, query_start_loc, tmp)
++        got = tmp.cpu()
++        want = self._stage[:num_tokens_padded]
++        bad = int((got != want).any(dim=-1).sum())
++        if bad:
++            raise RuntimeError(
++                f"B70-V7-PLEG device PLE gather differs from the host stage in {bad} of "
++                f"{num_tokens_padded * self._heads} (token, head) slots")
++        logger.info("B70-V7-PLEG check: device ids + gather equal the host stage "
++                    "(%d tokens x %d heads)", num_tokens_padded, self._heads)
+ 
+     def _fill_stage(self, ids: np.ndarray, num_tokens: int, num_padded: int) -> None:
+         stage = self._stage_np
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index b25ba9e9ff..76e8858e88 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -143,6 +143,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 raise ValueError("Disk BF16 PLE input length differs from dispatch")
+             if num_tokens_padded == 0:
+                 continue
++            emb = module.ngram_embedding
++            if getattr(emb, "_devgather", None) is not None and emb._pleg_checked:
++                # B70-V7-PLEG: the forward hashes and gathers on the device.
++                emb.prepare_device(num_tokens_padded)
++                continue
+             if _B70_HOST_IDS and hasattr(module, "compute_ngram_ids_host"):
+                 # B70-V32-03: one small D2H of the tokens + context, ids hashed on the host: the
+                 # step's only host sync no longer waits behind ~50 eager hash kernels.
+@@ -162,6 +167,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 )
+                 _b70p.mark("ple-prep")
+                 module.ngram_embedding.prepare(None, num_tokens, num_tokens_padded, host_ids=ids)
++                if getattr(emb, "_devgather", None) is not None and num_tokens > 0:
++                    # B70-V7-PLEG: first real step, the host path is the reference.
++                    emb._wait_for_stage()
++                    emb.check_device_gather(
++                        module.device_ngram_ids(
++                            input_batch.input_ids, query_start_loc, model_inputs["ngram_context"]),
++                        query_start_loc, num_tokens_padded)
+                 continue
+             # Existing GPU IDs use the authoritative committed context above.
+             # This producer runs before FULL replay as well as ordinary forward.
+@@ -175,6 +187,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
+                 input_batch.num_tokens,
+                 num_tokens_padded,
+             )
++            if getattr(emb, "_devgather", None) is not None and input_batch.num_tokens > 0:
++                emb._wait_for_stage()
++                emb.check_device_gather(
++                    module.device_ngram_ids(
++                        input_batch.input_ids, query_start_loc, model_inputs["ngram_context"]),
++                    query_start_loc, num_tokens_padded)
+         return model_inputs
+ 
+     def prepare_dummy_inputs(
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 4e81aa8863..eaa6fede87 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -316,6 +316,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+                                   consts[2], int(self.eos_token_id), int(self.heads_per_ngram),
+                                   int(self.ngram_size))
+ 
++    def device_ngram_ids(self, input_ids, query_start_loc, ngram_context) -> torch.Tensor:
++        """B70-V7-PLEG: the fused Triton n-gram hash on any Triton device (the
++        stock dispatch below takes it on CUDA only and runs ~50 eager ops on XPU)."""
++        return ple_ngram_ids(
++            input_ids=input_ids.reshape(-1),
++            query_start_loc=query_start_loc,
++            ngram_context=ngram_context,
++            layer_multipliers=self.layer_multipliers,
++            ngram_heads_vocab_sizes=self.ngram_heads_vocab_sizes,
++            ngram_heads_offsets=self.ngram_heads_offsets,
++            eos_token_id=self.eos_token_id,
++            heads_per_ngram=self.heads_per_ngram,
++        )
++
+     def compute_ngram_ids(
+         self,
+         input_ids: torch.Tensor,
+@@ -412,6 +426,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         """Return full embeddings or a token shard after combining vocabulary owners."""
+         embedding = self.ngram_embedding
+         if embedding.supports_prefetch:
++            if getattr(embedding, "_devgather", None) is not None:
++                # B70-V7-PLEG: the producer runs here, on the device (in-graph).
++                embedding.device_fill(
++                    self.device_ngram_ids(input_ids, query_start_loc, ngram_context),
++                    query_start_loc,
++                )
+             # Prefetch contains full tokens even when hidden states are sharded.
+             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
+         else:

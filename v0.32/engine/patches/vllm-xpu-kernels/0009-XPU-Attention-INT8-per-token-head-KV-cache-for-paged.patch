@@ -1,0 +1,563 @@
+From d99c0d2d690d97523a0ea41e8781a72cf5a77c43 Mon Sep 17 00:00:00 2001
+From: wiesion <wiesion@gmail.com>
+Date: Mon, 5 Oct 2026 14:26:50 +0200
+Subject: [PATCH 09/15] [XPU][Attention] INT8 per-token-head KV cache for paged
+ decode
+
+Add vLLM's int8_per_token_head KV cache dtype to the Xe2 paged decode
+(split-K) FlashAttention path.
+
+- KV dtype int8 with one fp32 scale per (KV token, KV head). The scales are
+  passed through the existing k_descale / v_descale arguments as strided
+  scale caches [num_blocks, block_size, num_heads_kv]; no op schema change.
+- Layout: per block [int8 K|V for all (slot, head) | K scales | V scales]
+  (same bytes per block as vLLM's inline per-token-head layout, arranged so
+  every K/V base is 64-byte aligned for Xe 2D block loads). Because the block
+  stride is not a whole number of KV tiles, INT8 tiles are loaded through
+  per-block 2D surfaces.
+- Dedicated INT8 tile step in DecodeFwdMainloop: one page-table read per
+  tile, scale loads issued before the K loads, K scale applied to the S
+  columns before masking, V scale to the P columns after the softmax row
+  sums. Tokens at or beyond seq_len get scale 0. fp16/bf16/fp8 paths are
+  unchanged.
+- flash_api: validate the INT8 cache/scale views; INT8 KV is paged decode
+  only (max_seqlen_q == 1, plus the uniform small-q speculative-decode route
+  that runs through the decode kernel). Prefill callers dequantize the
+  referenced blocks and use the fp16/bf16 kernel.
+
+Assisted-by: Claude Code
+Signed-off-by: Thomas Wieser <thomas@wiesion.ch>
+
+Adapted from: https://github.com/wiesion/vllm-xpu-kernels/commit/60668c49a156f85ef397ac54c4759fc45f4b2f78
+  (branch int8-kv-llmscaler, intel/llm-scaler#744 / #739; Apache-2.0, DCO
+  signed off by the author). Port onto vllm-xpu-kernels 0.1.16.2 (6b30c9b +
+  b70.5): CutlassDType moved to csrc/xpu/attn/fmha_utils.hpp; the KV head is
+  passed to both has_large_surface instantiations of the decode mainloop, and
+  INT8 KV never takes the 2^24-row surface split (it builds one surface per
+  KV block); q_descale normalisation kept; fp8 Q with INT8 KV rejected.
+Ported-by: Lumnus <lumnus.org@gmail.com>
+
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index 1bb0462..ef6fb81 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -139,8 +139,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
+ 
+   TORCH_CHECK(
+       v.scalar_type() == k_type, "key and value must have the same dtype");
++  const bool is_int8_kv = k_type == at::ScalarType::Char;
+   if (k_type != at::ScalarType::Float8_e5m2 &&
+-      k_type != at::ScalarType::Float8_e4m3fn) {
++      k_type != at::ScalarType::Float8_e4m3fn && !is_int8_kv) {
+     TORCH_CHECK(
+         k.scalar_type() == q_type, "query and key must have the same dtype");
+     TORCH_CHECK(
+@@ -173,8 +174,24 @@ std::vector<at::Tensor> mha_varlen_fwd(
+     TORCH_CHECK(
+         block_table.stride(-1) == 1,
+         "page_table must have contiguous last dimension");
+-    check_paged_kv_cache_strides(k, v);
++    if (is_int8_kv) {
++      // Split layout: block stride is not a multiple of the row stride.
++      check_int8_kv_cache(k, v, k_scale, v_scale);
++    } else {
++      check_paged_kv_cache_strides(k, v);
++    }
++  } else {
++    TORCH_CHECK(!is_int8_kv, "INT8 KV cache requires a paged KV cache");
+   }
++  TORCH_CHECK(
++      !is_int8_kv || !q_is_fp8,
++      "INT8 KV cache requires a half or bfloat16 query");
++  // INT8 KV is implemented in the paged decode kernel only. Prefill / mixed
++  // batches should dequantize the referenced blocks and use the fp16/bf16 path.
++  TORCH_CHECK(
++      !is_int8_kv || max_seqlen_q == 1,
++      "INT8 KV cache is supported for decode (max_seqlen_q == 1) only; "
++      "dequantize the KV blocks for prefill");
+ 
+   CHECK_DEVICE(cu_seqlens_q);
+   CHECK_CONTIGUOUS(cu_seqlens_q);
+diff --git a/csrc/xpu/attn/fmha_utils.hpp b/csrc/xpu/attn/fmha_utils.hpp
+index fb813f9..88edf73 100644
+--- a/csrc/xpu/attn/fmha_utils.hpp
++++ b/csrc/xpu/attn/fmha_utils.hpp
+@@ -12,7 +12,7 @@
+ #define HEAD_SIZE_LIMIT_6 512
+ #define HEAD_SIZE_LIMIT_7 576
+ 
+-enum class CutlassDType { half, bfloat16, float8_e4m3, float8_e5m2 };
++enum class CutlassDType { half, bfloat16, float8_e4m3, float8_e5m2, int8 };
+ 
+ // Struct to carry separate Q and K dtypes without breaking existing API
+ struct CutlassQKType {
+@@ -40,11 +40,13 @@ inline CutlassDType aten_to_dtype(const at::ScalarType st) {
+     return CutlassDType::float8_e4m3;
+   } else if (st == torch::kFloat8_e5m2) {
+     return CutlassDType::float8_e5m2;
++  } else if (st == torch::kChar) {
++    return CutlassDType::int8;  // KV only: per-token-head INT8 KV cache
+   }
+   TORCH_INTERNAL_ASSERT(
+       false,
+-      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2 supported "
+-      "for Q/K.");
++      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2 (and int8 "
++      "for KV) supported for Q/K.");
+ }
+ 
+ inline CutlassDType aten_to_dtype(const at::Tensor& t) {
+diff --git a/csrc/xpu/attn/paged_kv_utils.h b/csrc/xpu/attn/paged_kv_utils.h
+index 67a1b4e..adc88a7 100644
+--- a/csrc/xpu/attn/paged_kv_utils.h
++++ b/csrc/xpu/attn/paged_kv_utils.h
+@@ -85,3 +85,56 @@ inline void check_paged_kv_cache_strides(
+           std::numeric_limits<int>::max(),
+       "effective_total exceeds int32 range");
+ }
++
++// INT8 per-token-head KV cache: int8 K/V views over the block-local split
++// layout
++// ([int8 K|V data for all (slot, head) | K scales fp32 | V scales fp32] per
++// block) plus fp32 scale caches [num_blocks, block_size, num_heads_kv] passed
++// as k_scale / v_scale. Validates everything the kernels rely on.
++inline void check_int8_kv_cache(
++    const at::Tensor& key_cache,
++    const at::Tensor& value_cache,
++    const std::optional<const at::Tensor>& k_scale,
++    const std::optional<const at::Tensor>& v_scale) {
++  TORCH_CHECK(
++      key_cache.scalar_type() == at::ScalarType::Char &&
++          value_cache.scalar_type() == at::ScalarType::Char,
++      "INT8 KV cache: key and value caches must both be int8");
++  TORCH_CHECK(
++      key_cache.dim() == 4 && value_cache.dim() == 4,
++      "INT8 KV cache must be paged: [num_blocks, block_size, num_heads_kv, "
++      "head_size]");
++  TORCH_CHECK(
++      k_scale.has_value() && v_scale.has_value(),
++      "INT8 KV cache requires per-token-head k_scale and v_scale caches");
++  for (const auto* s : {&*k_scale, &*v_scale}) {
++    TORCH_CHECK(
++        s->scalar_type() == at::ScalarType::Float && s->dim() == 3 &&
++            s->size(0) == key_cache.size(0) &&
++            s->size(1) == key_cache.size(1) && s->size(2) == key_cache.size(2),
++        "INT8 KV scale caches must be float32 [num_blocks, block_size, "
++        "num_heads_kv] matching the KV cache");
++  }
++  TORCH_CHECK(
++      k_scale->strides() == v_scale->strides(),
++      "INT8 KV k_scale and v_scale caches must have identical strides");
++  TORCH_CHECK(
++      key_cache.strides() == value_cache.strides(),
++      "INT8 KV key and value caches must have identical strides");
++  // Xe 2D block loads need 64-byte aligned surface bases; the kernels build one
++  // surface per (block, head) for K and for V.
++  auto addr = [](const at::Tensor& t) {
++    return reinterpret_cast<uintptr_t>(t.data_ptr());
++  };
++  TORCH_CHECK(
++      addr(key_cache) % 64 == 0 && addr(value_cache) % 64 == 0 &&
++          key_cache.stride(0) % 64 == 0 && key_cache.stride(2) % 64 == 0,
++      "INT8 KV cache: block, head and K/V base addresses must be 64-byte "
++      "aligned (head_size must be a multiple of 64 for the split layout); got "
++      "page stride ",
++      key_cache.stride(0),
++      ", head stride ",
++      key_cache.stride(2),
++      ", V offset ",
++      static_cast<int64_t>(addr(value_cache) - addr(key_cache)));
++}
+diff --git a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
+index 0525ec8..fd8a1eb 100644
+--- a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
++++ b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
+@@ -875,6 +875,10 @@ struct DecodeFwdMainloop<
+   static constexpr bool CausalMask = CausalMask_;
+   static constexpr bool Fp8KV =
+       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
++  // INT8 per-token-head KV: int8 K/V tiles plus one fp32 scale per (KV token,
++  // KV head), read from [num_blocks, block_size, num_heads_kv] scale caches
++  // (scale_k / scale_v point to them). Paged KV only.
++  static constexpr bool Int8KV = is_same_v<ElementK, int8_t>;
+   static constexpr bool LocalMask = LocalMask_;
+ 
+   // User-facing arguments
+@@ -892,6 +896,11 @@ struct DecodeFwdMainloop<
+     int window_size_right;
+     // Physical stride between paged blocks in seq-position units
+     int page_stride_elements;
++    // INT8 KV only (see FMHAFwdMainloop::Arguments).
++    int64_t scale_stride_block = 0;
++    int64_t scale_stride_slot = 0;
++    int64_t scale_stride_head = 0;
++    int64_t page_stride_bytes = 0;
+   };
+ 
+   // Kernel-facing parameters
+@@ -922,7 +931,11 @@ struct DecodeFwdMainloop<
+         args.total_seqlen_kv,
+         args.window_size_left,
+         args.window_size_right,
+-        args.page_stride_elements};
++        args.page_stride_elements,
++        args.scale_stride_block,
++        args.scale_stride_slot,
++        args.scale_stride_head,
++        args.page_stride_bytes};
+   }
+ 
+   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+@@ -945,7 +958,8 @@ struct DecodeFwdMainloop<
+       int thr_id,
+       int seq_len,
+       int full_tile_offset,
+-      int discard_seq_coord) {
++      int discard_seq_coord,
++      int head_kv = 0) {
+     using namespace sycl::ext::oneapi::this_work_item;
+ 
+     // Short dimension names:
+@@ -1214,7 +1228,9 @@ struct DecodeFwdMainloop<
+     }
+ 
+     for (int D = 0; D < size<4>(pKgK); D++) {
+-      prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
++      if constexpr (!Int8KV) {
++        prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
++      }
+     }
+ 
+     clear(tArA);
+@@ -1238,9 +1254,171 @@ struct DecodeFwdMainloop<
+       effective_scale = params.scale * ElementS(scale_k);
+     }
+ 
++    // INT8 KV helpers (only instantiated for int8 K/V; see Arguments).
++    auto int8_phys_block = [&](int k_tile) {
++      int page_local = k_tile * get<1>(TileShapeQK{}) / params.page_size;
++      page_local = page_local < params.max_pages_per_seq
++                       ? page_local
++                       : params.max_pages_per_seq - 1;
++      return params
++          .ptr_page_table[idx_b * params.max_pages_per_seq + page_local];
++    };
++    auto int8_tile_in_block = [&](int k_tile) {
++      return k_tile % (params.page_size / get<1>(TileShapeQK{}));
++    };
++    // INT8 decode tile step: one page-table read per tile, scale loads issued
++    // before the K loads, per-block K/V surfaces built once per tile, V of this
++    // tile and K of the next tile prefetched through per-block surfaces.
++    auto int8_k_surface = [&](int pblk) {
++      return make_tensor(
++          K_2D.data() + int64_t(pblk) * params.page_stride_bytes,
++          make_layout(
++              make_shape(params.page_size, get<1>(K_2D.shape())),
++              K_2D.stride()));
++    };
++    auto int8_v_surface = [&](int pblk) {
++      return make_tensor(
++          V_2D.data() + int64_t(pblk) * params.page_stride_bytes,
++          make_layout(
++              make_shape(get<0>(V_2D.shape()), params.page_size),
++              V_2D.stride()));
++    };
++    auto int8_scales = [&](void* cache, int k_tile, int pblk) {
++      FragSCol sc;
++      const float* base = static_cast<const float*>(cache) +
++                          int64_t(pblk) * params.scale_stride_block +
++                          int64_t(head_kv) * params.scale_stride_head;
++      int k =
++          get<0>(tKgK(0, 0, 0, k_tile, 0)) + get_sub_group().get_local_id()[0];
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < sc.size(); i++, k += intel::sg_size) {
++        sc(i) = (k < seq_len) ? ElementS(
++                                    base
++                                        [int64_t(k % params.page_size) *
++                                         params.scale_stride_slot])
++                              : ElementS(0);
++      }
++      return sc;
++    };
++    auto int8_prefetch_k = [&](int k_tile) {
++      if (k_tile >= blk_k1) return;
++      auto K_blk = int8_k_surface(int8_phys_block(k_tile));
++      TiledCopyK copy_k_blk{K_blk};
++      auto pf_k = make_block_2d_prefetch(copy_k_blk);
++      auto pKgK_blk = pf_k.get_slice(thr_id).partition_S(local_tile(
++          make_identity_tensor(K_blk.shape()),
++          TileShapeQK{},
++          make_coord(_, _, _),
++          Step<X, _1, _1>{}));
++      CUTLASS_PRAGMA_UNROLL
++      for (int D = 0; D < size<4>(pKgK_blk); D++) {
++        prefetch(pf_k, pKgK_blk(_, _, _, int8_tile_in_block(k_tile), D));
++      }
++    };
++    auto int8_decode_tile = [&](int K) {
++      const int pblk = int8_phys_block(K);
++      const int t = int8_tile_in_block(K);
++      FragSCol ksc = int8_scales(params.scale_k, K, pblk);
++      FragSCol vsc = int8_scales(params.scale_v, K, pblk);
++
++      auto K_blk = int8_k_surface(pblk);
++      TiledCopyK copy_k_blk{K_blk};
++      auto tKgK_blk = thr_copy_k.partition_S(local_tile(
++          make_identity_tensor(K_blk.shape()),
++          TileShapeQK{},
++          make_coord(_, _, _),
++          Step<X, _1, _1>{}));
++      auto V_blk = int8_v_surface(pblk);
++      TiledCopyV copy_v_blk{V_blk};
++      auto gV_blk = local_tile(
++          make_identity_tensor(V_blk.shape()),
++          tile_shape_v,
++          make_coord(get<1>(blk_qv), _));
++      auto tVgV_blk = thr_copy_v.partition_S(local_tile(
++          gV_blk, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{}));
++      auto pf_v = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_blk);
++      auto pVgV_blk = pf_v.get_slice(thr_id).partition_S(gV_blk);
++
++      /* GEMM 1: S = K * Q */
++      clear(tSrS);
++      for (int D = 0; D < size<4>(tKgK); D++) {
++        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
++        copy(copy_k_blk, tKgK_blk(_, _, _, t, D), tKrK);
++        reorder(tQrQ, tSrQ);
++        reorder(tKrK, tSrK);
++        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
++      }
++      prefetch(pf_v, pVgV_blk(_, _, _, t));
++      int8_prefetch_k(K + 1);
++
++      // S(:, j) *= k_scale[j]: per-token K dequantization (before masking).
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tSrS.size(); i++) {
++        tSrS(i) *= broadcast<1>(ksc, tSrS, i);
++      }
++
++      /* Local/sliding window masking */
++      if constexpr (LocalMask) {
++        int decode_row = seq_len - 1 - full_tile_offset;
++        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
++        Tensor gP = local_tile(
++            cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
++        auto cS_thread = thr_mma_qk.partition_C(gP);
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < tSrS.size(); ++i) {
++          int col_idx = get<1>(cS_thread(i)) - full_tile_offset;
++          bool left_mask = col_idx < decode_row - params.window_size_left;
++          bool right_mask = col_idx > decode_row + params.window_size_right;
++          if (left_mask || right_mask) {
++            tSrS(i) = ElementS(-INFINITY);
++          }
++        }
++      }
++
++      /* k masking for remainder tiles */
++      if (check_remainder_k && K == blk_k1 - 1) {
++        FragSCol k_rem_mask;
++        int k = get<0>(tKgK(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
++          k_rem_mask(i) =
++              (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
++        }
++        CUTLASS_PRAGMA_UNROLL
++        for (int i = 0; i < tSrS.size(); i++) {
++          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
++        }
++      }
++
++      softmax(effective_scale, K == blk_k0, tSrS, tA_max, tA_sum, tArA);
++      // P(:, j) *= v_scale[j]: per-token V dequantization, applied after the
++      // softmax row sums so the normalizer is unaffected.
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tSrS.size(); i++) {
++        tSrS(i) *= broadcast<1>(vsc, tSrS, i);
++      }
++      reorder(tSrS, tArP);
++
++      /* GEMM 2: A += P * V, split in v dimension */
++      CUTLASS_PRAGMA_UNROLL
++      for (int VV = 0; VV < VTiles; VV++) {
++        copy(copy_v_blk, tVgV_blk(_, _, _, VV, t), tVrV);
++        reorder(tVrV, tArV);
++        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
++      }
++      barrier();
++    };
++    if constexpr (Int8KV) {
++      int8_prefetch_k(blk_k0);
++    }
++
+     /* Main loop, blocked in k. */
+     int next_tile_idx;
+     for (int K = blk_k0; K < blk_k1; K++) {
++      if constexpr (Int8KV) {
++        int8_decode_tile(K);
++        continue;
++      }
+       /* Split barrier to keep threads together */
+       // barrier_arrive(ScopeWorkgroup);
+ 
+diff --git a/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp b/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
+index eeb9728..12f23aa 100644
+--- a/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
++++ b/csrc/xpu/attn/xe_2/kernel/paged_decode_kernel.hpp
+@@ -463,7 +463,10 @@ class XeFMHAFwdSplitKVKernel {
+       int end_blk = kv_split_offset + num_effective_kv_blocks;
+ 
+       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+-      bool has_large_surface = kXeMaxSurfaceRows < total_seqlen_kv;
++      // INT8 KV builds one 2D surface per KV block (page_size rows), so the
++      // 2^24-row surface split never applies to it.
++      bool has_large_surface = !CollectiveMainloop::Int8KV &&
++                               kXeMaxSurfaceRows < total_seqlen_kv;
+       if (has_large_surface) {
+         mainloop.template operator()<true>(
+             Q(_, _, head, l_coord),
+@@ -480,7 +483,8 @@ class XeFMHAFwdSplitKVKernel {
+             thr_id,
+             seq_len,
+             full_tile_offset,
+-            discard_seq_coord);
++            discard_seq_coord,
++            head);
+       } else {
+         mainloop.template operator()<false>(
+             Q(_, _, head, l_coord),
+@@ -497,7 +501,8 @@ class XeFMHAFwdSplitKVKernel {
+             thr_id,
+             seq_len,
+             full_tile_offset,
+-            discard_seq_coord);
++            discard_seq_coord,
++            head);
+       }
+ 
+       if constexpr (
+diff --git a/csrc/xpu/attn/xe_2/paged_decode.hpp b/csrc/xpu/attn/xe_2/paged_decode.hpp
+index b98617d..f6a76fc 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode.hpp
++++ b/csrc/xpu/attn/xe_2/paged_decode.hpp
+@@ -163,6 +163,15 @@ struct paged_decode_args_t {
+   // pass), otherwise by the ReduceSplitK kernel.
+   float* softmax_lse = nullptr;
+   int lse_stride = 0;  // stride along the head dim (= total_seqlen_q)
++  // INT8 per-token-head KV (key/value dtype int8): k_scale / v_scale point to
++  // fp32 scale caches [num_blocks, block_size, num_heads_kv]; strides in
++  // floats.
++  int64_t kv_scale_stride_block = 0;
++  int64_t kv_scale_stride_slot = 0;
++  int64_t kv_scale_stride_head = 0;
++  // Physical bytes between consecutive KV blocks (INT8 block-local split
++  // layout).
++  int64_t kv_page_stride_bytes = 0;
+ };
+ 
+ template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
+@@ -351,7 +360,11 @@ struct DecodeKernelLauncher {
+          args.window_size_right,
+          // page_stride_elements: physical stride between paged blocks in
+          // seq-position units. It includes interleaved and cross-layer gaps.
+-         args.page_stride_elements},
++         args.page_stride_elements,
++         args.kv_scale_stride_block,
++         args.kv_scale_stride_slot,
++         args.kv_scale_stride_head,
++         args.kv_page_stride_bytes},
+         {},
+         hw_info,
+         args.num_kv_splits};
+@@ -649,6 +662,21 @@ void decode_policy_dispatch_impl(
+           float_e5m2_t,
+           float_e5m2_t,
+           half_t>::kernel_dispatch(queue, args);
++    } else if (cuQKType.k_type == CutlassDType::int8) {
++      return PagedDecodeConfig<
++          typename decode_policy::ShapeQK,
++          typename decode_policy::ShapePV,
++          typename decode_policy::ShapeOut,
++          typename decode_policy::SubgroupLayoutQK,
++          void,
++          PipelineStages,
++          Causal,
++          Local,
++          Sink,
++          half_t,
++          int8_t,
++          int8_t,
++          half_t>::kernel_dispatch(queue, args);
+     }
+   } else if (cuQKType.q_type == CutlassDType::bfloat16) {
+     if (cuQKType.k_type == CutlassDType::bfloat16) {
+@@ -696,6 +724,21 @@ void decode_policy_dispatch_impl(
+           float_e5m2_t,
+           float_e5m2_t,
+           bfloat16_t>::kernel_dispatch(queue, args);
++    } else if (cuQKType.k_type == CutlassDType::int8) {
++      return PagedDecodeConfig<
++          typename decode_policy::ShapeQK,
++          typename decode_policy::ShapePV,
++          typename decode_policy::ShapeOut,
++          typename decode_policy::SubgroupLayoutQK,
++          void,
++          PipelineStages,
++          Causal,
++          Local,
++          Sink,
++          bfloat16_t,
++          int8_t,
++          int8_t,
++          bfloat16_t>::kernel_dispatch(queue, args);
+     }
+   }
+   TORCH_CHECK(
+diff --git a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+index a35f534..33c5c3c 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
++++ b/csrc/xpu/attn/xe_2/paged_decode_xe2.cpp
+@@ -227,6 +227,18 @@ void cutlass_paged_decode_impl(
+       is_varlen ? int64_t{0} : query.stride(0),
+       page_stride_elements};
+ 
++  // INT8 per-token-head KV: k_scale / v_scale are the per-token scale caches
++  // (validated in check_int8_kv_cache); the split layout's block stride is
++  // passed in bytes.
++  if (key_cache.scalar_type() == at::ScalarType::Char) {
++    args.k_scale = k_scale.value().data_ptr();
++    args.v_scale = v_scale.value().data_ptr();
++    args.kv_scale_stride_block = k_scale->stride(0);
++    args.kv_scale_stride_slot = k_scale->stride(1);
++    args.kv_scale_stride_head = k_scale->stride(2);
++    args.kv_page_stride_bytes = key_cache.stride(0);
++  }
++
+   // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
+   // total_seqlen_k to cover the full physical extent for the 2D block
+   // load surface descriptor. Without this, block loads for blocks at
+diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
+index d6eb2a7..77de5bb 100644
+--- a/vllm_xpu_kernels/flash_attn_interface.py
++++ b/vllm_xpu_kernels/flash_attn_interface.py
+@@ -485,8 +485,14 @@ def flash_attn_varlen_func(
+     if softmax_scale is None:
+         softmax_scale = q.shape[-1]**(-0.5)
+     q_descale = _normalize_descale_tensor(q_descale, "q_descale")
+-    k_descale = _normalize_descale_tensor(k_descale, "k_descale")
+-    v_descale = _normalize_descale_tensor(v_descale, "v_descale")
++    if k.dtype == torch.int8:
++        # INT8 per-token-head KV: k_descale / v_descale are the fp32 scale
++        # caches [num_blocks, block_size, num_heads_kv] (validated in C++).
++        assert k_descale is not None and v_descale is not None, \
++            "INT8 KV cache requires per-token-head k_descale and v_descale"
++    else:
++        k_descale = _normalize_descale_tensor(k_descale, "k_descale")
++        v_descale = _normalize_descale_tensor(v_descale, "v_descale")
+     # custom op does not support non-tuple input
+     real_window_size: tuple[int, int]
+     if window_size is None:
+-- 
+2.43.0
+

@@ -1,0 +1,190 @@
+From 4193f51142ffe4dc4b985bb7c2ec6bfeac854902 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:20 +0000
+Subject: [PATCH 36/51] B70-V7-DFA: DFlash drafter attention on the native INT8
+ FA decode (B70_DRAFT_FA_INT8=1)
+
+With B70_PTH_FA_DECODE=1 and an int8_per_token_head draft KV,
+load_dflash_model builds the drafter on FLASH_ATTN instead of the configured
+backend (TRITON_ATTN, in-kernel dequant). Page bytes are TRITON_ATTN's, so
+KV sizing, unify and offload are unchanged; the FA impl writes and reads the
+D2 split layout. Refuses head_dim not a multiple of 64 with a log line.
+fa_int8_forward gains the non-causal sliding-window case (the drafter's
+2048 window): each draft row runs as one q-1 INT8 decode row with window
+[w, 0] from the block end. TRITON_ATTN measures the window per row, so a
+row j places before the block end loses its j oldest keys (<= 7 of 2048);
+exact while seq_len <= w + 1.
+---
+ vllm/v1/attention/backends/b70_pth_fa.py      | 63 ++++++++++++++++++-
+ .../v1/worker/gpu/spec_decode/dflash/utils.py | 49 ++++++++++++++-
+ 2 files changed, 109 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index af2c34a545..eb64a1c34f 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -344,13 +344,40 @@ def _capturing() -> bool:
+         return False
+ 
+ 
++_dfa_swa_logged = False
++
++
++def draft_swa_enabled() -> bool:
++    """B70-V7-DFA: a non-causal sliding-window block (the DFlash drafter,
++    window 2048) may take the INT8 decode route (B70_DRAFT_FA_INT8=1)."""
++    return os.environ.get("B70_DRAFT_FA_INT8", "0") == "1"
++
++
+ def _noncausal_rows_decode(
+-    query, key_cache, value_cache, k_scale, v_scale, output, attn_metadata, impl
++    query,
++    key_cache,
++    value_cache,
++    k_scale,
++    v_scale,
++    output,
++    attn_metadata,
++    impl,
++    window_left: int = -1,
+ ) -> None:
+     """Non-causal small-q rows (DFlash draft blocks): every query row attends
+     to its request's whole context, i.e. one q_len-1 decode row each. Graph-safe
+     (no host sync); padded rows past query_start_loc[-1] read one slot of block 0
+-    and are zeroed."""
++    and are zeroed.
++
++    B70-V7-DFA: ``window_left >= 0`` (a symmetric non-causal window ``(w, w)``)
++    gives every row the keys ``[seq_len - 1 - w, seq_len - 1]``, i.e. the
++    window measured from the block's last row. TRITON_ATTN measures it from
++    each row (``|q_pos - k_pos| <= w``), so a row ``j`` places before the block
++    end also sees ``j`` older keys there. The two agree while
++    ``seq_len <= w + 1``; past that each row ``j`` loses its ``j`` oldest keys
++    (at most q_len - 1 = 7 of 2048 for the DFlash K=7 drafter). The decode
++    kernel takes one scalar window, so the exact per-row edge is not
++    expressible in one launch."""
+     from vllm._xpu_ops import xpu_ops
+ 
+     total = query.shape[0]
+@@ -380,6 +407,7 @@ def _noncausal_rows_decode(
+         out=output,
+         block_table=bt,
+         seqused_k=used,
++        window_size=[window_left, 0] if window_left >= 0 else None,
+         k_descale=k_scale,
+         v_descale=v_scale,
+         s_aux=impl.sinks,
+@@ -446,6 +474,37 @@ def fa_int8_forward(
+             q, key_cache, value_cache, k_scale, v_scale, out, attn_metadata, impl
+         )
+         return output
++    if (
++        max_q <= spec_decode_max_qlen()
++        and window_size is not None
++        and window_size[0] == window_size[1]
++        and draft_swa_enabled()
++    ):
++        # B70-V7-DFA: the DFlash drafter's non-causal sliding window.
++        global _dfa_swa_logged
++        if not _dfa_swa_logged:
++            _dfa_swa_logged = True
++            logger.info(
++                "B70-V7-DFA non-causal sliding-window rows on the native INT8 "
++                "decode: window %d from the block end, max q %d, head_size %d, "
++                "kv heads %d",
++                window_size[0] + 1,
++                max_q,
++                impl.head_size,
++                impl.num_kv_heads,
++            )
++        _noncausal_rows_decode(
++            q,
++            key_cache,
++            value_cache,
++            k_scale,
++            v_scale,
++            out,
++            attn_metadata,
++            impl,
++            window_left=window_size[0],
++        )
++        return output
+ 
+     # Prefill or mixed batch: dequantize the referenced blocks into the K4
+     # scratch and run FA bf16 (the INT8 kernel has no prefill path).
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index 5b836ff954..aee044e9eb 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -1,8 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
++from vllm.logger import init_logger
+ from vllm.model_executor.model_loader import get_model
+ from vllm.model_executor.model_loader.utils import get_draft_load_config
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+@@ -12,6 +15,50 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+ )
+ from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
+ 
++logger = init_logger(__name__)
++
++
++def _b70_draft_attention_backend(vllm_config: VllmConfig):
++    """B70-V7-DFA (``B70_DRAFT_FA_INT8=1``): run the drafter's attention on
++    the native INT8 FLASH_ATTN decode (B70-IP-D2) instead of the configured
++    backend when the draft KV is int8_per_token_head and B70_PTH_FA_DECODE=1.
++    FLASH_ATTN keeps TRITON_ATTN's page bytes for this dtype, so KV sizing,
++    hybrid unify and offload see the same pages."""
++    spec = vllm_config.speculative_config
++    configured = spec.attention_backend
++    if os.environ.get("B70_DRAFT_FA_INT8", "0") != "1":
++        return configured
++    from vllm.v1.attention.backends import b70_pth_fa
++    from vllm.v1.attention.backends.registry import AttentionBackendEnum
++
++    dtype = spec.kv_cache_dtype or vllm_config.cache_config.cache_dtype
++    if dtype != "int8_per_token_head" or not b70_pth_fa.fa_decode_enabled():
++        logger.warning_once(
++            "B70-V7-DFA drafter FLASH_ATTN int8 off: draft KV dtype %s, "
++            "B70_PTH_FA_DECODE active %s (needs int8_per_token_head and 1)",
++            dtype,
++            b70_pth_fa.fa_decode_enabled(),
++        )
++        return configured
++    hf = spec.draft_model_config.hf_config
++    head_dim = getattr(hf, "head_dim", None) or (
++        hf.hidden_size // hf.num_attention_heads
++    )
++    if head_dim % 64 != 0:
++        logger.warning_once(
++            "B70-V7-DFA drafter FLASH_ATTN int8 off: head_dim %d is not a "
++            "multiple of 64 (INT8 decode surfaces need 64-B alignment)",
++            head_dim,
++        )
++        return configured
++    logger.info(
++        "B70-V7-DFA drafter attention: FLASH_ATTN native INT8 per-token-head "
++        "decode, head_dim %d (was %s)",
++        head_dim,
++        getattr(configured, "name", configured),
++    )
++    return AttentionBackendEnum.FLASH_ATTN
++
+ 
+ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+     from vllm.compilation.backends import set_model_tag
+@@ -29,7 +76,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+         attention_config=replace(
+             vllm_config.attention_config,
+             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
+-            backend=speculative_config.attention_backend,
++            backend=_b70_draft_attention_backend(vllm_config),
+         ),
+         cache_config=(
+             replace(

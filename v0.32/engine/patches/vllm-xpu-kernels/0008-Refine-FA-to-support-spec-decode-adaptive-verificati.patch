@@ -1,0 +1,360 @@
+From 82fb86d38d3b384f3f1cadd969d683e8b0f335fa Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Fri, 30 Oct 2026 15:13:06 +0800
+Subject: [PATCH 08/15] Refine FA to support spec-decode adaptive verification
+ (#647)
+
+* Refine FA to support spec-decode adaptive verification
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+* address comment
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+---------
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+diff --git a/tests/flash_attn/test_flash_attn_varlen_func.py b/tests/flash_attn/test_flash_attn_varlen_func.py
+index 0c69c11..5ec6fe1 100644
+--- a/tests/flash_attn/test_flash_attn_varlen_func.py
++++ b/tests/flash_attn/test_flash_attn_varlen_func.py
+@@ -2370,6 +2370,154 @@ def test_spec_decode_uniform_qlen(
+     torch.xpu.empty_cache()
+ 
+ 
++@pytest.mark.parametrize("query_lens", [(8, 1, 3, 4), (0, 8, 0, 3), (8, 0)])
++@pytest.mark.parametrize("window_size,is_sink", [((-1, -1), False),
++                                               ((256, 0), False),
++                                               ((-1, -1), True)])
++@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
++@torch.inference_mode()
++def test_spec_decode_varlen_graph_replay(query_lens, window_size, dtype,
++                                        is_sink, monkeypatch):
++    """Variable causal queries and padding remain correct after graph replay."""
++
++    torch.set_default_device("xpu")
++    torch.manual_seed(4242)
++    device = "xpu:0"
++    num_seqs = len(query_lens)
++    num_tokens = max(16, sum(query_lens))
++    query = torch.randn(num_tokens, 4, 128, dtype=dtype, device=device)
++    key_cache = torch.randn(128, 64, 1, 128, dtype=dtype, device=device)
++    value_cache = torch.randn_like(key_cache)
++    tables = torch.randint(0, 128, (num_seqs, 40), dtype=torch.int32,
++                           device=device)
++    block_tables = tables.clone()
++    boundaries = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
++    seq_k = torch.empty(num_seqs, dtype=torch.int32, device=device)
++    sink = torch.randn(4, dtype=dtype, device=device) if is_sink else None
++    native_fwd = torch.ops._vllm_fa2_C.varlen_fwd
++    launches = []
++
++    def checked_fwd(*args):
++        launches.append(args[10])
++        assert args[10] == 1
++        return native_fwd(*args)
++
++    monkeypatch.setattr(torch.ops._vllm_fa2_C, "varlen_fwd", checked_fwd)
++
++    def set_lengths(lengths, step=0):
++        boundaries.copy_(torch.tensor([0] + list(lengths), dtype=torch.int32,
++                                     device=device).cumsum(0))
++        kv_lens = [2039 + 29 * index + 17 * step if length else 0
++                   for index, length in enumerate(lengths)]
++        seq_k.copy_(torch.tensor(kv_lens, dtype=torch.int32, device=device))
++        block_tables.copy_(tables)
++        block_tables.masked_fill_((seq_k == 0)[:, None], -1)
++        return kv_lens
++
++    def run():
++        return flash_attn_varlen_func(
++            query, key_cache, value_cache, 8, boundaries, 2200,
++            seqused_k=seq_k, softmax_scale=128**-0.5, causal=True,
++            block_table=block_tables, window_size=window_size, s_aux=sink)
++
++    set_lengths(query_lens)
++    run()
++    run()
++    torch.xpu.synchronize()
++    graph = torch.xpu.XPUGraph()
++    with torch.xpu.graph(graph):
++        captured_output = run()
++    assert launches and all(length == 1 for length in launches)
++
++    layouts = (query_lens, tuple(reversed(query_lens)),
++               tuple(length // 2 for length in query_lens))
++    for step, lengths in enumerate(layouts):
++        tables.copy_(tables.roll(1, dims=1))
++        kv_lens = set_lengths(lengths, step)
++        query.normal_()
++        eager_output = run()
++        graph.replay()
++        active = [index for index, length in enumerate(lengths) if length]
++        reference = ref_paged_attn(
++            query=query[:sum(lengths)], key_cache=key_cache,
++            value_cache=value_cache,
++            query_lens=[lengths[index] for index in active],
++            kv_lens=[kv_lens[index] for index in active],
++            block_tables=block_tables[active], scale=128**-0.5,
++            casual=True, is_paged=True, sink=sink,
++            window_size_left=window_size[0],
++            window_size_right=window_size[1], dtype=dtype)
++        for output in (eager_output, captured_output):
++            torch.testing.assert_close(output[:sum(lengths)], reference,
++                                       atol=2e-2, rtol=1.5e-2)
++            assert torch.count_nonzero(output[sum(lengths):]).item() == 0
++
++
++@pytest.mark.parametrize("provide_out", [False, True])
++@pytest.mark.parametrize("error_message", [
++    "decode variant not compiled",
++    "unrelated decode failure",
++])
++@torch.inference_mode()
++def test_spec_decode_varlen_kernel_error(provide_out, error_message,
++                                         monkeypatch):
++    """Missing variants preserve padded outputs; unrelated errors propagate."""
++    torch.set_default_device("xpu")
++    torch.manual_seed(4242)
++    query = torch.randn(16, 4, 128, dtype=torch.bfloat16)
++    key_cache = torch.randn(128, 64, 1, 128, dtype=query.dtype)
++    value_cache = torch.randn_like(key_cache)
++    query_lens = [0, 8, 0, 3, 0]
++    kv_lens = [0, 2039, 0, 2097, 0]
++    boundaries = torch.tensor([0, 0, 8, 8, 11, 11], dtype=torch.int32)
++    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
++    block_tables = torch.randint(0, 128, (5, 40), dtype=torch.int32)
++    block_tables[seq_k == 0] = -1
++    metadata = [boundaries, seq_k, block_tables]
++    original_metadata = [tensor.clone() for tensor in metadata]
++    out = torch.full_like(query, float("nan")) if provide_out else None
++    error = RuntimeError(error_message)
++    launches = []
++
++    def missing_decode(*args):
++        launches.append(args[10])
++        assert args[10] == 1
++        raise error
++
++    monkeypatch.setattr(torch.ops._vllm_fa2_C, "varlen_fwd", missing_decode)
++
++    def run():
++        return flash_attn_varlen_func(
++            query, key_cache, value_cache, 8, boundaries, max(kv_lens),
++            seqused_k=seq_k, causal=True, block_table=block_tables, out=out)
++
++    if "not compiled" not in error_message:
++        with pytest.raises(RuntimeError, match=error_message) as exc_info:
++            run()
++        assert exc_info.value is error
++    else:
++        output = run()
++        active = [1, 3]
++        reference = ref_paged_attn(
++            query=query[:sum(query_lens)], key_cache=key_cache,
++            value_cache=value_cache,
++            query_lens=[query_lens[index] for index in active],
++            kv_lens=[kv_lens[index] for index in active],
++            block_tables=block_tables[active], scale=128**-0.5,
++            casual=True, window_size_left=-1, window_size_right=-1,
++            dtype=query.dtype)
++        assert output.shape == query.shape
++        if provide_out:
++            assert output is out
++        torch.testing.assert_close(output[:sum(query_lens)], reference,
++                                   atol=2e-2, rtol=1.5e-2)
++        assert torch.count_nonzero(output[sum(query_lens):]).item() == 0
++
++    assert launches == [1]
++    for actual, original in zip(metadata, original_metadata):
++        torch.testing.assert_close(actual, original)
++
++
+ # ---------------------------------------------------------------------------
+ # Regression: paged-decode attention-sink + small sliding-window NaN.
+ #
+diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
+index 5357eb2..d6eb2a7 100644
+--- a/vllm_xpu_kernels/flash_attn_interface.py
++++ b/vllm_xpu_kernels/flash_attn_interface.py
+@@ -25,14 +25,14 @@ _warned_missing_configs: set = set()
+ 
+ # Speculative-decoding fast path.
+ #
+-# In speculative decoding every sequence in the batch issues the same small
+-# number of query tokens (q_len = num_speculative_tokens + 1, e.g. 2/3/4). By
++# In speculative decoding each sequence issues a small number of query tokens,
++# potentially different across requests with adaptive verification. By
+ # default such a batch (max_seqlen_q > 1) is routed to the chunk-prefill
+ # kernel, which has no split-K parallelism over the KV dimension. With a long
+ # KV cache and only a handful of query rows the GPU is heavily under-utilized,
+ # so prefill is slow.
+ #
+-# Instead we reuse the split-K *decode* kernel: for a uniform, causal, paged
++# Instead we reuse the split-K *decode* kernel: for a causal, paged
+ # batch we treat each (sequence, query-position) pair as an independent
+ # single-token decode "sequence" and run the whole batch in one decode
+ # launch. Query token ``j`` (0-indexed within the q_len window) attends
+@@ -42,7 +42,7 @@ _warned_missing_configs: set = set()
+ # exact (it matches the causal reference) and gets the decode path's split-K
+ # parallelism.
+ #
+-# The path only triggers for small, uniform query lengths; larger uniform
++# The path only triggers for small query lengths; larger
+ # query lengths keep using chunk-prefill (which reuses the shared KV tile
+ # across the Q block, whereas the decode path rescans KV per query token).
+ # The default threshold (16) stays within the measured win region across KV
+@@ -71,18 +71,9 @@ def _spec_decode_varlen_fwd(
+     window_size,
+     softcap,
+ ):
+-    """Run the split-K decode kernel once for a speculative-decode batch.
+-
+-    Assumes a uniform query length: every sequence contributes the same
+-    ``q_len`` consecutive query tokens, laid out as ``q[i * q_len + j]`` for
+-    sequence ``i`` and position ``j``. Each (sequence, position) pair is
+-    treated as an independent single-token decode "sequence", so the whole
+-    batch runs in a single ``varlen_fwd`` launch. Returns the output tensor
+-    (same row order as ``q``).
+-    """
++    """Decode causal query rows, including empty requests and query padding."""
+     batch = cu_seqlens_q.numel() - 1
+-    q_len = q.shape[0] // batch
+-    total = q.shape[0]  # batch * q_len
++    total = q.shape[0]
+ 
+     # One decode query per (sequence, position) pair; the row order already
+     # matches q, so the output needs no reordering.
+@@ -90,17 +81,16 @@ def _spec_decode_varlen_fwd(
+                                      dtype=torch.int32,
+                                      device=q.device)
+     dummy_cu_seqlens_k = torch.zeros_like(cu_seqlens_q_spec)
+-    # Causal per-position KV length: query row i*q_len + j (position j within
+-    # the q_len window of sequence i) attends to seqused_k[i] - (q_len-1-j)
+-    # tokens.
+-    pos = torch.arange(q_len, device=q.device, dtype=seqused_k.dtype)
+-    seqused_k_spec = (seqused_k.view(batch, 1) -
+-                      (q_len - 1 - pos).view(1, q_len)).clamp_(min=1).reshape(
+-                          total).to(torch.int32)
+-
+-    # Expand the block table so each pseudo-sequence points at its parent
+-    # sequence's blocks.
+-    block_table_spec = block_table.repeat_interleave(q_len, dim=0)
++    positions = cu_seqlens_q_spec[:-1]
++    request_ids = torch.searchsorted(cu_seqlens_q[1:], positions,
++                                    right=True).clamp_(max=batch - 1)
++    query_ends = cu_seqlens_q[1:].index_select(0, request_ids)
++    is_padding = positions >= cu_seqlens_q[-1]
++    seqused_k_spec = (seqused_k.index_select(0, request_ids) -
++                     (query_ends - positions - 1)).clamp_(min=1).to(torch.int32)
++    seqused_k_spec.masked_fill_(is_padding, 1)
++    block_table_spec = block_table.index_select(0, request_ids)
++    block_table_spec.masked_fill_(is_padding[:, None], 0)
+ 
+     out, _ = torch.ops._vllm_fa2_C.varlen_fwd(
+         q,
+@@ -133,7 +123,7 @@ def _spec_decode_varlen_fwd(
+         None,  # splits_per_seq
+         None,  # work_list
+     )
+-    return out
++    return out.masked_fill_(is_padding[:, None, None], 0)
+ 
+ 
+ def maybe_contiguous(x):
+@@ -520,36 +510,6 @@ def flash_attn_varlen_func(
+             raise NotImplementedError(
+                 "FA2 only supports both KV cache descaled")
+ 
+-        # Speculative-decoding fast path: redirect small, uniform, causal,
+-        # paged query batches (q_len = num_speculative_tokens + 1) from the
+-        # slow chunk-prefill kernel to the split-K decode kernel. See the
+-        # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
+-        batch = cu_seqlens_q.numel() - 1
+-        is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
+-        # TODO: We could also support the case where q_descale is not None.
+-        if (block_table is not None and causal and not return_softmax_lse
+-                and softcap == 0.0 and alibi_slopes is None and q_v is None
+-                and q_descale is None and scheduler_metadata is None
+-                and seqused_k is not None
+-                and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
+-                and is_uniform_qlen):
+-            return _spec_decode_varlen_fwd(
+-                q,
+-                k,
+-                v,
+-                out,
+-                cu_seqlens_q,
+-                seqused_k,
+-                block_table,
+-                max_seqlen_k,
+-                k_descale,
+-                v_descale,
+-                softmax_scale,
+-                s_aux,
+-                real_window_size,
+-                softcap,
+-            )
+-
+         # Compute per-seq splits and work_list on host, upload to device.
+         # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
+         # multi-seq batches, and global num_splits_kv > 1.
+@@ -584,6 +544,34 @@ def flash_attn_varlen_func(
+                     device=q.device, non_blocking=True)
+ 
+         try:
++            # Speculative-decoding fast path: redirect small, causal,
++            # paged query batches to the split-K decode kernel. See the
++            # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
++            batch = cu_seqlens_q.numel() - 1
++            # TODO: We could also support the case where q_descale is not None.
++            if (block_table is not None and causal and not return_softmax_lse
++                    and softcap == 0.0 and alibi_slopes is None and q_v is None
++                    and q_descale is None and scheduler_metadata is None
++                    and seqused_k is not None
++                    and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
++                    and batch > 0 and q.shape[0] > 0):
++                return _spec_decode_varlen_fwd(
++                    q,
++                    k,
++                    v,
++                    out,
++                    cu_seqlens_q,
++                    seqused_k,
++                    block_table,
++                    max_seqlen_k,
++                    k_descale,
++                    v_descale,
++                    softmax_scale,
++                    s_aux,
++                    real_window_size,
++                    softcap,
++                )
++
+             out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+                 q,
+                 k,
+@@ -647,10 +635,15 @@ def flash_attn_varlen_func(
+                 s_aux=s_aux,
+                 return_softmax_lse=return_softmax_lse,
+             )
+-            if out is not None:
+-                out.copy_(fallback_out.reshape(out.shape))
+-            else:
++            if out is None and fallback_out.shape[0] == q.shape[0]:
+                 out = fallback_out
++            else:
++                if out is None:
++                    out = fallback_out.new_empty(
++                        (q.shape[0], *fallback_out.shape[1:]))
++                num_valid_tokens = fallback_out.shape[0]
++                out[:num_valid_tokens].copy_(fallback_out)
++                out[num_valid_tokens:].zero_()
+     else:
+         raise NotImplementedError("not support yet")
+     return (out, softmax_lse) if return_softmax_lse else (out)
+-- 
+2.43.0
+

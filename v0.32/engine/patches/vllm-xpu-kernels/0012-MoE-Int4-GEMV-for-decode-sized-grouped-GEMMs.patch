@@ -1,0 +1,517 @@
+From 5b5f3c7507ef4f9cab4acdf0f03903c2d19ff62a Mon Sep 17 00:00:00 2001
+From: riceharvest <myappleiddarimaan@gmail.com>
+Date: Thu, 15 Oct 2026 11:50:56 +0200
+Subject: [PATCH 12/15] [MoE] Int4 GEMV for decode-sized grouped GEMMs
+
+At decode each routed expert sees one row, and the int4 grouped GEMM's fixed
+cost per call dominates: 8 experts of Qwen3.6-35B-A3B are 13 MB of weights
+(~21 us at full bandwidth on a B70), but a gate_up call takes ~56 us and a
+down call ~34 us.
+
+Add _xpu_C.moe_int4_gemv for the int4 layout cutlass_grouped_gemm_interface
+already uses (int8-packed signed 4-bit weights [E, N, K/2], per-group scales
+[E, N, K/G]) and route int4 calls with at most 8 rows to it from
+XpuFusedMoe. Larger calls (prefill, MTP verify, batched decode) keep the
+grouped GEMM. VLLM_XPU_FUSED_MOE_INT4_GEMV=0 disables the new path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: riceharvest <myappleiddarimaan@gmail.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 00b6a41..a4c647c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -708,7 +708,8 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
+       "csrc/xpu/utils.cpp")
+   if(MOE_KERNELS_ENABLED)
+     list(APPEND VLLM_EXT_XPU_SRC
+-         "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp")
++         "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp"
++         "csrc/xpu/grouped_gemm/moe_int4_gemv.cpp")
+   endif()
+   if(GDN_KERNELS_ENABLED)
+     list(APPEND VLLM_EXT_XPU_SRC "csrc/xpu/gdn_attn/gdn_attn_interface.cpp")
+diff --git a/csrc/xpu/grouped_gemm/moe_int4_gemv.cpp b/csrc/xpu/grouped_gemm/moe_int4_gemv.cpp
+new file mode 100644
+index 0000000..5ec66c0
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/moe_int4_gemv.cpp
+@@ -0,0 +1,262 @@
++// Int4 MoE GEMV for decode-sized grouped GEMMs (a few rows per call).
++//
++// Same layout as the int4 path of cutlass_grouped_gemm_interface:
++//   A        [rows, K]      fp16/bf16, rows grouped by expert
++//   B        [E, N, K / 2]  int8, two signed 4-bit values per byte, element
++//                           2j in the low nibble (see implement_zp)
++//   B_scale  [E, N, K / G]  same dtype as A, symmetric per-group scale
++//   rows_per_expert [E]     int32
++//   D        [rows, N]      same dtype as A
++//
++// One work-group handles one expert that has rows and a block of N. Each
++// sub-group computes NR output columns for up to MC rows at a time; its lanes
++// split K into chunks of KCV values.
++
++#include <sycl/sycl.hpp>
++
++#include <algorithm>
++
++#include "csrc/utils.h"
++#include "xpu/ops.h"
++
++namespace vllm {
++
++constexpr int kSubGroupSize = 16;
++
++template <typename T, int NR, int SGS_PER_WG, int KCV, int MC>
++struct MoeInt4GemvKernel {
++  const T* A;
++  const int8_t* B;
++  const T* S;
++  const int* rows;
++  T* D;
++  int N, K, E, G, nblocks;
++  sycl::local_accessor<int, 1> slm;
++
++  [[sycl::reqd_sub_group_size(kSubGroupSize)]] void
++  operator()(sycl::nd_item<1> it) const {
++    auto sg = it.get_sub_group();
++    const int wg = it.get_group(0);
++    const int slot = wg / nblocks;
++    const int nb = wg % nblocks;
++
++    // Find the slot-th expert with rows and its first row: each work-item
++    // scans a slice of rows_per_expert.
++    {
++      const int wi = it.get_local_id(0);
++      const int ws = it.get_local_range(0);
++      const int chunk = (E + ws - 1) / ws;
++      const int i0 = sycl::min(E, wi * chunk);
++      const int i1 = sycl::min(E, i0 + chunk);
++      int cnt = 0, rsum = 0;
++      for (int i = i0; i < i1; ++i) {
++        const int r = rows[i];
++        cnt += r > 0;
++        rsum += r;
++      }
++      const int ecnt = sycl::exclusive_scan_over_group(
++          it.get_group(), cnt, sycl::plus<int>());
++      const int erows = sycl::exclusive_scan_over_group(
++          it.get_group(), rsum, sycl::plus<int>());
++      if (wi == 0) slm[0] = -1;
++      sycl::group_barrier(it.get_group());
++      if (slot >= ecnt && slot < ecnt + cnt) {
++        int seen = ecnt, pre = erows;
++        for (int i = i0; i < i1; ++i) {
++          const int r = rows[i];
++          if (r > 0) {
++            if (seen == slot) {
++              slm[0] = i;
++              slm[1] = pre;
++              break;
++            }
++            ++seen;
++          }
++          pre += r;
++        }
++      }
++    }
++    sycl::group_barrier(it.get_group());
++    const int e = slm[0];
++    const int pre = slm[1];
++    if (e < 0) return;
++
++    const int m_e = rows[e];
++    const int sgid = sg.get_group_linear_id();
++    const int lane = sg.get_local_linear_id();
++    const int n0 = (nb * SGS_PER_WG + sgid) * NR;
++    if (n0 >= N) return;
++    const int ngroups = K / G;
++    const int8_t* Be = B + (int64_t)e * N * (K / 2);
++    const T* Se = S + (int64_t)e * N * ngroups;
++    using WV = sycl::vec<uint32_t, KCV / 8>;
++    using AV = sycl::vec<T, 8>;
++
++    for (int m0 = 0; m0 < m_e; m0 += MC) {
++      const int mc = sycl::min(MC, m_e - m0);
++      float acc[NR][MC];
++#pragma unroll
++      for (int r = 0; r < NR; ++r)
++#pragma unroll
++        for (int m = 0; m < MC; ++m)
++          acc[r][m] = 0.f;
++
++      for (int kb = lane * KCV; kb < K; kb += kSubGroupSize * KCV) {
++        float a[MC][KCV];
++#pragma unroll
++        for (int m = 0; m < MC; ++m) {
++          if (m < mc) {
++            const AV* ap = reinterpret_cast<const AV*>(
++                A + (int64_t)(pre + m0 + m) * K + kb);
++#pragma unroll
++            for (int v = 0; v < KCV / 8; ++v) {
++              const AV x = ap[v];
++#pragma unroll
++              for (int j = 0; j < 8; ++j)
++                a[m][v * 8 + j] = static_cast<float>(x[j]);
++            }
++          }
++        }
++        const int g = kb / G;
++#pragma unroll
++        for (int r = 0; r < NR; ++r) {
++          const int n = n0 + r;
++          if (n >= N) break;
++          const WV w =
++              *reinterpret_cast<const WV*>(Be + (int64_t)n * (K / 2) + kb / 2);
++          const float s = static_cast<float>(Se[(int64_t)n * ngroups + g]);
++          float d[MC];
++#pragma unroll
++          for (int m = 0; m < MC; ++m)
++            d[m] = 0.f;
++#pragma unroll
++          for (int v = 0; v < KCV / 8; ++v) {
++            const uint32_t word = w[v];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++              int q = (word >> (4 * j)) & 0xF;
++              q = q >= 8 ? q - 16 : q;
++#pragma unroll
++              for (int m = 0; m < MC; ++m)
++                d[m] += (float)q * a[m][v * 8 + j];
++            }
++          }
++#pragma unroll
++          for (int m = 0; m < MC; ++m)
++            acc[r][m] += d[m] * s;
++        }
++      }
++
++#pragma unroll
++      for (int r = 0; r < NR; ++r) {
++        const int n = n0 + r;
++#pragma unroll
++        for (int m = 0; m < MC; ++m) {
++          const float v =
++              sycl::reduce_over_group(sg, acc[r][m], sycl::plus<float>());
++          if (lane == 0 && m < mc && n < N)
++            D[(int64_t)(pre + m0 + m) * N + n] = static_cast<T>(v);
++        }
++      }
++    }
++  }
++};
++
++template <typename scalar_t>
++void call_moe_int4_gemv(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const torch::Tensor& rows_per_expert,
++    torch::Tensor& D,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts,
++    int64_t group_size) {
++  using T = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
++  constexpr int NR = 4, SGS = 8, KCV = 32, MC = 2;
++  const int nblocks = (int)((N + NR * SGS - 1) / (NR * SGS));
++  // At most one active expert per input row.
++  const int64_t slots = std::min<int64_t>(A.size(0), num_experts);
++  if (slots == 0) return;
++  const sycl::range<1> local(SGS * kSubGroupSize);
++  const sycl::range<1> global(slots * nblocks * SGS * kSubGroupSize);
++
++  const T* a = reinterpret_cast<const T*>(A.data_ptr());
++  const int8_t* b = reinterpret_cast<const int8_t*>(B.data_ptr());
++  const T* s = reinterpret_cast<const T*>(B_scale.data_ptr());
++  const int* r = rows_per_expert.data_ptr<int>();
++  T* d = reinterpret_cast<T*>(D.data_ptr());
++
++  auto& queue = vllm::xpu::vllmGetQueue();
++  queue.submit([&](sycl::handler& cgh) {
++    sycl::local_accessor<int, 1> slm(sycl::range<1>(2), cgh);
++    cgh.parallel_for(
++        sycl::nd_range<1>(global, local),
++        MoeInt4GemvKernel<T, NR, SGS, KCV, MC>{
++            a,
++            b,
++            s,
++            r,
++            d,
++            (int)N,
++            (int)K,
++            (int)num_experts,
++            (int)group_size,
++            nblocks,
++            slm});
++  });
++}
++
++}  // namespace vllm
++
++void moe_int4_gemv(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const torch::Tensor& rows_per_expert,
++    torch::Tensor& D,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts) {
++  TORCH_CHECK(
++      A.is_contiguous() && B.is_contiguous() && B_scale.is_contiguous() &&
++          D.is_contiguous(),
++      "moe_int4_gemv: inputs must be contiguous");
++  TORCH_CHECK(
++      A.scalar_type() == at::kHalf || A.scalar_type() == at::kBFloat16,
++      "moe_int4_gemv: A must be fp16 or bf16");
++  TORCH_CHECK(
++      B_scale.scalar_type() == A.scalar_type() &&
++          D.scalar_type() == A.scalar_type(),
++      "moe_int4_gemv: B_scale and D must have the dtype of A");
++  TORCH_CHECK(B.scalar_type() == at::kChar, "moe_int4_gemv: B must be int8");
++  TORCH_CHECK(
++      rows_per_expert.scalar_type() == at::kInt &&
++          rows_per_expert.numel() == num_experts,
++      "moe_int4_gemv: rows_per_expert must be int32 [num_experts]");
++  TORCH_CHECK(
++      A.dim() == 2 && A.size(1) == K && D.dim() == 2 &&
++          D.size(0) == A.size(0) && D.size(1) == N,
++      "moe_int4_gemv: A must be [rows, K] and D [rows, N]");
++  TORCH_CHECK(
++      B.dim() == 3 && B.size(0) == num_experts && B.size(1) == N &&
++          B.size(2) == K / 2,
++      "moe_int4_gemv: B must be [num_experts, N, K / 2]");
++  TORCH_CHECK(
++      B_scale.dim() == 3 && B_scale.size(0) == num_experts &&
++          B_scale.size(1) == N && K % B_scale.size(2) == 0,
++      "moe_int4_gemv: B_scale must be [num_experts, N, K / group_size]");
++  const int64_t group_size = K / B_scale.size(2);
++  TORCH_CHECK(
++      K % 512 == 0 && group_size % 32 == 0,
++      "moe_int4_gemv: needs K % 512 == 0 and group_size % 32 == 0");
++
++  if (A.scalar_type() == at::kHalf) {
++    vllm::call_moe_int4_gemv<c10::Half>(
++        A, B, B_scale, rows_per_expert, D, N, K, num_experts, group_size);
++  } else {
++    vllm::call_moe_int4_gemv<c10::BFloat16>(
++        A, B, B_scale, rows_per_expert, D, N, K, num_experts, group_size);
++  }
++}
+diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
+index 5000ae2..9b5cc92 100644
+--- a/csrc/xpu/ops.h
++++ b/csrc/xpu/ops.h
+@@ -95,6 +95,16 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t N,
+     int64_t K,
+     int64_t num_experts);
++
++void moe_int4_gemv(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const torch::Tensor& rows_per_expert,
++    torch::Tensor& D,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts);
+ #endif
+ 
+ std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index f07496f..1e8bebe 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -79,6 +79,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
+   xpu_ops.impl(
+       "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
++  xpu_ops.def(
++      "moe_int4_gemv(Tensor A, Tensor B, Tensor B_scale, "
++      "Tensor rows_per_expert, Tensor! D, int N, int K, int num_experts) -> "
++      "()");
++  xpu_ops.impl("moe_int4_gemv", torch::kXPU, &moe_int4_gemv);
+ #endif
+ 
+   xpu_ops.def(
+diff --git a/tests/fused_moe/test_grouped_gemm.py b/tests/fused_moe/test_grouped_gemm.py
+index be99a94..d41a701 100644
+--- a/tests/fused_moe/test_grouped_gemm.py
++++ b/tests/fused_moe/test_grouped_gemm.py
+@@ -36,7 +36,13 @@ MINI_PYTEST_PARAMS = {
+         "topk": [1],
+         "dtype": [torch.bfloat16],
+         "has_bias": [True]
+-    }
++    },
++    "test_moe_int4_gemv": {
++        "m,topk": [(1, 8)],
++        "n,k": [(1024, 2048)],
++        "e": [16],
++        "dtype": [torch.bfloat16],
++    },
+ }
+ 
+ 
+@@ -780,3 +786,57 @@ def test_xe_grouped_gemm_block_fp8_wide_scales(m, n, k, pattern, dtype):
+     # the floor is set from the output magnitude instead of using atol=0.
+     atol = float(ref.abs().max()) * 2**-8
+     torch.testing.assert_close(output, ref, rtol=3e-2, atol=atol)
++
++
++# Qwen3.6-35B-A3B expert projections (w13, w2) and a wide case.
++MOE_INT4_GEMV_NK = [(1024, 2048), (2048, 512), (5120, 8192)]
++
++
++@pytest.mark.parametrize("m,topk", [(1, 8), (2, 4), (1, 1)])
++@pytest.mark.parametrize("n,k", MOE_INT4_GEMV_NK)
++@pytest.mark.parametrize("e", [16, 256])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16],
++                         ids=format_tc)
++def test_moe_int4_gemv(m, topk, n, k, e, dtype):
++    """moe_int4_gemv matches the dequantized reference and the int4 grouped
++    GEMM it replaces for decode-sized calls (one or two rows per expert)."""
++    seed_everything(7)
++    group_size = 128
++    total_m = m * topk
++    input_A = torch.randn((total_m, k), dtype=dtype, device=DEVICE)
++    input_B_uint4 = torch.randint(0,
++                                  0xff, [e, n, k // 2],
++                                  dtype=torch.uint8,
++                                  device=DEVICE)
++    random_exponents = torch.randint(-3, 4, (e, n, k // group_size),
++                                     device=DEVICE)
++    scale_B = torch.pow(2.0, random_exponents.float()).to(dtype)
++    input_B_int4 = torch.empty_like(input_B_uint4).to(torch.int8)
++    for i in range(e):
++        input_B_int4[i] = implement_zp(input_B_uint4[i], None)
++
++    num_rows_per_expert = torch.zeros(e, device=DEVICE, dtype=torch.int32)
++    init_rows_for_experts(m, topk, num_rows_per_expert)
++
++    output = torch.empty((total_m, n), dtype=dtype, device=DEVICE)
++    torch.ops._xpu_C.moe_int4_gemv(input_A, input_B_int4, scale_B,
++                                   num_rows_per_expert, output, n, k, e)
++
++    ref = []
++    row = 0
++    for i in range(e):
++        rows = int(num_rows_per_expert[i])
++        if rows == 0:
++            continue
++        weight = dequantize_uint4(input_B_uint4[i], scale_B[i],
++                                  group_size).to(torch.float32)
++        ref.append((input_A[row:row + rows].to(torch.float32) @ weight.T).to(
++            dtype))
++        row += rows
++    ref = torch.cat(ref, dim=0)
++    torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
++
++    grouped = torch.empty_like(output)
++    cutlass_grouped_gemm_xe2(input_A, input_B_int4, scale_B, None, grouped,
++                             num_rows_per_expert, n, k, e)
++    torch.testing.assert_close(output, grouped, rtol=1e-2, atol=1e-2)
+diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
+index d43772a..bc0d2d9 100755
+--- a/vllm_xpu_kernels/fused_moe_interface.py
++++ b/vllm_xpu_kernels/fused_moe_interface.py
+@@ -22,6 +22,12 @@ USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
+ # MXFP8 / block-FP8 use the native Xe2 path by default.
+ NATIVE_MXFP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_MXFP8"
+ NATIVE_BLOCK_FP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8"
++# Int4 grouped GEMMs with at most INT4_GEMV_MAX_ROWS rows (one decode token
++# with top-8 routing) run moe_int4_gemv instead of the grouped GEMM, whose
++# fixed cost per call dominates at that size. Disable with
++# VLLM_XPU_FUSED_MOE_INT4_GEMV=0.
++INT4_GEMV_ENV = "VLLM_XPU_FUSED_MOE_INT4_GEMV"
++INT4_GEMV_MAX_ROWS = 8
+ 
+ def _is_env_enabled(env_name: str, default: str = "0") -> bool:
+     value = os.environ.get(env_name, default).strip().upper()
+@@ -268,6 +274,8 @@ class XpuFusedMoe:
+         self.ep_size = ep_size
+         self.is_fp8 = is_fp8
+         self.is_int4 = is_int4
++        self._use_int4_gemv = is_int4 and _env_native_default_on(
++            INT4_GEMV_ENV)
+         self.is_mxfp4 = is_mxfp4
+         self.is_mxfp8 = is_mxfp8
+         self.is_block_fp8 = is_block_fp8
+@@ -369,6 +377,29 @@ class XpuFusedMoe:
+                             expert_map=expert_map,
+                             a1q_scale=a1q_scale)
+ 
++    def _grouped_gemm(self, A, A_scale, B, B_scale, bias, D,
++                      rows_per_expert, N, K):
++        if (self._use_int4_gemv and A_scale is None and bias is None
++                and A.shape[0] <= INT4_GEMV_MAX_ROWS
++                and A.dtype in (torch.float16, torch.bfloat16)
++                and B_scale is not None and B_scale.dtype == A.dtype
++                and B_scale.dim() == 3 and B_scale.is_contiguous()
++                and K % 512 == 0 and (K // B_scale.shape[-1]) % 32 == 0):
++            torch.ops._xpu_C.moe_int4_gemv(A, B, B_scale, rows_per_expert, D,
++                                           N, K, self.num_experts)
++            return
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=A,
++            ptr_A_scale=A_scale,
++            ptr_B=B,
++            ptr_B_scale=B_scale,
++            ptr_bias=bias,
++            ptr_D=D,
++            rows_per_expert=rows_per_expert,
++            N=N,
++            K=K,
++            num_experts=self.num_experts)
++
+     def _apply_kernel(
+         self,
+         output,
+@@ -443,17 +474,9 @@ class XpuFusedMoe:
+         gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
+                                 dtype=output.dtype,
+                                 device=output.device)
+-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+-            ptr_A=remapped_hidden_states,
+-            ptr_A_scale=remapped_scales,
+-            ptr_B=self.w13,
+-            ptr_B_scale=self.gemm1_wei_scales,
+-            ptr_bias=self.w13_bias,
+-            ptr_D=gemm1_output,
+-            rows_per_expert=rows_per_expert,
+-            N=2 * self.inter_size,
+-            K=hidden_size,
+-            num_experts=self.num_experts)
++        self._grouped_gemm(remapped_hidden_states, remapped_scales, self.w13,
++                           self.gemm1_wei_scales, self.w13_bias, gemm1_output,
++                           rows_per_expert, 2 * self.inter_size, hidden_size)
+ 
+         # Apply swiglu_limit clamping before activation
+         if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
+@@ -497,17 +520,10 @@ class XpuFusedMoe:
+                 gemm2_act_scale = None
+         else:
+             gemm2_act_scale = None
+-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+-            ptr_A=act_output,
+-            ptr_A_scale=gemm2_act_scale,
+-            ptr_B=self.w2,
+-            ptr_B_scale=self.gemm2_wei_scales,
+-            ptr_bias=self.w2_bias,
+-            ptr_D=gemm2_output,
+-            rows_per_expert=rows_per_expert,
+-            N=hidden_size,
+-            K=self.inter_size * self.inter_size_scale,
+-            num_experts=self.num_experts)
++        self._grouped_gemm(act_output, gemm2_act_scale, self.w2,
++                           self.gemm2_wei_scales, self.w2_bias, gemm2_output,
++                           rows_per_expert, hidden_size,
++                           self.inter_size * self.inter_size_scale)
+ 
+         torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                     unpermuted_row_to_permuted_row,
+-- 
+2.43.0
+

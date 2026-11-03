@@ -5,34 +5,40 @@
 #   v0.32/engine/scripts/check-series.sh --qsa [--git-dir DIR]      sparse:   patches/vllm-qsa     = v0.32.0-b70.4-dense..v0.32.0-b70.4-qsa
 #   v0.32/engine/scripts/check-series.sh --hotcold [--git-dir DIR]  hot/cold: patches/vllm-hotcold = v0.32.0-b70.4-qsa..v0.32.0-b70.4
 #   v0.32/engine/scripts/check-series.sh --models [--git-dir DIR]   models:   patches/vllm-models  = v0.32.0-b70.4..v0.32.0-b70.5
-#   v0.32/engine/scripts/check-series.sh --all [--git-dir DIR]      all four
+#   v0.32/engine/scripts/check-series.sh --v6 [--git-dir DIR]       v6:       patches/vllm-v6      = v0.32.0-b70.5..v0.32.0-b70.6
+#   v0.32/engine/scripts/check-series.sh --all [--no-v6] [--git-dir DIR]   all five (--no-v6: the first four, for the b70.5 engine)
 #
 #   --git-dir  a vLLM clone (default: ./vllm-src-032, cloned on demand from https://github.com/Lumnus/vllm.git)
 #
-# The engine is fork tag v0.32.0-b70.5 (109 commits on v0.32.0); the three b70.4 tags mark where the dense base, the
-# sparse layer and the hot/cold layer end. The export is `git format-patch` of the range, one file per commit, abbrev 10,
-# no signature.
+# The engine is fork tag v0.32.0-b70.6 (160 commits on v0.32.0); the three b70.4 tags and
+# v0.32.0-b70.5 mark where the dense base, the sparse layer, the hot/cold layer and the models layer end.
+# The export is `git format-patch` of the range, one file per commit, abbrev 10, no signature.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
 REPO_URL=https://github.com/Lumnus/vllm.git
-DENSE=v0.32.0-b70.4-dense; QSA=v0.32.0-b70.4-qsa; HOTCOLD=v0.32.0-b70.4; ENGINE=v0.32.0-b70.5
-gd="$PWD/vllm-src-032"; which=(dense)
+DENSE=v0.32.0-b70.4-dense; QSA=v0.32.0-b70.4-qsa; HOTCOLD=v0.32.0-b70.4; ENGINE=v0.32.0-b70.5; V6=v0.32.0-b70.6
+gd="$PWD/vllm-src-032"; which=(dense); no6=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --git-dir) gd=$2; shift 2 ;;
     --qsa) which=(qsa); shift ;;
     --hotcold) which=(hotcold); shift ;;
     --models) which=(models); shift ;;
-    --all) which=(dense qsa hotcold models); shift ;;
-    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
+    --v6) which=(v6); shift ;;
+    --no-v6) no6=1; shift ;;
+    --all) which=(dense qsa hotcold models v6); shift ;;
+    -h|--help) sed -n 2,15p "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 if [ ! -e "$gd/.git" ] && [ ! -e "$gd/HEAD" ]; then
   git clone -q --filter=blob:none --no-checkout "$REPO_URL" "$gd"
 fi
-for t in "$DENSE" "$QSA" "$HOTCOLD" "$ENGINE"; do
+if [ "$no6" = 1 ]; then k=(); for w in "${which[@]}"; do [ "$w" = v6 ] || k+=("$w"); done; which=("${k[@]}"); fi
+tags=("$DENSE" "$QSA" "$HOTCOLD" "$ENGINE")
+for w in "${which[@]}"; do [ "$w" = v6 ] && tags+=("$V6"); done
+for t in "${tags[@]}"; do
   git -C "$gd" rev-parse -q --verify "refs/tags/$t^{commit}" >/dev/null || git -C "$gd" fetch -q origin "refs/tags/$t:refs/tags/$t"
 done
 check() {  # dir from to
@@ -54,6 +60,7 @@ for w in "${which[@]}"; do
     qsa) check vllm-qsa "$DENSE" "$QSA" || rc=1 ;;
     hotcold) check vllm-hotcold "$QSA" "$HOTCOLD" || rc=1 ;;
     models) check vllm-models "$HOTCOLD" "$ENGINE" || rc=1 ;;
+    v6) check vllm-v6 "$ENGINE" "$V6" || rc=1 ;;
   esac
 done
 exit $rc

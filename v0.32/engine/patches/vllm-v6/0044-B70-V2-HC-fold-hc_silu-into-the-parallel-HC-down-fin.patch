@@ -1,0 +1,258 @@
+From 5d7834d4d954d89f113cd982f31b8e2dccafdc7d Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:06 +0000
+Subject: [PATCH 44/51] B70-V2-HC: fold hc_silu into the parallel HC down
+ finish kernel (B70_HC_SILU_FUSE=1)
+
+_hc_finish_silu writes the down output and silu(down[:, :lora]/HC) from the stored BF16 value.
+GatedResidual._down_and_silu uses it when the ordered projection takes the parallel route
+(rows <= 32); the route predicate is shared with ordered_hc_gemm. 97 kernels per c=1
+step. Default off; bitwise-identical (CPU interpreter tests).
+---
+ vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py   | 102 ++++++++++++++++--
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   |  75 +++++++++----
+ 2 files changed, 146 insertions(+), 31 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+index 289555d2fb..00f842951b 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hc_gemm.py
+@@ -56,13 +56,10 @@ def _ordered_hc_gemm(
+     )
+ 
+ 
+-def ordered_hc_gemm(x, weight, valid_columns):
+-    global _large_hc
+-    assert x.dtype == weight.dtype == torch.bfloat16
++def _takes_long_hc(x, weight, valid_columns) -> bool:
+     rows, inner = x.shape
+     columns = weight.shape[0]
+-    assert inner == weight.shape[1] and 0 < valid_columns <= columns
+-    if (
++    return (
+         256 < rows <= 1024
+         and inner == 10240
+         and columns in (320, 336)
+@@ -70,7 +67,30 @@ def ordered_hc_gemm(x, weight, valid_columns):
+         and x.device.type == "xpu"
+         and x.is_contiguous()
+         and weight.is_contiguous()
+-    ):
++    )
++
++
++def _takes_parallel(x, weight) -> bool:
++    rows, inner = x.shape
++    return (
++        (1 <= rows <= 8 or (9 <= rows <= _PARALLEL_MAX_ROWS and inner == 10240))
++        and x.stride(1) == weight.stride(1) == 1
++        and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
++    )
++
++
++def takes_parallel_route(x, weight, valid_columns) -> bool:
++    """ordered_hc_gemm(x, weight, valid_columns) would run parallel_hc_gemm."""
++    return not _takes_long_hc(x, weight, valid_columns) and _takes_parallel(x, weight)
++
++
++def ordered_hc_gemm(x, weight, valid_columns):
++    global _large_hc
++    assert x.dtype == weight.dtype == torch.bfloat16
++    rows, inner = x.shape
++    columns = weight.shape[0]
++    assert inner == weight.shape[1] and 0 < valid_columns <= columns
++    if _takes_long_hc(x, weight, valid_columns):
+         # Block loads and DPAS consume the existing BF16 checkpoint layout.
+         # The native FP32 accumulation matches the ordered projection exactly;
+         # neither a transposed weight copy nor padded token rows are needed.
+@@ -82,11 +102,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
+             ))
+             _large_hc = torch.ops.long_hc.forward
+         return _large_hc(x, weight, valid_columns, 1)
+-    if (
+-        (1 <= rows <= 8 or (9 <= rows <= _PARALLEL_MAX_ROWS and inner == 10240))
+-        and x.stride(1) == weight.stride(1) == 1
+-        and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
+-    ):
++    if _takes_parallel(x, weight):
+         return parallel_hc_gemm(x, weight, valid_columns)
+     output = torch.empty((rows, columns), device=x.device, dtype=x.dtype)
+     # Preserve fixed K ordering; wide prefill tiles share more weight loads.
+@@ -166,6 +182,70 @@ def _hc_partials_batched(x, weight, out, M: tl.constexpr, N: tl.constexpr, K: tl
+              y, (rows[:, None] < M) & (cols[None, :] < N))
+ 
+ 
++@triton.jit
++def _hc_finish_silu(partials, output, lora_out, M: tl.constexpr, N: tl.constexpr,
++                    TILES: tl.constexpr, LORA: tl.constexpr, HC: tl.constexpr):
++    """B70-V2-HC: _hc_finish, plus hc_silu of the first LORA columns computed from the
++    stored BF16 value (the same rounding, scaling and silu as _hc_silu_kernel), written
++    to lora_out [M, LORA]."""
++    offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
++    mask = offsets < M * N
++    value = tl.full((256,), 0, tl.float32)
++    for step in range(TILES):
++        value += tl.load(partials + step * M * N + offsets, mask, other=0)
++    stored = value.to(output.dtype.element_ty)
++    tl.store(output + offsets, stored, mask)
++    row = offsets // N
++    col = offsets % N
++    v = stored.to(tl.float32) / HC
++    y = v * tl.sigmoid(v)
++    tl.store(lora_out + row * LORA + col, y, mask & (col < LORA))
++
++
++def _parallel_partials(x, weight, valid_columns):
++    rows, inner = x.shape
++    columns = weight.shape[0]
++    block_k = 64 if rows > 8 else 128
++    tiles = triton.cdiv(inner, block_k)
++    partials = torch.empty((tiles, rows, columns), dtype=torch.float32, device=x.device)
++    if rows > 8:
++        _hc_partials_batched[(tiles, triton.cdiv(columns, 32), triton.cdiv(rows, 16))](
++            x, weight, partials, rows, columns, inner, valid_columns,
++            x.stride(0), weight.stride(0), block_k, 32, num_warps=4,
++        )
++    else:
++        _hc_partials[(tiles, triton.cdiv(columns, 32))](
++            x,
++            weight,
++            partials,
++            rows,
++            columns,
++            inner,
++            valid_columns,
++            x.stride(0),
++            weight.stride(0),
++            num_warps=4,
++        )
++    return partials, tiles
++
++
++def parallel_hc_gemm_silu(x, weight, valid_columns, lora_rank, hc_count):
++    """B70-V2-HC (B70_HC_SILU_FUSE=1): parallel_hc_gemm and hc_silu(out[:, :lora_rank])
++    with the silu folded into the finish kernel.
++
++    Returns (out [rows, columns], silu_lora [rows, lora_rank])."""
++    rows, _ = x.shape
++    columns = weight.shape[0]
++    assert 0 < lora_rank <= columns
++    partials, tiles = _parallel_partials(x, weight, valid_columns)
++    output = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
++    lora = torch.empty((rows, lora_rank), dtype=x.dtype, device=x.device)
++    _hc_finish_silu[(triton.cdiv(rows * columns, 256),)](
++        partials, output, lora, rows, columns, tiles, lora_rank, hc_count, num_warps=4,
++    )
++    return output, lora
++
++
+ def parallel_hc_gemm(x, weight, valid_columns):
+     """BF16 products with deterministic, batch-invariant FP32 tile summation.
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index bec384dd6a..ad368bf031 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -55,6 +55,11 @@ logger = init_logger(__name__)
+ # decode, prefill chunks) take the stock BF16 GEMM. The ordered Triton GEMM is 4.5x (64 rows) to 6.7x
+ # (4096 rows) slower than F.linear on B70. Default: unbounded (wu1ff behaviour).
+ _B70_HC_ORDERED_MAX_ROWS = int(os.environ.get("B70_HC_ORDERED_MAX_ROWS", str(1 << 30)))
++# B70-V2-HC: fold hc_silu into the parallel HC down GEMM's finish kernel (bitwise-
++# identical; one launch fewer per GatedResidual on the parallel route, i.e. rows <=
++# B70_HC_PARALLEL_MAX_ROWS). Default off.
++_B70_HC_SILU_FUSE = os.environ.get("B70_HC_SILU_FUSE", "0") == "1"
++_B70_HC_SILU_FUSE_LOGGED = False
+ 
+ 
+ def _is_xpu() -> bool:
+@@ -277,6 +282,54 @@ class GatedResidual(nn.Module):
+             return self.input_mix_weight_down_block_inject(xn)
+         return self.input_mix_weight_down(xn)
+ 
++    def _down_and_silu(
++        self, xn: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        """(hc_silu(lora), injection) of the down projection.
++
++        B70-V2-HC fuses the silu when the ordered projection takes the parallel
++        route; otherwise the stock sequence runs."""
++        global _B70_HC_SILU_FUSE_LOGGED
++        if (
++            _B70_HC_SILU_FUSE
++            and self._ordered_hc
++            and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS
++        ):
++            from .b70_hc_gemm import parallel_hc_gemm_silu, takes_parallel_route
++
++            linear = (
++                self.input_mix_weight_down_block_inject
++                if self.use_combine
++                else self.input_mix_weight_down
++            )
++            valid = self.lora_rank + (self.hc_count if self.use_combine else 0)
++            if (
++                xn.dtype == linear.weight.dtype == torch.bfloat16
++                and takes_parallel_route(xn, linear.weight, valid)
++            ):
++                if not _B70_HC_SILU_FUSE_LOGGED:
++                    _B70_HC_SILU_FUSE_LOGGED = True
++                    logger.info(
++                        "B70-V2-HC: hc_silu fused into the parallel HC down finish "
++                        "(B70_HC_SILU_FUSE=1)"
++                    )
++                down, lora = parallel_hc_gemm_silu(
++                    xn, linear.weight, valid, self.lora_rank, self.hc_count
++                )
++                if self.use_combine:
++                    injection = down[:, self.lora_rank : self.lora_rank + self.hc_count]
++                    return lora, injection
++                return lora, None
++        if self.use_combine:
++            # produce injection logits for combine
++            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
++            down_and_injection = self._down_gemm(xn)
++            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
++        else:
++            lora = self._down_gemm(xn)
++            injection = None
++        return hc_silu(lora, self.hc_count), injection
++
+     def mix(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+@@ -302,16 +355,7 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
+-        if self.use_combine:
+-            # produce injection logits for combine
+-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self._down_gemm(xn)
+-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+-        else:
+-            lora = self._down_gemm(xn)
+-            injection = None
+-
+-        lora = hc_silu(lora, self.hc_count)
++        lora, injection = self._down_and_silu(xn)
+         block_input = self._mix_up(lora, xn)
+ 
+         return hidden_states, block_input, injection
+@@ -362,16 +406,7 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
+-        if self.use_combine:
+-            # produce injection logits for combine
+-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self._down_gemm(xn)
+-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+-        else:
+-            lora = self._down_gemm(xn)
+-            injection = None
+-
+-        lora = hc_silu(lora, self.hc_count)
++        lora, injection = self._down_and_silu(xn)
+         block_input = self._mix_up(lora, xn)
+ 
+         return hidden_states, block_input, injection

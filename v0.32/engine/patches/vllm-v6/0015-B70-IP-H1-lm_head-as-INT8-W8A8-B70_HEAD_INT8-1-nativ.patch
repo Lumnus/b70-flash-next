@@ -1,0 +1,141 @@
+From c68b32f91805174c9d5cb823b379e3ca7f78b2ee Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 17:48:19 +0000
+Subject: [PATCH 15/51] B70-IP-H1: lm_head as INT8 W8A8 (B70_HEAD_INT8=1),
+ native int8 DPAS
+
+The FP8 W8A16 head upcasts e4m3 to bf16 (storage only). Per-row int8
+weights (one scale per vocab row) + per-token int8 activations through the
+B70-IP-W1 opaque op (Triton int8 at decode M, oneDNN int8_scaled_mm above):
+same bytes as FP8, int8 math on XMX, and per-row int8 is ~4x more accurate
+than e4m3 on embedding-like rows (PLE study 0.66% vs 2.66% rel-L2). Built
+once at the first forward, BF16 shard released first; wins over
+B70_HEAD_FP8 when both are set. Drafters sharing the head use it too.
+QFN path only (qwen4_exp); CPU test included, GPU pending.
+---
+ tests/v1/core/test_b70_ip_h1.py              | 30 ++++++++++
+ vllm/models/qwen4_exp/nvidia/b70_fp8_head.py | 60 +++++++++++++++++++-
+ 2 files changed, 89 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/core/test_b70_ip_h1.py
+
+diff --git a/tests/v1/core/test_b70_ip_h1.py b/tests/v1/core/test_b70_ip_h1.py
+new file mode 100644
+index 0000000000..9d0e3e40d1
+--- /dev/null
++++ b/tests/v1/core/test_b70_ip_h1.py
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-H1: INT8 lm_head copy (CPU): per-row int8 codes + scales, BF16 shard released, accuracy vs bf16."""
++
++import torch
++
++from vllm.models.qwen4_exp.nvidia.b70_fp8_head import B70Int8Head, b70_int8_head_of
++
++
++class _Head(torch.nn.Module):
++    def __init__(self, rows, k):
++        super().__init__()
++        self.weight = torch.nn.Parameter(
++            torch.randn(rows, k, dtype=torch.bfloat16) * 0.02, requires_grad=False
++        )
++
++
++def test_int8_head_codes_scales_release():
++    torch.manual_seed(0)
++    h = _Head(20000, 256)
++    ref = h.weight.data.float().clone()
++    head = b70_int8_head_of(h)
++    assert isinstance(head, B70Int8Head)
++    assert h.weight.numel() == 0  # BF16 shard released
++    assert head.wq.dtype == torch.int8 and head.wq.shape == (20000, 256)
++    assert head.scale.shape == (20000, 1)
++    assert head.wq.abs().max() <= 127
++    deq = head.wq.float() * head.scale
++    rel = (deq - ref).norm() / ref.norm()
++    assert rel < 0.01, rel
++    assert b70_int8_head_of(h) is head  # cached
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_fp8_head.py b/vllm/models/qwen4_exp/nvidia/b70_fp8_head.py
+index ce27831df1..2553729770 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_fp8_head.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_fp8_head.py
+@@ -23,6 +23,51 @@ class B70Fp8Head:
+         return out.reshape(*shape[:-1], -1)
+ 
+ 
++class B70Int8Head:
++    """B70-IP-H1: the lm_head shard as INT8 W8A8 (one scale per vocab row, activations int8 per token), native int8
++    DPAS through B70-IP-W1's opaque op (Triton int8 at decode M, oneDNN int8_scaled_mm above). Per-row int8 is ~4x
++    more accurate than e4m3 on embedding-like rows (PLE study: 0.66 % vs 2.66 % rel-L2) and the math stays int8."""
++
++    def __init__(self, wq: torch.Tensor, scale: torch.Tensor, triton_max_m: int) -> None:
++        self.wq, self.scale, self.triton_max_m = wq, scale, triton_max_m
++
++    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
++        import vllm.model_executor.layers.b70_dense_int8  # noqa: F401  (registers the op)
++
++        shape = x.shape
++        out = torch.ops.vllm.b70_int8_dense_mm(
++            x.reshape(-1, shape[-1]), self.wq, self.scale, bias, self.triton_max_m
++        )
++        return out.reshape(*shape[:-1], -1)
++
++
++def b70_int8_head_of(lm_head) -> "B70Int8Head | None":
++    """INT8 copy of an lm_head shard (built chunked, BF16 moved to host first so the two never coexist in VRAM)."""
++    head8 = getattr(lm_head, "_b70_int8_head", None)
++    weight = getattr(lm_head, "weight", None)
++    if head8 is not None:
++        return head8
++    if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16 or weight.numel() == 0:
++        return None
++    rows, k = weight.shape
++    device = weight.device
++    src = weight.data.to("cpu")
++    weight.data = torch.empty((0, k), dtype=weight.dtype, device=device)
++    wq = torch.empty((rows, k), dtype=torch.int8, device=device)
++    scale = torch.empty((rows, 1), dtype=torch.float32, device=device)
++    step = 8192
++    for i in range(0, rows, step):
++        chunk = src[i : i + step].to(device).float()
++        sc = (chunk.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
++        wq[i : i + step] = torch.round(chunk / sc).clamp(-127, 127).to(torch.int8)
++        scale[i : i + step] = sc
++        del chunk
++    del src
++    head8 = B70Int8Head(wq, scale, int(os.environ.get("B70_DENSE_INT8_TRITON_MAX_M", "64")))
++    lm_head._b70_int8_head = head8
++    return head8
++
++
+ def b70_fp8_head_of(lm_head, release_bf16: bool = False) -> "B70Fp8Head | None":
+     """The FP8 copy of an lm_head shard, cached on the module. release_bf16: the BF16 weight goes to host memory and
+     is released on the device before the FP8 copy is built (the two never coexist in VRAM)."""
+@@ -61,7 +106,8 @@ def maybe_prepare_head_fp8(lm) -> None:
+     lm._b70_head_fp8_checked = True
+     from vllm.platforms import current_platform
+ 
+-    if os.environ.get("B70_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
++    want_int8 = os.environ.get("B70_HEAD_INT8", "0") == "1"
++    if (os.environ.get("B70_HEAD_FP8", "0") != "1" and not want_int8) or not current_platform.is_xpu():
+         return
+     if torch.xpu.is_current_stream_capturing():
+         lm._b70_head_fp8_checked = False
+@@ -73,6 +119,18 @@ def maybe_prepare_head_fp8(lm) -> None:
+     weight = head.weight
+     released = weight.numel() * weight.element_size()
+     alloc0 = torch.accelerator.memory_allocated(weight.device)
++    if want_int8:
++        # B70-IP-H1: INT8 W8A8 head wins over B70_HEAD_FP8 when both are set.
++        head_i8 = b70_int8_head_of(head)
++        if head_i8 is None:
++            logger.warning("B70 head INT8: no BF16 lm_head weight; off")
++            return
++        head.quant_method = head_i8
++        alloc1 = torch.accelerator.memory_allocated(weight.device)
++        logger.info("B70-IP-H1 head INT8: target lm_head %d x %d as INT8 W8A8 (%.0f MB), BF16 shard released "
++                    "(%.0f MB); torch allocated %.2f -> %.2f GiB", head_i8.wq.shape[0], head_i8.wq.shape[1],
++                    head_i8.wq.numel() / 1e6, released / 1e6, alloc0 / 2**30, alloc1 / 2**30)
++        return
+     head8 = b70_fp8_head_of(head, release_bf16=True)
+     if head8 is None:
+         logger.warning("B70 head FP8: no BF16 lm_head weight; off")

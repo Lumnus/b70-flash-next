@@ -89,3 +89,17 @@ Third-party material
    - Weights and drafters are referenced, not included: devan-carlin/Qwen3.8-27B-int4-AutoRound (5efb20f, Apache-2.0),
      incoai/Qwen3.8-27B-DFlash2 (015e795, Apache-2.0), Intel/Qwen3.6-35B-A3B-int4-mixed-AutoRound (65f69c7),
      z-lab/Qwen3.6-35B-A3B-DFlash (f181eec, Apache-2.0).
+
+8. Release 0.32.0-b70.6:
+   - v0.32/engine/patches/vllm-v6/ modifies vLLM v0.32.0 (Apache-2.0). Commits by other authors, kept with their authorship:
+     0019 (vllm-project/vllm#63421) and 0020 (#63819) by Misha Goin; 0021 (#62244) by Yan Ma; 0026 (#59260) by qizixi;
+     0029, the backport of vllm-project/vllm#62113, by noon-at-cgn; 0025, 0027 and 0028 by riceharvest (a draft int4 MTP lane,
+     an asymmetric-GPTQ loader, and mixed GDN steps without a host sync). 0002 backports vllm-project/vllm#64141.
+   - v0.32/engine/patches/vllm-xpu-kernels/ 0006–0015 (Apache-2.0) include commits by other authors, kept with their
+     authorship: 0008 vllm-project/vllm-xpu-kernels#647 by Yan Ma; 0009 and 0010 (INT8 per-token-head KV for paged decode and its
+     tests) by wiesion; 0012 and 0013 (int4 GEMV and its test) and 0014 (fast e4m3 to half KV conversion) by riceharvest.
+     0001 and 0007 are our #660 and #658, merged upstream.
+   - v0.32/engine/patches/sycl-tla/ are the two commits of intel/sycl-tla pull request #859 by riceharvest (BSD-3-Clause, as the
+     files they modify), applied to a sycl-tla checkout at build time; no sycl-tla source is stored here.
+   - The W8A8 drafter for Flash-Next is made from incoai/Qwen3.8-Flash-Next-DFlash2 (a22a1744, Apache-2.0), which is referenced,
+     not included.

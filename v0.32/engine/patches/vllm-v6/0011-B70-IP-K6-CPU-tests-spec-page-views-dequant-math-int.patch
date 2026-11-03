@@ -1,0 +1,573 @@
+From fcf0af3d01802090db245f5139efe221c5f5ed32 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 15:53:39 +0000
+Subject: [PATCH 11/51] B70-IP-K6: CPU tests (spec/page, views, dequant math,
+ interpreter kernels)
+
+Without Triton: dtype acceptance; the QSA and state backends pack the int8
+per-token-head spec like TRITON_ATTN (520 B cells, page = block x nkv x 520)
+and leave bf16/fp8 specs untouched; qsa_pth_kv_views equals TRITON_ATTN's
+scale views on HND, NHD and padded-page caches and writes no byte; the impl
+accepts the dtype and rebuilds views after the runner's reset; the kernels'
+scale placement vs an fp32 dense reference.
+
+With TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= (the Triton kernels on CPU
+tensors): Triton writer -> attn2 and split-K vs the dequantized reference and
+vs the bf16 cache; bf16 launches unchanged; fused prepare int8 bytes/scales
+equal the writer formula; unfused update ignores padded rows. The module
+patches the Triton 3.8 interpreter's bf16 dot and int<->bf16 casts (it works
+on raw uint16 bits there); compiled kernels are unaffected.
+
+Result (GPUs masked): 34 passed (interpreter), 148 passed / 155
+skipped with the existing QSA and IP CPU suites.
+---
+ .../models/qwen4_exp/test_b70_ip_qsa_int8.py  | 540 ++++++++++++++++++
+ 1 file changed, 540 insertions(+)
+ create mode 100644 tests/models/qwen4_exp/test_b70_ip_qsa_int8.py
+
+diff --git a/tests/models/qwen4_exp/test_b70_ip_qsa_int8.py b/tests/models/qwen4_exp/test_b70_ip_qsa_int8.py
+new file mode 100644
+index 0000000000..25a84eb879
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_b70_ip_qsa_int8.py
+@@ -0,0 +1,540 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-K6: int8 per-token-head main KV for Qwen4Exp QSA, CPU checks.
++
++Part 1 needs no Triton: dtype acceptance, the cache spec (TRITON_ATTN's inline
++scale packing, also as the hybrid alignment sees it), the scale views (same as
++TRITON_ATTN's, no byte written) and the dequant math the kernels use (K scale
++on the scores, V scale on P) against a dense fp32 reference.
++
++Part 2 runs the real Triton kernels on CPU tensors through the Triton
++interpreter, so it is skipped unless the process was started with
++``TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=""`` (the latter keeps
++vllm.triton_utils from disabling Triton on a host without a driver):
++
++    TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= \
++        pytest tests/models/qwen4_exp/test_b70_ip_qsa_int8.py
++
++It covers the Triton per-token-head writer feeding both sparse kernels (attn2
++and split-K) and the fused prepare's int8 writer against the writer formula.
++"""
++
++import os
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
++from vllm.models.qwen4_exp.nvidia import (
++    model as _qwen4_exp_model,  # noqa: F401  (import order: model before qsa)
++)
++from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
++from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
++from vllm.v1.attention.backends.triton_attn import (
++    TritonAttentionBackend,
++    TritonAttentionImpl,
++)
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, get_kv_quant_mode
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++requires_interpreter = pytest.mark.skipif(
++    not INTERPRET, reason='needs TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=""'
++)
++
++HD = 256
++PTH = "int8_per_token_head"
++
++
++def _patch_interpreter_bf16() -> None:
++    """Test harness only: the Triton 3.8 interpreter keeps bf16 as raw uint16
++    and so computes tl.dot on bf16 operands and int<->bf16 casts on the bit
++    patterns (garbage; measured: a 16x16 bf16 dot off by 2.7e10). Route both
++    through fp32, which the interpreter converts correctly. Compiled kernels
++    are not affected; bf16 elementwise math is not patched (the QSA kernels
++    only load, cast and dot bf16)."""
++    import numpy as np
++    import triton.language as tl
++    from triton.runtime import interpreter as interp
++
++    builder = interp.InterpreterBuilder
++    if getattr(builder, "_b70_ip_bf16", False):
++        return
++    cast_impl = builder.cast_impl
++    create_dot = builder.create_dot
++
++    def bf16_cast(self, src, dst_type):
++        s, d = src.dtype.scalar, dst_type.scalar
++        if (s == tl.bfloat16) != (d == tl.bfloat16) and tl.float32 not in (s, d):
++            return cast_impl(self, cast_impl(self, src, tl.float32), dst_type)
++        return cast_impl(self, src, dst_type)
++
++    def to_f32(handle):
++        if handle.dtype.scalar != tl.bfloat16:
++            return handle
++        data = interp._convert_float(handle.data, tl.bfloat16, tl.float32, None)
++        return interp.TensorHandle(data.view(np.float32), tl.float32)
++
++    def bf16_dot(self, a, b, d, input_precision, max_num_imprecise_acc):
++        return create_dot(
++            self, to_f32(a), to_f32(b), d, input_precision, max_num_imprecise_acc
++        )
++
++    builder.cast_impl = bf16_cast
++    builder.create_dot = bf16_dot
++    builder._b70_ip_bf16 = True
++
++
++if INTERPRET:
++    _patch_interpreter_bf16()
++
++
++# --------------------------------------------------------------------------
++# Part 1: no Triton
++# --------------------------------------------------------------------------
++
++
++def test_qsa_backend_accepts_int8_pth() -> None:
++    backend = qsa_mod.Qwen4ExpQSAFlashAttentionBackend
++    assert backend.supports_kv_cache_dtype(PTH)
++    for dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
++        assert backend.supports_kv_cache_dtype(dtype)
++    assert not backend.supports_kv_cache_dtype("fp8_per_token_head")
++    assert PTH in qsa_mod._QSA_CACHE_DTYPES
++
++
++def _spec(dtype: torch.dtype, mode: str, nkv: int, block: int = 1):
++    return FullAttentionSpec(
++        block_size=block,
++        num_kv_heads=nkv,
++        head_size=HD,
++        head_size_v=HD,
++        dtype=dtype,
++        kv_quant_mode=get_kv_quant_mode(mode),
++    )
++
++
++@pytest.mark.parametrize("nkv", [1, 2])
++@pytest.mark.parametrize("block", [1, 16, 3328])
++def test_qsa_spec_packs_inline_scales_like_triton(nkv: int, block: int) -> None:
++    spec = _spec(torch.int8, PTH, nkv, block)
++    qsa = qsa_mod.Qwen4ExpQSAFlashAttentionBackend.customize_spec(spec)
++    assert qsa == TritonAttentionBackend.customize_spec(spec)
++    assert qsa.state_content_bytes == 2 * (HD + 4)  # 520
++    assert qsa.page_size_bytes == block * nkv * 520
++    # The hybrid alignment asks the first non-SSM backend, which in Qwen4Exp
++    # is the indexer's state backend: it must answer the same page.
++    assert QSAStateBackend.customize_spec(spec) == qsa
++
++
++@pytest.mark.parametrize("dtype,mode", [(torch.bfloat16, "auto"), (torch.uint8, "fp8")])
++def test_qsa_spec_unchanged_for_bf16_and_fp8(dtype, mode) -> None:
++    spec = _spec(dtype, mode, 2, 16)
++    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.customize_spec(spec) is spec
++    assert QSAStateBackend.customize_spec(spec) is spec
++
++
++def _pth_cache(nb: int, nkv: int, bs: int, layout: str) -> torch.Tensor:
++    """Logical (B, H, N, C) int8 cache, NHD or HND physical, optionally in a
++    padded page (hybrid unify) at a nonzero storage offset."""
++    c = 2 * (HD + 4)
++    if layout == "hnd":
++        return torch.randint(-128, 128, (nb, nkv, bs, c), dtype=torch.int8)
++    if layout == "nhd":
++        return torch.randint(-128, 128, (nb, bs, nkv, c), dtype=torch.int8).transpose(
++            1, 2
++        )
++    page = bs * nkv * c + 64  # padded page, 4-byte multiple
++    raw = torch.randint(-128, 128, (nb * page + 128,), dtype=torch.int8)
++    return torch.as_strided(raw, (nb, nkv, bs, c), (page, c, nkv * c, 1), 128)
++
++
++@pytest.mark.parametrize("layout", ["hnd", "nhd", "padded"])
++@pytest.mark.parametrize("nkv", [1, 2])
++def test_pth_views_match_triton_and_write_nothing(layout: str, nkv: int) -> None:
++    cache = _pth_cache(5, nkv, 16, layout)
++    before = cache.clone()
++    k, v, ks, vs = qsa_ops.qsa_pth_kv_views(cache, HD)
++    assert torch.equal(cache, before)
++    assert k.dtype == v.dtype == torch.int8 and k.shape == (5, 16, nkv, HD)
++    assert k.stride(-1) == v.stride(-1) == 1
++    # Same scale views as TRITON_ATTN (byte offsets and strides).
++    ref = TritonAttentionImpl.__new__(TritonAttentionImpl)
++    ref._k_scale_cache = ref._v_scale_cache = None
++    ref._ensure_scale_caches(cache)
++    for mine, theirs in ((ks, ref._k_scale_cache), (vs, ref._v_scale_cache)):
++        assert mine.shape == theirs.shape == (5, 16, nkv)
++        assert mine.stride() == theirs.stride()
++        assert mine.storage_offset() == theirs.storage_offset()
++        assert torch.equal(mine.view(torch.int32), theirs.view(torch.int32))
++    # Views address the documented bytes: K(hd) | ks | V(hd) | vs.
++    ks[3, 7, nkv - 1] = 2.5
++    vs[1, 2, 0] = -0.75
++    cell = cache[3, nkv - 1, 7]
++    assert cell[HD : HD + 4].contiguous().view(torch.float32).item() == 2.5
++    assert torch.equal(k[3, 7, nkv - 1], cell[:HD])
++    cell = cache[1, 0, 2]
++    assert cell[2 * HD + 4 :].contiguous().view(torch.float32).item() == -0.75
++    assert torch.equal(v[1, 2, 0], cell[HD + 4 : 2 * HD + 4])
++
++
++def test_pth_views_reject_wrong_content() -> None:
++    with pytest.raises(AssertionError):
++        qsa_ops.qsa_pth_kv_views(torch.zeros(2, 1, 16, 2 * HD, dtype=torch.int8), HD)
++
++
++def test_impl_accepts_int8_pth_and_logs_path(monkeypatch) -> None:
++    monkeypatch.setattr(qsa_mod, "is_flash_attn_varlen_func_available", lambda: True)
++    try:
++        impl = qsa_mod.Qwen4ExpQSAFlashAttentionImpl(
++            12, HD, HD**-0.5, 1, None, None, PTH, None
++        )
++    except Exception as exc:  # parent ctor needs a platform probe
++        pytest.skip(f"FlashAttentionImpl ctor unavailable on this host: {exc!r}")
++    assert impl.kv_cache_dtype == PTH
++    assert impl.is_int8_pth
++    assert impl._kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
++    cache = _pth_cache(3, 1, 16, "nhd")
++    first = impl.pth_kv_views(cache)
++    assert impl.pth_kv_views(cache)[2] is first[2]  # cached per bound cache
++    impl._k_scale_cache = None  # the runner's post-profiling reset
++    assert impl.pth_kv_views(cache)[2] is not first[2]
++
++
++def quantize_pth(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Torch replica of _reshape_cache_per_token_head (int8): per row of the
++    last dim, scale = max(absmax / 127, 1e-6), x * (1 / scale), round half
++    away from zero, clamp, truncate."""
++    xf = x.float()
++    scale = torch.clamp(xf.abs().amax(-1) / 127.0, min=1e-6)
++    q = xf * (1.0 / scale)[..., None]
++    q = torch.where(q >= 0, q + 0.5, q - 0.5).clamp(-128.0, 127.0)
++    return q.trunc().to(torch.int8), scale
++
++
++def dense_reference(q, k, v, scale) -> torch.Tensor:
++    """fp32 softmax(q k^T * scale) v with GQA, one row of selected tokens."""
++    rep = q.shape[0] // k.shape[1]
++    kk = k.float().repeat_interleave(rep, dim=1)
++    vv = v.float().repeat_interleave(rep, dim=1)
++    s = torch.einsum("hd,khd->hk", q.float(), kk) * scale
++    return torch.einsum("hk,khd->hd", torch.softmax(s, -1), vv)
++
++
++def kernel_math_emulation(q, k_i8, ks, v_i8, vs, scale) -> torch.Tensor:
++    """What the QSA kernels compute for int8 per-token-head: bf16 dots over the
++    exact int8 values, K scale on the FP32 scores, V scale on P (fp32 then
++    bf16) before P.V."""
++    rep = q.shape[0] // k_i8.shape[1]
++    kb = k_i8.to(torch.bfloat16).float().repeat_interleave(rep, dim=1)
++    vb = v_i8.to(torch.bfloat16).float().repeat_interleave(rep, dim=1)
++    ksr = ks.repeat_interleave(rep, dim=1).T  # [h, k]
++    vsr = vs.repeat_interleave(rep, dim=1).T
++    s = torch.einsum("hd,khd->hk", q.float(), kb) * ksr * scale
++    p = torch.softmax(s, -1)
++    pv = (p * vsr).to(torch.bfloat16).float()
++    return torch.einsum("hk,khd->hd", pv, vb)
++
++
++def _metrics(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
++    a, b = a.float().flatten(), b.float().flatten()
++    rel = ((a - b).norm() / b.norm()).item()
++    cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
++    return rel, cos
++
++
++@pytest.mark.parametrize("hq,nkv", [(24, 2), (12, 1)])
++@pytest.mark.parametrize("ntok", [17, 2051])
++def test_dequant_math_matches_reference(hq: int, nkv: int, ntok: int) -> None:
++    torch.manual_seed(ntok + hq)
++    q = torch.randn(hq, HD, dtype=torch.bfloat16)
++    # Per-token magnitudes vary (outlier tokens/heads), as real K/V do.
++    k = (torch.randn(ntok, nkv, HD) * torch.rand(ntok, nkv, 1) * 4).to(torch.bfloat16)
++    v = (torch.randn(ntok, nkv, HD) * torch.rand(ntok, nkv, 1) * 2).to(torch.bfloat16)
++    k_i8, ks = quantize_pth(k)
++    v_i8, vs = quantize_pth(v)
++    scale = HD**-0.5
++    emu = kernel_math_emulation(q, k_i8, ks, v_i8, vs, scale)
++    deq = dense_reference(
++        q, k_i8.float() * ks[..., None], v_i8.float() * vs[..., None], scale
++    )
++    bf16 = dense_reference(q, k, v, scale)
++    rel_emu, cos_emu = _metrics(emu, deq)
++    rel_q, cos_q = _metrics(deq, bf16)
++    # Scale placement is exact algebra; only P's bf16 rounding remains.
++    assert rel_emu < 4e-3 and cos_emu > 0.99999
++    # int8 per-token-head storage floor vs the bf16 cache.
++    assert rel_q < 3e-2 and cos_q > 0.999
++
++
++# --------------------------------------------------------------------------
++# Part 2: real Triton kernels, CPU tensors, Triton interpreter
++# --------------------------------------------------------------------------
++
++
++def _paged_case(hq: int, nkv: int, page: int, rows: int, width: int, seed: int):
++    torch.manual_seed(seed)
++    nb = 6
++    seq = nb * page - 3
++    tokens = seq
++    key = (torch.randn(tokens, nkv, HD) * torch.rand(tokens, nkv, 1) * 3).to(
++        torch.bfloat16
++    )
++    value = (torch.randn(tokens, nkv, HD) * torch.rand(tokens, nkv, 1)).to(
++        torch.bfloat16
++    )
++    perm = torch.randperm(nb)
++    block_table = perm[None, :].to(torch.int32).repeat(2, 1)
++    slot_mapping = (
++        block_table[0].long()[torch.arange(tokens) // page] * page
++        + torch.arange(tokens) % page
++    )
++    # bf16 cache in vLLM's logical (B, H, N, 2*hd), NHD physical.
++    bf16_cache = torch.zeros(nb, page, nkv, 2 * HD, dtype=torch.bfloat16).transpose(
++        1, 2
++    )
++    kc, vc = bf16_cache.transpose(1, 2).split(HD, dim=-1)
++    kc.view(-1, nkv, HD)[slot_mapping] = key
++    vc.view(-1, nkv, HD)[slot_mapping] = value
++    int8_cache = torch.zeros(nb, page, nkv, 2 * (HD + 4), dtype=torch.int8).transpose(
++        1, 2
++    )
++    q = torch.randn(rows, hq, HD, dtype=torch.bfloat16)
++    indices = torch.full((rows, width + 1), -1, dtype=torch.int32)
++    for r in range(rows):
++        count = min(width, seq - r)
++        indices[r, :count] = torch.randperm(seq)[:count].sort().values
++        indices[r, width] = count
++    token_to_req = torch.zeros(rows, dtype=torch.int32)
++    gate = torch.full((rows, hq * HD), 30.0, dtype=torch.bfloat16)  # sigmoid ~ 1
++    return dict(
++        key=key,
++        value=value,
++        slot_mapping=slot_mapping,
++        bf16_cache=bf16_cache,
++        int8_cache=int8_cache,
++        q=q,
++        indices=indices,
++        block_table=block_table,
++        token_to_req=token_to_req,
++        gate=gate,
++    )
++
++
++def _write_int8(case) -> tuple:
++    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++        triton_reshape_and_cache_flash_per_token_head_quant,
++    )
++
++    k, v, ks, vs = qsa_ops.qsa_pth_kv_views(case["int8_cache"], HD)
++    triton_reshape_and_cache_flash_per_token_head_quant(
++        case["key"],
++        case["value"],
++        k,
++        v,
++        ks,
++        vs,
++        case["slot_mapping"],
++        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++    )
++    return k, v, ks, vs
++
++
++def _run(case, impl: str, monkeypatch, int8: bool, use_prefill_config: bool):
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_attn2
++
++    monkeypatch.setenv("B70_QSA_ATTN_IMPL", impl)
++    # grf_mode is an Intel launch option the interpreter does not take.
++    orig = qsa_attn2.select_attn2_config
++
++    def no_extra(*a, **kw):
++        cfg = orig(*a, **kw)
++        cfg["extra"] = {}
++        return cfg
++
++    monkeypatch.setattr(qsa_attn2, "select_attn2_config", no_extra)
++    # The split-K merge's `bool & bool` does not run in the interpreter; one
++    # split stores straight from the split-K kernel (same int8 code path).
++    orig_cfg = qsa_ops._select_config
++
++    def one_split(*a, **kw):
++        block_n, warps, tiles, _ = orig_cfg(*a, **kw)
++        return block_n, warps, tiles, 1
++
++    monkeypatch.setattr(qsa_ops, "_select_config", one_split)
++    out = torch.zeros_like(case["q"])
++    if int8:
++        k, v, ks, vs = qsa_ops.qsa_pth_kv_views(case["int8_cache"], HD)
++        extra = dict(k_scale_cache=ks, v_scale_cache=vs)
++    else:
++        k, v = case["bf16_cache"].transpose(1, 2).split(HD, dim=-1)
++        extra = {}
++    qsa_ops.qsa_sparse_paged_attention(
++        case["q"],
++        k,
++        v,
++        case["indices"],
++        case["block_table"],
++        case["token_to_req"],
++        use_prefill_config,
++        out,
++        output_gate=case["gate"],
++        **extra,
++    )
++    return out
++
++
++def _reference_rows(case, k_rows, v_rows) -> torch.Tensor:
++    """Dense per-row reference over token-indexed K/V [tokens, nkv, hd]."""
++    out = []
++    for r in range(case["q"].shape[0]):
++        sel = case["indices"][r, : case["indices"][r, -1]].long()
++        o = dense_reference(case["q"][r], k_rows[sel], v_rows[sel], HD**-0.5)
++        out.append(o.to(torch.bfloat16).float() * torch.sigmoid(torch.tensor(30.0)))
++    return torch.stack(out)
++
++
++@requires_interpreter
++@pytest.mark.parametrize("impl", ["attn2", "splitk"])
++@pytest.mark.parametrize("hq,nkv", [(24, 2), (12, 1)])
++@pytest.mark.parametrize("use_prefill_config", [False, True])
++def test_qsa_kernels_int8_pth_vs_bf16(
++    impl, hq, nkv, use_prefill_config, monkeypatch
++) -> None:
++    case = _paged_case(hq, nkv, page=16, rows=3, width=67, seed=hq + nkv)
++    k, v, ks, vs = _write_int8(case)
++    # Writer bytes = the torch replica of the writer formula.
++    k_ref, ks_ref = quantize_pth(case["key"])
++    v_ref, vs_ref = quantize_pth(case["value"])
++    sm = case["slot_mapping"]
++    assert torch.equal(k.reshape(-1, nkv, HD)[sm], k_ref)
++    assert torch.equal(v.reshape(-1, nkv, HD)[sm], v_ref)
++    torch.testing.assert_close(ks.reshape(-1, nkv)[sm], ks_ref, rtol=0, atol=0)
++    torch.testing.assert_close(vs.reshape(-1, nkv)[sm], vs_ref, rtol=0, atol=0)
++
++    out8 = _run(case, impl, monkeypatch, True, use_prefill_config)
++    out16 = _run(case, impl, monkeypatch, False, use_prefill_config)
++    deq = _reference_rows(
++        case, k_ref.float() * ks_ref[..., None], v_ref.float() * vs_ref[..., None]
++    )
++    rel_k, cos_k = _metrics(out8.flatten(1), deq.flatten(1))
++    rel_q, cos_q = _metrics(out8, out16)
++    print(
++        f"[IP-F] {impl} hq={hq} nkv={nkv} prefill_cfg={use_prefill_config}: "
++        f"int8 kernel vs dequant ref rel={rel_k:.2e} cos={cos_k:.6f}; "
++        f"int8 vs bf16 cache rel={rel_q:.2e} cos={cos_q:.6f}"
++    )
++    assert rel_k < 1e-2 and cos_k > 0.9999
++    assert rel_q < 3e-2 and cos_q > 0.999
++
++
++@requires_interpreter
++@pytest.mark.parametrize("impl", ["attn2", "splitk"])
++def test_qsa_kernels_bf16_unchanged_by_int8_args(impl, monkeypatch) -> None:
++    """The bf16 launch (no scale kwargs) still matches the dense reference."""
++    case = _paged_case(12, 1, page=16, rows=2, width=35, seed=7)
++    out16 = _run(case, impl, monkeypatch, False, False)
++    ref = _reference_rows(case, case["key"], case["value"])
++    rel, cos = _metrics(out16, ref.view_as(out16))
++    assert rel < 1e-2 and cos > 0.9999
++
++
++@requires_interpreter
++@pytest.mark.parametrize("nkv", [1, 2])
++def test_fused_prepare_int8_matches_writer_formula(nkv: int) -> None:
++    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare
++
++    torch.manual_seed(nkv)
++    T, HQI, DI, MHQ, page, nb = 9, 4, 128, 6 * nkv, 16, 3
++    q = torch.randn(T, HQI * DI, dtype=torch.bfloat16)
++    k = torch.randn(T, DI, dtype=torch.bfloat16)
++    positions = torch.arange(T, dtype=torch.int64) + 5
++    cos_sin = torch.randn(64, DI // 2, dtype=torch.float32)
++    qkv_width = 2 * (MHQ + nkv) * HD
++    main_qkv = (torch.randn(T, qkv_width) * 2).to(torch.bfloat16)
++    w = torch.randn(2, HD, dtype=torch.bfloat16) * 0.2
++    slots = torch.randperm(nb * page)[:T]
++    slots[-1] = -1
++
++    def run(cache, pth):
++        common = dict(
++            compress_ratio=4,
++            mrope_section=None,
++            rope_pos_offset=None,
++            main_qkv=main_qkv,
++            main_q_norm_weight=w[0],
++            main_k_norm_weight=w[1],
++            main_eps=1e-6,
++            main_kv_cache=cache,
++            main_slot_mapping=slots,
++            main_k_scale=1.0,
++            main_v_scale=1.0,
++        )
++        if pth:
++            common["main_kv_pth"] = True
++        return qsa_prepare(
++            q,
++            k,
++            positions,
++            cos_sin,
++            torch.zeros(DI, dtype=torch.bfloat16),
++            torch.zeros(DI, dtype=torch.bfloat16),
++            1e-6,
++            torch.empty(T, HQI, DI, dtype=torch.bfloat16),
++            torch.zeros(2, 4, DI, dtype=torch.bfloat16),
++            torch.full((T,), -1, dtype=torch.int64),
++            torch.zeros(1, 1, dtype=torch.int32),
++            torch.tensor([0, T], dtype=torch.int32),
++            positions.clone(),
++            torch.zeros(2, 4, DI, dtype=torch.bfloat16),
++            torch.full((T,), -1, dtype=torch.int64),
++            torch.zeros(0, 2, dtype=torch.int32),
++            **common,
++        )
++
++    bf16 = torch.zeros(nb, nkv, page, 2 * HD, dtype=torch.bfloat16).transpose(1, 2)
++    i8 = torch.zeros(nb, nkv, page, 2 * (HD + 4), dtype=torch.int8).transpose(1, 2)
++    q16, g16 = run(bf16, False)
++    q8, g8 = run(i8, True)
++    assert torch.equal(q16, q8) and torch.equal(g16, g8)
++
++    live = slots[slots >= 0]
++    k16 = bf16.reshape(-1, nkv, 2 * HD)[live, :, :HD]
++    v16 = bf16.reshape(-1, nkv, 2 * HD)[live, :, HD:]
++    cells = i8.reshape(-1, nkv, 2 * (HD + 4))[live]
++    k_exp, ks_exp = quantize_pth(k16)
++    v_exp, vs_exp = quantize_pth(v16)
++    assert torch.equal(cells[..., :HD], k_exp)
++    assert torch.equal(cells[..., HD + 4 : 2 * HD + 4], v_exp)
++    ks = cells[..., HD : HD + 4].contiguous().view(torch.float32).squeeze(-1)
++    vs = cells[..., 2 * HD + 4 :].contiguous().view(torch.float32).squeeze(-1)
++    assert torch.equal(ks, ks_exp) and torch.equal(vs, vs_exp)
++    # Unwritten slots stay zero (slot -1 is skipped).
++    written = torch.zeros(nb * page, dtype=torch.bool)
++    written[live] = True
++    assert not i8.reshape(-1, nkv, 2 * (HD + 4))[~written].any()
++
++
++@requires_interpreter
++def test_unfused_update_ignores_padded_rows(monkeypatch) -> None:
++    """do_kv_cache_update writes only slot_mapping's rows of a padded K/V."""
++    monkeypatch.setattr(qsa_mod, "is_flash_attn_varlen_func_available", lambda: True)
++    impl = qsa_mod.Qwen4ExpQSAFlashAttentionImpl(
++        12, HD, HD**-0.5, 1, None, None, PTH, None
++    )
++    cache = torch.zeros(2, 16, 1, 2 * (HD + 4), dtype=torch.int8).transpose(1, 2)
++    key = torch.full((8, 1, HD), float("nan"), dtype=torch.bfloat16)
++    value = key.clone()
++    key[:5] = torch.randn(5, 1, HD, dtype=torch.bfloat16)
++    value[:5] = torch.randn(5, 1, HD, dtype=torch.bfloat16)
++    slots = torch.tensor([3, 17, -1, 0, 30])
++    impl.do_kv_cache_update(None, key, value, cache, slots)
++    k, v, ks, vs = impl.pth_kv_views(cache)
++    live = slots >= 0
++    k_exp, ks_exp = quantize_pth(key[:5][live])
++    v_exp, vs_exp = quantize_pth(value[:5][live])
++    assert torch.equal(k.reshape(-1, 1, HD)[slots[live]], k_exp)
++    assert torch.equal(v.reshape(-1, 1, HD)[slots[live]], v_exp)
++    assert torch.equal(ks.reshape(-1, 1)[slots[live]], ks_exp)
++    assert torch.equal(vs.reshape(-1, 1)[slots[live]], vs_exp)
++    written = torch.zeros(32, dtype=torch.bool)
++    written[slots[live]] = True
++    assert not cache.transpose(1, 2).reshape(32, -1)[~written].any()

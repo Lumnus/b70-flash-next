@@ -1,0 +1,484 @@
+From c98e4ae83bd15bd9a1e3f12dccfca55520aa4621 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 01:34:03 +0000
+Subject: [PATCH 33/51] B70-PLE-PRELOAD: preload the rank's INT8 PLE rows into
+ the pinned NVMe row cache (B70_PLE_INT8_NVME_PRELOAD=1)
+
+Opt-in (default 0). At init, when the rank's cache capacity >= its owned rows,
+read the owned row range (one contiguous byte range of the table) into the
+pinned slab with sequential O_DIRECT chunks (B70_PLE_INT8_NVME_PRELOAD_THREADS,
+default 4; B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB, default 64) through page-aligned
+bounces, then PleRowCache.mark_all_resident(): slot r = row r, the slots carry
+a pinned epoch CLOCK never picks, the tail stays free, and lookup() skips the
+ref/epoch writes. Zero NVMe reads per step afterwards; a miss, if one ever
+reached install(), takes a free tail slot and never displaces a preloaded row.
+Capacity < owned rows: one warning, normal cache. The boot sample rows (O_DIRECT
+row reads) are compared byte for byte against the preloaded slab. One log line
+per rank: rows, GiB, seconds, GB/s.
+---
+ tests/b70/test_ple_int8_nvme_preload.py      | 156 +++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py |  28 ++-
+ vllm/models/qwen4_exp/nvidia/ple_nvme.py     | 174 +++++++++++++++++++
+ 3 files changed, 354 insertions(+), 4 deletions(-)
+ create mode 100644 tests/b70/test_ple_int8_nvme_preload.py
+
+diff --git a/tests/b70/test_ple_int8_nvme_preload.py b/tests/b70/test_ple_int8_nvme_preload.py
+new file mode 100644
+index 0000000000..e4d6d2c400
+--- /dev/null
++++ b/tests/b70/test_ple_int8_nvme_preload.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-PLE-PRELOAD: the rank's owned INT8 PLE rows preloaded into the pinned row cache."""
++import importlib.util
++import json
++import logging
++import os
++import struct
++import sys
++import tempfile
++
++import numpy as np
++import pytest
++
++HERE = os.path.dirname(__file__)
++spec = importlib.util.spec_from_file_location(
++    "ple_nvme", os.path.join(HERE, "../../vllm/models/qwen4_exp/nvidia/ple_nvme.py"))
++ple_nvme = importlib.util.module_from_spec(spec)
++sys.modules["ple_nvme"] = ple_nvme
++spec.loader.exec_module(ple_nvme)
++
++DIM = 164
++PAGE = ple_nvme.PAGE
++
++
++def _table(tmp, rows, pad=0):
++    """A safetensors INT8 table; ``pad`` header bytes move the data off page alignment."""
++    rng = np.random.default_rng(11)
++    data = rng.integers(0, 256, size=(rows, DIM), dtype=np.uint8)
++    hdr = json.dumps({"table": {"dtype": "U8", "shape": [rows, DIM], "data_offsets": [0, data.nbytes]},
++                      "__metadata__": {"format": "lumnus-ple-int8-rowscale/v1"}}).encode()
++    hdr += b" " * (pad + (-(len(hdr) + pad) % 8))
++    path = os.path.join(tmp, "t.safetensors")
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(hdr)) + hdr + data.tobytes())
++    return path, data
++
++
++def _server(path, tp_start, tp_end, cap, *, stats_on=True):
++    start, shape, _ = ple_nvme.safetensors_tensor_location(path, "table")
++    store = ple_nvme.PleNvmeRowStore(path, start, DIM, shape[0], io_threads=2, reader="py")
++    slab = np.zeros((cap, DIM), np.uint8)
++    cache = ple_nvme.PleRowCache(tp_end - tp_start, cap, DIM, slab=slab)
++    stats = ple_nvme.PleNvmeStats(0, 1e9, stats_on)
++    srv = ple_nvme.PleNvmeServer(tp_start=tp_start, tp_end=tp_end, multipliers=np.ones(3, np.int64),
++                                 sizes=np.array([3000, 3000]), offsets=np.array([0, 3000]),
++                                 eos_token_id=0, heads_per_ngram=1, cache=cache, store=store,
++                                 stats=stats)
++    return srv, store, cache, slab, stats
++
++
++@pytest.mark.parametrize("tp", [(0, 3000), (1234, 4321), (4321, 6000)])
++@pytest.mark.parametrize("chunk,threads", [(PAGE, 1), (2 * PAGE, 3), (64 << 20, 4)])
++def test_preload_all_rows_resident_zero_reads(tp, chunk, threads):
++    tp_start, tp_end = tp
++    owned = tp_end - tp_start
++    with tempfile.TemporaryDirectory() as tmp:
++        path, data = _table(tmp, 6000, pad=37)
++        srv, store, cache, slab, stats = _server(path, tp_start, tp_end, cap=owned + 100)
++        info = ple_nvme.preload_cache(cache, store, tp_start, threads=threads, chunk_bytes=chunk)
++        assert info is not None and info["rows"] == owned and info["bytes"] == owned * DIM
++        assert info["direct"]  # ext4 /tmp takes O_DIRECT; the bounce handles misalignment
++        # Every owned row is resident, slot r = row r, bytes equal the file.
++        assert cache.all_resident
++        assert np.array_equal(cache.row2slot, np.arange(owned))
++        assert np.array_equal(cache.slot2row[:owned], np.arange(owned))
++        assert (cache.slot2row[owned:] == -1).all()
++        assert np.array_equal(slab[:owned], data[tp_start:tp_end])
++        assert not slab[owned:].any()
++        # Lookups after preload: zero NVMe reads, zero misses, exact gathers.
++        def boom(*a, **k):
++            raise AssertionError("NVMe read after preload")
++        store.read_rows = boom
++        rng = np.random.default_rng(3)
++        epoch_before = cache.epoch.copy()
++        for _ in range(20):
++            ids = rng.integers(0, 6000, size=(64, 2))
++            slots, mask = srv.resolve_ids(ids)
++            assert np.array_equal(mask, (ids >= tp_start) & (ids < tp_end))
++            t, c = np.nonzero(mask)
++            assert np.array_equal(slab[slots[t, c]], data[ids[t, c]])
++        assert stats.total_reads == 0 and stats.reads == 0 and stats.misses == 0
++        assert stats.hits == stats.lookups > 0
++        assert np.array_equal(cache.epoch, epoch_before)  # pins survive lookups
++        store.close()
++
++
++def test_preload_miss_path_never_displaces_preloaded_rows():
++    """If a miss ever reached install, it takes a free tail slot, never a pinned one."""
++    with tempfile.TemporaryDirectory() as tmp:
++        path, data = _table(tmp, 1000)
++        srv, store, cache, slab, _ = _server(path, 0, 1000, cap=1010)
++        assert ple_nvme.preload_cache(cache, store, 0, threads=2, chunk_bytes=PAGE) is not None
++        cache.begin_step()
++        # Forge a miss: drop row 5 from the map (its slot stays pinned).
++        cache.row2slot[5] = -1
++        slots = cache.lookup(np.array([5, 6]))
++        assert slots[0] == -1 and slots[1] == 6
++        new = cache.install(np.array([5]), data[5:6])
++        assert 1000 <= int(new[0]) < 1010
++        assert np.array_equal(slab[:1000][np.arange(1000) != 5], data[np.arange(1000) != 5])
++        assert np.array_equal(slab[new[0]], data[5])
++        # Pinned slots cannot be allocated: only the 9 remaining tail slots can.
++        cache.begin_step()
++        with pytest.raises(RuntimeError, match="evictable"):
++            cache.allocate(11)
++        store.close()
++
++
++def test_preload_falls_back_when_capacity_too_small(caplog):
++    with tempfile.TemporaryDirectory() as tmp:
++        path, data = _table(tmp, 3000)
++        srv, store, cache, slab, stats = _server(path, 0, 3000, cap=512)
++        with caplog.at_level(logging.WARNING, logger=ple_nvme.logger.name):
++            assert ple_nvme.preload_cache(cache, store, 0, rank=2) is None
++        warnings = [r for r in caplog.records if "preload (rank 2) skipped" in r.getMessage()]
++        assert len(warnings) == 1
++        assert not cache.all_resident and (cache.row2slot == -1).all() and not slab.any()
++        # Normal cache behaviour: misses read from the file, CLOCK evicts.
++        rng = np.random.default_rng(5)
++        for _ in range(6):
++            ids = rng.integers(0, 3000, size=(40, 2))
++            slots, mask = srv.resolve_ids(ids)
++            t, c = np.nonzero(mask)
++            assert np.array_equal(slab[slots[t, c]], data[ids[t, c]])
++        assert stats.total_reads > 0
++        store.close()
++
++
++def test_preload_range_buffered_and_retry():
++    with tempfile.TemporaryDirectory() as tmp:
++        path, data = _table(tmp, 500, pad=5)
++        start, _, _ = ple_nvme.safetensors_tensor_location(path, "table")
++        out = np.empty((300, DIM), np.uint8)
++        assert not ple_nvme.preload_range(path, start + 100 * DIM, out, direct=False,
++                                          threads=2, chunk_bytes=PAGE)
++        assert np.array_equal(out, data[100:400])
++        # One transient error and one short read per chunk are retried and still exact.
++        state = {"n": 0}
++
++        def flaky(fd, bufs, pos):
++            state["n"] += 1
++            if state["n"] % 3 == 1:
++                raise OSError(5, "EIO")
++            if state["n"] % 3 == 2:
++                view = bufs[0][:PAGE]
++                return os.preadv(fd, [view], pos)
++            return os.preadv(fd, bufs, pos)
++        out2 = np.empty((300, DIM), np.uint8)
++        ple_nvme.preload_range(path, start + 100 * DIM, out2, direct=True, threads=1,
++                               chunk_bytes=4 * PAGE, preadv=flaky)
++        assert np.array_equal(out2, data[100:400])
++
++        def dead(fd, bufs, pos):
++            raise OSError(5, "EIO")
++        with pytest.raises(RuntimeError, match="preload read failed"):
++            ple_nvme.preload_range(path, start, np.empty((10, DIM), np.uint8), preadv=dead)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+index 255bc38986..104ff20da2 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_ple_nvme.py
+@@ -22,6 +22,12 @@ B70_PLE_INT8_PATH), B70_PLE_INT8_NVME_CACHE_GIB (total over ranks, default 8),
+ B70_PLE_INT8_NVME_IO_THREADS, B70_PLE_INT8_NVME_READER, B70_PLE_INT8_NVME_STATS,
+ B70_PLE_INT8_NVME_STATS_S, B70_PLE_INT8_NVME_BOOT_SAMPLE, PLE_TABLE_PATH (BF16
+ cross-check, optional), B70_PLE_INT8_CROSSCHECK, B70_PLE_INT8_MAX_REL_ERR.
++
++B70-PLE-PRELOAD: B70_PLE_INT8_NVME_PRELOAD=1 (default 0) reads the rank's whole
++owned row range into the pinned cache at boot when the cache holds it
++(``ple_nvme.preload_cache``; B70_PLE_INT8_NVME_PRELOAD_THREADS,
++B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB); the boot sample rows are then compared
++byte for byte against the preloaded slab.
+ """
+ 
+ import json
+@@ -141,7 +147,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+ 
+         from .ple_nvme import (PleNvmeRowStore, PleNvmeServer, PleNvmeStats,
+                                PleRowCache, cache_rows_per_rank, owned_heads,
+-                               safetensors_tensor_location)
++                               preload_cache, safetensors_tensor_location)
+ 
+         if self._server is not None:
+             raise RuntimeError("B70 PLE NVMe rejects reload")
+@@ -177,10 +183,12 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+                 raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
+             del ref
+         sample = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
++        own = own_bytes = None
+         if sample > 0 and tp_end > tp_start:
+             g = torch.Generator().manual_seed(20260929 + tp_start)
+             own = torch.unique(torch.randint(tp_start, tp_end, (sample,), generator=g)).numpy()
+-            sc = torch.from_numpy(store.read_rows(own))[:, dim:].contiguous().view(torch.float32)
++            own_bytes = store.read_rows(own)
++            sc = torch.from_numpy(own_bytes)[:, dim:].contiguous().view(torch.float32)
+             if not bool(torch.isfinite(sc).all()) or bool((sc < 0).any()):
+                 raise ValueError(f"INT8 PLE {path}: non-finite or negative row scale")
+         sizes = owner.ngram_heads_vocab_sizes.detach().cpu().numpy()
+@@ -197,6 +205,18 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+         self._slab_np = slab.numpy()
+         cache = PleRowCache(tp_end - tp_start, capacity, self._storage, slab=self._slab_np)
+         rank = get_tp_group().rank_in_group
++        preloaded = None
++        if os.environ.get("B70_PLE_INT8_NVME_PRELOAD", "0") == "1":
++            preloaded = preload_cache(
++                cache, store, tp_start, rank=rank,
++                threads=int(os.environ.get("B70_PLE_INT8_NVME_PRELOAD_THREADS", "4")),
++                chunk_bytes=int(float(os.environ.get(
++                    "B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB", "64")) * (1 << 20)))
++            # The O_DIRECT row reads of the boot sample vs the bulk preload.
++            if (preloaded is not None and own is not None
++                    and not np.array_equal(self._slab_np[own - tp_start], own_bytes)):
++                raise ValueError(f"INT8 PLE {path}: preloaded rows differ from row reads "
++                                 f"(rank {rank}, {own.shape[0]} sampled rows)")
+         stats = PleNvmeStats(rank, float(os.environ.get("B70_PLE_INT8_NVME_STATS_S", "60")),
+                              os.environ.get("B70_PLE_INT8_NVME_STATS", "0") == "1")
+         self._server = PleNvmeServer(
+@@ -205,9 +225,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+             sizes=sizes, offsets=offsets, eos_token_id=owner.eos_token_id,
+             heads_per_ngram=owner.heads_per_ngram, cache=cache, store=store, stats=stats)
+         logger.info("B70 PLE NVMe ready (rank %d, %s): cache %d rows (%.2f GiB pinned), "
+-                    "own heads %s, rows [%d, %d), stage %d tokens", rank, path, capacity,
++                    "own heads %s, rows [%d, %d), stage %d tokens%s", rank, path, capacity,
+                     capacity * self._storage / 2**30, self._own_heads.tolist(), tp_start,
+-                    tp_end, self._capacity)
++                    tp_end, self._capacity, ", preloaded" if preloaded is not None else "")
+ 
+     # -- producer (host, before forward / FULL replay) ---------------------
+     def _check_capacity(self, num_tokens: int) -> None:
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_nvme.py b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+index c9a0dddd7f..a6dc7b84e2 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_nvme.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_nvme.py
+@@ -61,6 +61,19 @@ Env contract (read in ngram_embedding.py, documented here):
+   B70_PLE_INT8_NVME_LOOKAHEAD_TOKENS
+                                     tokens predicted per step (default: the
+                                     scheduler's max_num_batched_tokens)
++
++Preload (B70-PLE-PRELOAD), default off:
++  B70_PLE_INT8_NVME_PRELOAD=1       at boot, when the rank's cache holds at
++                                    least its owned rows, read the whole owned
++                                    row range (one contiguous byte range of
++                                    the table) into the pinned slab with large
++                                    sequential O_DIRECT reads and mark every
++                                    owned row resident and pinned: steps then
++                                    hit the cache with zero NVMe reads. With
++                                    less capacity: one warning, normal cache.
++  B70_PLE_INT8_NVME_PRELOAD_THREADS reads in flight per rank (default 4)
++  B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB
++                                    bytes per read, MiB (default 64)
+ """
+ 
+ from __future__ import annotations
+@@ -789,6 +802,8 @@ class PleNvmeRowStore:
+ # --------------------------------------------------------------------------
+ 
+ _EPOCH_FREE = np.iinfo(np.int64).min // 2
++# Epoch of a preloaded slot: above every step, so CLOCK never picks it.
++_EPOCH_PINNED = np.iinfo(np.int64).max // 2
+ 
+ 
+ def _clock_alloc_py(n, hand, ref, epoch, min_epoch, step, out):
+@@ -833,6 +848,12 @@ class PleRowCache:
+     ``.numpy()`` view in the engine); None = bookkeeping only (SYNC_ONLY).
+     Slot ids are int64 everywhere (slot * row_bytes exceeds 2^31 once
+     C > 13,094,412 rows).
++
++    Preload (``mark_all_resident``): with C >= num_rows, row r sits in slot r
++    for every own row, those slots carry ``_EPOCH_PINNED`` (CLOCK skips them
++    for good) and ``lookup`` stops touching ref/epoch. Nothing can miss then;
++    if a miss ever reached ``install`` it would take a free tail slot
++    [num_rows, C) and never displace a preloaded row.
+     """
+ 
+     def __init__(self, num_rows: int, capacity: int, row_bytes: int,
+@@ -855,6 +876,7 @@ class PleRowCache:
+         self.hand = 0
+         self.step = 0
+         self._alloc_out = np.empty(0, dtype=np.int64)
++        self.all_resident = False
+ 
+     def meta_bytes(self) -> int:
+         return (self.row2slot.nbytes + self.slot2row.nbytes + self.ref.nbytes
+@@ -867,6 +889,10 @@ class PleRowCache:
+     def lookup(self, local_rows: np.ndarray) -> np.ndarray:
+         """int64 slots of ``local_rows`` (-1 = miss); marks the hits used."""
+         slots = self.row2slot[local_rows].astype(np.int64)
++        if self.all_resident:
++            # Preloaded: every slot is pinned, so the CLOCK marks carry no
++            # information (and must not overwrite the pinned epoch).
++            return slots
+         hit = slots >= 0
+         if hit.any():
+             used = slots[hit]
+@@ -909,6 +935,152 @@ class PleRowCache:
+         self.row2slot[local_rows] = slots.astype(np.int32)
+         return slots
+ 
++    def mark_all_resident(self) -> None:
++        """Record that slab rows [0, num_rows) hold own rows [0, num_rows).
++
++        The caller has filled ``slab[:num_rows]`` (``preload_cache``). Row r
++        maps to slot r; slots [0, num_rows) are pinned; the tail is free.
++        """
++        n = self.num_rows
++        if n > self.capacity:
++            raise ValueError(f"PLE NVMe preload: {n} own rows > capacity {self.capacity}")
++        self.row2slot[:] = np.arange(n, dtype=np.int32)
++        self.slot2row[:n] = np.arange(n, dtype=np.int64)
++        self.slot2row[n:] = -1
++        self.ref[:n] = 1
++        self.ref[n:] = 0
++        self.epoch[:n] = _EPOCH_PINNED
++        self.epoch[n:] = _EPOCH_FREE
++        self.hand = n % self.capacity
++        self.all_resident = True
++
++
++# --------------------------------------------------------------------------
++# Preload (B70-PLE-PRELOAD)
++# --------------------------------------------------------------------------
++
++
++def preload_range(path: str, byte_start: int, out: np.ndarray, *, direct: bool = True,
++                  threads: int = 4, chunk_bytes: int = 64 << 20,
++                  preadv=None) -> bool:
++    """Fill ``out`` (C-contiguous uint8) with file bytes [byte_start, +out.nbytes).
++
++    Sequential page-aligned chunks of ``chunk_bytes`` (O_DIRECT when
++    ``direct`` and the filesystem takes it, buffered otherwise) go through
++    one page-aligned anonymous-mmap bounce per worker and are copied into
++    ``out``; ``threads`` workers take the chunks round-robin, so the reads
++    in flight stay adjacent in the file. A failed or short read is retried
++    as in ``PleNvmeRowStore`` (3 retries, then raise); nothing is zero-filled.
++    Returns whether O_DIRECT was used.
++    """
++    if out.dtype != np.uint8 or not out.flags.c_contiguous:
++        raise ValueError("PLE NVMe preload: out must be C-contiguous uint8")
++    total = int(out.nbytes)
++    if total == 0:
++        return direct
++    flat = out.reshape(-1)
++    chunk = max(PAGE, int(chunk_bytes) // PAGE * PAGE)
++    begin = int(byte_start)
++    end = begin + total
++    first = begin & ~(PAGE - 1)
++    starts = list(range(first, end, chunk))
++    fd = -1
++    if direct:
++        try:
++            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++        except OSError:
++            direct = False
++    if fd < 0:
++        fd = os.open(path, os.O_RDONLY)
++    size = os.fstat(fd).st_size
++    if end > size:
++        os.close(fd)
++        raise ValueError(f"{path}: preload range [{begin}, {end}) is past the file ({size} B)")
++    preadv = os.preadv if preadv is None else preadv
++    workers = max(1, min(int(threads), len(starts)))
++
++    def read_chunk(view: memoryview, pos: int, need: int) -> None:
++        length = -(-need // PAGE) * PAGE  # whole pages (O_DIRECT); EOF may cut it
++        got = 0
++        last_error = ""
++        attempt = 0
++        while got < need:
++            try:
++                n = preadv(fd, [view[got:length]], pos + got)
++                if n > 0:
++                    nxt = got + n
++                    if direct and nxt < need:
++                        nxt &= ~(PAGE - 1)  # O_DIRECT resumes on a page boundary
++                    if nxt > got:
++                        got = nxt
++                        continue
++                last_error = f"short read at {pos + got} ({n} B, {got} < {need} B)"
++            except OSError as exc:
++                last_error = f"errno {exc.errno} ({exc.strerror})"
++            if attempt >= len(RETRY_BACKOFF_S):
++                raise RuntimeError(
++                    f"PLE NVMe preload read failed after {len(RETRY_BACKOFF_S)} retries: "
++                    f"file offset {pos + got}, chunk at {pos}: {last_error} ({path})")
++            time.sleep(RETRY_BACKOFF_S[attempt])
++            attempt += 1
++
++    def work(w: int) -> None:
++        # On an exception the traceback still holds the views; the mmap is then
++        # unmapped by GC instead of close().
++        bounce = mmap.mmap(-1, chunk)
++        view = memoryview(bounce)
++        src = np.frombuffer(bounce, dtype=np.uint8)
++        for pos in starts[w::workers]:
++            lo = max(begin - pos, 0)
++            hi = min(chunk, end - pos)
++            read_chunk(view, pos, hi)
++            flat[pos + lo - begin: pos + hi - begin] = src[lo:hi]
++        del src
++        view.release()
++        bounce.close()
++
++    try:
++        if workers == 1:
++            work(0)
++        else:
++            with ThreadPoolExecutor(workers, thread_name_prefix="ple-preload") as pool:
++                for future in [pool.submit(work, w) for w in range(workers)]:
++                    future.result()
++    finally:
++        os.close(fd)
++    return direct
++
++
++def preload_cache(cache: PleRowCache, store: PleNvmeRowStore, tp_start: int, *,
++                  rank: int = 0, threads: int = 4, chunk_bytes: int = 64 << 20) -> dict | None:
++    """Read the rank's own rows [tp_start, tp_start + cache.num_rows) into the
++    cache slab and mark them all resident. None (one warning) when the cache
++    is smaller than the owned row range; the cache is then left untouched."""
++    rows = cache.num_rows
++    if cache.capacity < rows:
++        logger.warning(
++            "B70 PLE NVMe preload (rank %d) skipped: cache %d rows < %d owned rows "
++            "(raise B70_PLE_INT8_NVME_CACHE_GIB); normal row cache", rank, cache.capacity, rows)
++        return None
++    if cache.slab is None:
++        raise ValueError("PLE NVMe preload needs a cache slab")
++    if tp_start < 0 or tp_start + rows > store.num_rows:
++        raise ValueError(f"PLE NVMe preload: rows [{tp_start}, {tp_start + rows}) outside "
++                         f"the table [0, {store.num_rows})")
++    dest = cache.slab[:rows]
++    t0 = time.perf_counter()
++    direct = preload_range(store.path, store.data_start + tp_start * cache.row_bytes, dest,
++                           direct=store.direct, threads=threads, chunk_bytes=chunk_bytes)
++    seconds = time.perf_counter() - t0
++    cache.mark_all_resident()
++    nbytes = rows * cache.row_bytes
++    gbps = nbytes / max(seconds, 1e-9) / 1e9
++    logger.info(
++        "B70 PLE NVMe preload (rank %d): %d rows, %.2f GiB in %.1f s (%.2f GB/s%s); "
++        "all owned rows resident", rank, rows, nbytes / 2**30, seconds, gbps,
++        "" if direct else ", buffered")
++    return {"rows": rows, "bytes": nbytes, "seconds": seconds, "gbps": gbps, "direct": direct}
++
+ 
+ # --------------------------------------------------------------------------
+ # Stats
+@@ -1410,6 +1582,8 @@ __all__ = [
+     "PleNvmeStats",
+     "PleRowCache",
+     "cache_rows_per_rank",
++    "preload_cache",
++    "preload_range",
+     "host_ngram_ids",
+     "current_chunk_keys",
+     "owned_heads",

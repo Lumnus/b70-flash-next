@@ -1,0 +1,1379 @@
+From 9651a8729df84059b4fe0f476932155f6483501b Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 19:18:05 +0000
+Subject: [PATCH 06/15] [B70][XPU][MoE] W4A8 grouped GEMM: int8 per-token
+ activations x int4 g128 experts, s8 x s4 DPAS
+
+cutlass_grouped_gemm_w4a8 (Xe2): the routed-expert grouped GEMM of
+cutlass_grouped_gemm_xe2 with the mixed-precision DPAS atom
+XE_DPAS_TT<8, int32_t, int8_t, int4_t> (dpas.s4.s8). The int4 weights are
+the bytes XpuFusedMoe holds after implement_zp ([E, N, K/2], bf16 scales
+[E, N, K/128]) and feed the systolic array as nibbles: no unpack, no repack.
+A is int8 [M, K] with one fp32 scale per row. Each 128-wide K group
+accumulates in int32; at the group end the partial is converted and scaled
+by w_scale[n, g] into an fp32 accumulator (a twin bf16 TiledMMA supplies
+the identical f32 C layout and the D store); the row scale and optional
+bias are applied once before the bf16 store.
+
+- csrc/xpu/grouped_gemm/xe_2_w4a8: mainloop + persistent grouped launcher,
+  policies 128x256 / 32x64 / 16x64 / 8x64 by average rows per expert (as
+  W4A16), tile K 64 (B70_W4A8_TILE_K=32 for one atom), g128, bf16 out.
+- _xpu_C.cutlass_grouped_gemm_w4a8 (linked library grouped_gemm_w4a8_xe_2)
+  and an opt-in standalone module _b70_w4a8_C (-DB70_W4A8_STANDALONE=ON /
+  env B70_W4A8_STANDALONE=1) loadable next to an installed wheel.
+- vllm_xpu_kernels/b70_moe_w4a8.py: quantize token rows once, route int8
+  bytes + scales through the stock remap, gemm1, SiLU, per-row quant,
+  gemm2, stock moe_gather. XpuFusedMoe.apply(..., w4a8=True) uses it.
+- tests/b70/t_w4a8_cutlass.py: GPU exactness vs float64, MoE vs fp32 and
+  stock W4A16, microbench at per-rank shapes of a 512-expert MoE.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 99ede77..00b6a41 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -78,6 +78,8 @@ option(MHC_KERNELS_ENABLED
+ option(XPU_SPECIFIC_KERNELS_ENABLED
+        "Build XPU-specific kernels (_xpu_C extension)" ON)
+ option(XPUMEM_ALLOCATOR_ENABLED "Build xpumem_allocator extension" ON)
++option(B70_W4A8_STANDALONE
++       "Build the standalone _b70_w4a8_C module (W4A8 grouped GEMM only)" OFF)
+ option(VLLM_XPU_ENABLE_ONEDNN
+        "Build oneDNN-backed kernels (GEMM ops in _xpu_C extension)" ON)
+ 
+@@ -446,6 +448,9 @@ if(BUILD_SYCL_TLA_KERNELS)
+     if(MOE_KERNELS_ENABLED)
+       add_subdirectory(csrc/xpu/grouped_gemm/xe_2)
+       list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_xe_2")
++      # B70 W4A8 grouped GEMM (int8 act x int4 weights, s8 x s4 DPAS).
++      add_subdirectory(csrc/xpu/grouped_gemm/xe_2_w4a8)
++      list(APPEND GROUPED_GEMM_LIB_NAME "grouped_gemm_w4a8_xe_2")
+     endif()
+     if(FA2_KERNELS_ENABLED)
+       add_subdirectory(csrc/xpu/attn/xe_2)
+@@ -784,3 +789,35 @@ if(MOE_KERNELS_ENABLED)
+     3
+     WITH_SOABI)
+ endif()
++
++#
++# _b70_w4a8_C: the W4A8 grouped GEMM alone, loadable next to an installed
++# wheel (torch.ops._b70_w4a8_C.cutlass_grouped_gemm_w4a8).
++#
++if(B70_W4A8_STANDALONE
++   AND MOE_KERNELS_ENABLED
++   AND BUILD_SYCL_TLA_KERNELS
++   AND VLLM_XPU_ENABLE_XE2)
++  message(STATUS "Enabling _b70_w4a8_C extension.")
++  define_gpu_extension_target(
++    _b70_w4a8_C
++    DESTINATION
++    vllm_xpu_kernels
++    LANGUAGE
++    ${VLLM_GPU_LANG}
++    SOURCES
++    "csrc/xpu/grouped_gemm/b70_w4a8_bindings.cpp"
++    COMPILE_FLAGS
++    ${VLLM_GPU_COMPILE_FLAGS}
++    LINK_FLAGS
++    ${VLLM_GPU_LINK_FLAGS}
++    ARCHITECTURES
++    ${VLLM_GPU_ARCHES}
++    INCLUDE_DIRECTORIES
++    ${VLLM_XPU_INCLUDE_DIR}
++    LIBRARIES
++    grouped_gemm_w4a8_xe_2
++    USE_SABI
++    3
++    WITH_SOABI)
++endif()
+diff --git a/csrc/xpu/grouped_gemm/b70_w4a8_bindings.cpp b/csrc/xpu/grouped_gemm/b70_w4a8_bindings.cpp
+new file mode 100644
+index 0000000..f0c4262
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/b70_w4a8_bindings.cpp
+@@ -0,0 +1,21 @@
++// Standalone torch extension for the B70 W4A8 grouped GEMM, so it can be
++// loaded next to an installed vllm_xpu_kernels wheel with
++// torch.ops.load_library() without re-registering any _xpu_C op.
++// Built only with -DB70_W4A8_STANDALONE=ON (target _b70_w4a8_C).
++#include "core/registration.h"
++#include "xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h"
++
++#include <torch/library.h>
++
++TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
++  m.def(
++      "cutlass_grouped_gemm_w4a8(Tensor ptr_A, Tensor ptr_A_scale, "
++      "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
++      "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
++  m.impl(
++      "cutlass_grouped_gemm_w4a8",
++      torch::kXPU,
++      &cutlass_grouped_gemm_w4a8_xe2);
++}
++
++REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+index 4faaddc..a3d6435 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+@@ -4,6 +4,7 @@
+ 
+ #ifdef VLLM_XPU_ENABLE_XE2
+   #include "xe_2/grouped_gemm_xe2.h"
++  #include "xe_2_w4a8/grouped_gemm_w4a8_xe2.h"
+ #endif
+ #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
+   #include "xe_default/grouped_gemm_xe_default.h"
+@@ -62,3 +63,34 @@ torch::Tensor cutlass_grouped_gemm_interface(
+ #endif
+   }
+ }
++
++torch::Tensor cutlass_grouped_gemm_w4a8(
++    torch::Tensor ptr_A,
++    torch::Tensor ptr_A_scale,
++    torch::Tensor ptr_B,
++    torch::Tensor ptr_B_scale,
++    const c10::optional<at::Tensor>& ptr_bias,
++    torch::Tensor ptr_D,
++    torch::Tensor rows_per_expert,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts) {
++#ifdef VLLM_XPU_ENABLE_XE2
++  TORCH_CHECK(
++      vllm::xpu::is_xe2_arch(),
++      "cutlass_grouped_gemm_w4a8 needs an Xe2 GPU (s8 x s4 DPAS)");
++  return cutlass_grouped_gemm_w4a8_xe2(
++      ptr_A,
++      ptr_A_scale,
++      ptr_B,
++      ptr_B_scale,
++      ptr_bias,
++      ptr_D,
++      rows_per_expert,
++      N,
++      K,
++      num_experts);
++#else
++  TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
++#endif
++}
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+index c820fed..232b025 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+@@ -11,3 +11,17 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t N,
+     int64_t K,
+     int64_t num_experts);
++
++// B70 W4A8: int8 A [M, K] with fp32 per-row scales x packed int4 B
++// [E, N, K/2] with bf16 g128 scales -> bf16 D [M, N] (s8 x s4 DPAS).
++torch::Tensor cutlass_grouped_gemm_w4a8(
++    torch::Tensor ptr_A,
++    torch::Tensor ptr_A_scale,
++    torch::Tensor ptr_B,
++    torch::Tensor ptr_B_scale,
++    const c10::optional<at::Tensor>& ptr_bias,
++    torch::Tensor ptr_D,
++    torch::Tensor rows_per_expert,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts);
+diff --git a/csrc/xpu/grouped_gemm/xe_2_w4a8/CMakeLists.txt b/csrc/xpu/grouped_gemm/xe_2_w4a8/CMakeLists.txt
+new file mode 100644
+index 0000000..c00bdbe
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/xe_2_w4a8/CMakeLists.txt
+@@ -0,0 +1,5 @@
++cmake_minimum_required(VERSION 3.18)
++
++# B70 W4A8 grouped GEMM (s8 x s4 DPAS). Its own library so the standalone
++# _b70_w4a8_C module can be built without the stock grouped_gemm_xe_2.
++add_xe2_kernel_library(grouped_gemm_w4a8_xe_2 INCLUDE_CMAKE_SOURCE_DIR)
+diff --git a/csrc/xpu/grouped_gemm/xe_2_w4a8/gemm_w4a8_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2_w4a8/gemm_w4a8_xe2.hpp
+new file mode 100644
+index 0000000..dde7ceb
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/xe_2_w4a8/gemm_w4a8_xe2.hpp
+@@ -0,0 +1,219 @@
++/***************************************************************************************************
++ * B70 W4A8 grouped GEMM mainloop (Xe2 / BMG).
++ *
++ * D[m, n] = a_scale[m] * sum_g w_scale[n, g] * sum_{k in g} A8[m, k] * W4[n, k]
++ *
++ *   A8  int8  (M, K) row-major: activations quantized per token (dynamic,
++ *              symmetric), one fp32 scale per row.
++ *   W4  int4  (N, K) K-contiguous: the int4 bytes XpuFusedMoe holds after
++ *              implement_zp (signed two's-complement nibbles, element 2p in
++ *              the low nibble of byte p), exactly what the W4A16 path reads.
++ *   w_scale    [N, K/GroupSize] (bf16 / fp16) per expert, same as W4A16.
++ *
++ * The MMA atom is the Xe2 mixed-precision DPAS s8 x s4 -> s32
++ * (XE_DPAS_TT<8, int32_t, int8_t, int4_t>, `dpas.s4.s8`): the int4 weights
++ * go into the systolic array as nibbles, so there is no unpack at all, only
++ * the copy-layout -> VNNI register shuffle that sycl-tla's reorder does for
++ * int4 B in its own s8 x s4 GEMM. The int32 partial of each K group is
++ * converted to fp32 and scaled by w_scale[n, g] into an fp32 accumulator; the
++ * per-row activation scale is applied once at the end, then bf16 out.
++ *
++ * The C fragment of the s32 atom has the same layout as the f32 one of the
++ * bf16 atom with the same WG tile and SG layout (checked by a
++ * static_assert; the launcher re-asserts it), so the fp32 accumulator and the
++ * D store reuse the stock W4A16 epilogue machinery via a twin bf16 TiledMMA.
++ **************************************************************************************************/
++#pragma once
++
++#include <sycl/sycl.hpp>
++#include <cute/util/compat.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++#include <cute/tensor.hpp>
++
++#include "cutlass/kernel_hardware_info.h"
++#include "cutlass/platform/platform.h"
++
++#pragma clang diagnostic ignored "-Wpass-failed"
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++namespace MoEW4A8 {
++
++using namespace cute;
++
++template <
++    int GroupSize,
++    class GmemTiledCopyD,
++    class ATensor,
++    class BTensor,
++    class DTensor,
++    class TiledMMA,
++    class TiledMMAF,
++    typename ElementS,
++    typename ElementBI>
++CUTE_DEVICE void xe_gemm_w4a8(
++    ATensor const& A,  // (M,K) int8
++    BTensor const& B,  // (N,K) int4
++    const ElementS* Scales,   // [N, K/GroupSize] of this expert
++    const float* AScales,     // [M] of this expert
++    const ElementBI* Bias,    // [N] of this expert or nullptr
++    DTensor& C,               // (M,N) bf16/fp16
++    Coord<int, int, cute::Underscore, int> blk_coord,
++    TiledMMA const& mma,      // s8 x s4 -> s32
++    TiledMMAF const& mma_f) { // twin 16-bit atom, same tile: f32 C layout
++  static constexpr int sg_local_range = 16;
++  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++  auto wg_m = get<0>(blk_coord);
++  auto wg_n = get<1>(blk_coord);
++  int local_id = item.get_local_linear_id();
++
++  Tensor cA = make_identity_tensor(A.shape());
++  Tensor cB = make_identity_tensor(B.shape());
++  Tensor cC = make_identity_tensor(C.shape());
++
++  auto wg_tile = mma.tile_mnk();
++  auto wg_coord = make_coord(wg_m, wg_n, 0);
++
++  Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
++  Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
++  Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});
++
++  auto copy_a = make_block_2d_copy_A(mma, A);
++  auto copy_b = make_block_2d_copy_B(mma, B);
++  auto copy_c = get_block_2d_copy_D<GmemTiledCopyD>(mma_f, C);
++
++  auto thr_mma = mma.get_slice(local_id);
++  auto thr_mma_f = mma_f.get_slice(local_id);
++  auto thr_copy_a = copy_a.get_slice(local_id);
++  auto thr_copy_b = copy_b.get_slice(local_id);
++  auto thr_copy_c = copy_c.get_slice(local_id);
++
++  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
++  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
++  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
++  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
++
++  Tensor tAgA = thr_copy_a.partition_S(gA);
++  Tensor tBgB = thr_copy_b.partition_S(gB);
++
++  auto tCrC = thr_mma.partition_sg_fragment_C(gC);    // int32 group partial
++  auto tCrF = thr_mma_f.partition_sg_fragment_C(gC);  // fp32 running sum
++  auto tCcC = thr_mma_f.partition_C(gC);              // (m, n) of each value
++  auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
++  auto tCgC = thr_copy_c.partition_D(gC);
++
++  auto prefetch_a = make_block_2d_prefetch(copy_a);
++  auto prefetch_b = make_block_2d_prefetch(copy_b);
++  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
++  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
++  auto pAgA = thr_prefetch_A.partition_S(gA);
++  auto pBgB = thr_prefetch_B.partition_S(gB);
++
++  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
++
++  static constexpr auto ATOM_M =
++      get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
++  static constexpr auto ATOM_N =
++      get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
++  static constexpr int tile_m = get<0>(wg_tile);
++  static constexpr int tile_n = get<1>(wg_tile);
++  static constexpr int tile_k = get<2>(wg_tile);
++  static constexpr int SG_M = tile_m / ATOM_M;
++  static constexpr int SG_N = tile_n / ATOM_N;
++  static constexpr int N_COLS = SG_N / sg_local_range;  // columns per lane
++  static_assert(SG_N % sg_local_range == 0, "SG_N must be a multiple of 16");
++  static_assert(GroupSize % tile_k == 0, "a K tile must not straddle groups");
++  static constexpr int k_tiles_per_group = GroupSize / tile_k;
++  static constexpr int prefetch_dist = 4;
++
++  const int gemm_m = static_cast<int>(get<0>(A.shape()));
++  const int gemm_n = static_cast<int>(get<0>(B.shape()));
++  const int group_num = static_cast<int>(get<1>(A.shape())) / GroupSize;
++  const int k_tile_count = ceil_div(get<1>(A.shape()), tile_k);
++
++  const int sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
++  const int sg_local_id = cutlass::get_sub_group_local_id();
++  const int n_lane0 = wg_n * tile_n + sg_local_n_coord * SG_N + sg_local_id;
++
++  // Value i of the C fragment is column n_lane0 + (i / SG_M) * 16 (the
++  // layout the stock bias epilogue relies on; s32 == f32 layout).
++  float wsc[N_COLS];
++
++  clear(tCrC);
++  clear(tCrF);
++
++  int k_tile_prefetch = 0;
++  CUTE_UNROLL
++  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
++    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
++    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
++  }
++
++  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
++    barrier_arrive(barrier_scope);
++
++    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
++    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
++
++    if (k_tile % k_tiles_per_group == 0) {
++      // Issue this group's weight-scale loads now; they are consumed only
++      // at the end of the group, k_tiles_per_group MMA steps later.
++      const int g = k_tile / k_tiles_per_group;
++      CUTLASS_PRAGMA_UNROLL
++      for (int c = 0; c < N_COLS; ++c) {
++        const int n = n_lane0 + c * sg_local_range;
++        wsc[c] = n < gemm_n
++                     ? static_cast<float>(
++                           Scales[static_cast<int64_t>(n) * group_num + g])
++                     : 0.0f;
++      }
++    }
++
++    if (k_tile_prefetch < k_tile_count) {
++      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
++      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
++    }
++
++    reorder(tArA, tCrA);
++    reorder(tBrB, tCrB);
++
++    cute::gemm(mma, tCrA, tCrB, tCrC);
++
++    barrier_wait(barrier_scope);
++
++    if ((k_tile + 1) % k_tiles_per_group == 0 || k_tile + 1 == k_tile_count) {
++      CUTLASS_PRAGMA_UNROLL
++      for (int c = 0; c < N_COLS; ++c) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int sm = 0; sm < SG_M; ++sm) {
++          const int i = c * SG_M + sm;
++          tCrF(i) += static_cast<float>(tCrC(i)) * wsc[c];
++        }
++      }
++      clear(tCrC);
++    }
++  }
++
++  // Per-token activation scale (one per row), then the optional bias.
++  CUTLASS_PRAGMA_UNROLL
++  for (int i = 0; i < tCrF.size(); ++i) {
++    const int m = get<0>(tCcC(i));
++    tCrF(i) *= (m < gemm_m) ? AScales[m] : 0.0f;
++  }
++  if (Bias != nullptr) {
++    CUTLASS_PRAGMA_UNROLL
++    for (int c = 0; c < N_COLS; ++c) {
++      const int n = n_lane0 + c * sg_local_range;
++      const float b = n < gemm_n ? static_cast<float>(Bias[n]) : 0.0f;
++      CUTLASS_PRAGMA_UNROLL
++      for (int sm = 0; sm < SG_M; ++sm) {
++        tCrF(c * SG_M + sm) += b;
++      }
++    }
++  }
++
++  reorder(tCrF, tCrC_out);
++  copy(copy_c, tCrC_out, tCgC);
++}
++
++}  // namespace MoEW4A8
+diff --git a/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.cpp b/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.cpp
+new file mode 100644
+index 0000000..daad717
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.cpp
+@@ -0,0 +1,380 @@
++// B70 W4A8 grouped GEMM (Xe2 / BMG): int8 per-token activations x the int4
++// expert weights XpuFusedMoe holds, s8 x s4 -> s32 DPAS, per-group weight
++// scale and per-row activation scale in fp32, bf16/fp16 out. Same grouping
++// contract as cutlass_grouped_gemm_xe2 (rows of A sorted by expert,
++// rows_per_expert[E], persistent work-groups with an atomic tile counter).
++#include <torch/all.h>
++#include <c10/xpu/XPUStream.h>
++#include <cstdlib>
++#include <cstring>
++
++#include <cute/tensor.hpp>
++#include <cute/util/compat.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++#include <sycl/sycl.hpp>
++
++#include "cutlass/kernel_hardware_info.h"
++#include "cutlass/platform/platform.h"
++
++#include "gemm_w4a8_xe2.hpp"
++#include "grouped_gemm_w4a8_xe2.h"
++
++#pragma clang diagnostic ignored "-Wpass-failed"
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++namespace MoEW4A8 {
++using namespace cute;
++
++// WG tile (M, N, K) and SG layout. K is a multiple of the s8 x s4 atom's 32.
++template <int TM, int TN, int TK, int SGM, int SGN>
++struct w4a8_policy {
++  static constexpr int tile_k = TK;
++  using WGTile = Shape<Int<TM>, Int<TN>, Int<TK>>;
++  using SGLayout =
++      Layout<Shape<Int<SGM>, Int<SGN>, _1>, Stride<Int<SGN>, _1, _0>>;
++  using GmemTiledCopyD = void;
++};
++
++// Large-M tile: the W4A16 w4a16_policy shape (128 x 256, 4 x 8 SGs).
++template <int TK>
++using w4a8_policy_big = w4a8_policy<128, 256, TK, 4, 8>;
++template <int TK>
++using w4a8_policy_m_32 = w4a8_policy<32, 64, TK, 1, 4>;
++template <int TK>
++using w4a8_policy_m_16 = w4a8_policy<16, 64, TK, 1, 4>;
++template <int TK>
++using w4a8_policy_m_8 = w4a8_policy<8, 64, TK, 1, 4>;
++
++template <typename, typename, class, int>
++class W4A8GemmName;
++
++template <
++    class GmemTiledCopyD,
++    int GroupSize,
++    class TiledMMA,
++    class TiledMMAF,
++    typename ElementS,
++    typename ElementD>
++CUTE_DEVICE void MoEGEMMW4A8(
++    const int8_t* Activations,
++    const float* ActScales,
++    const uint8_t* Weights,
++    const ElementS* Scales,
++    const ElementD* Bias,
++    ElementD* Outputs,
++    TiledMMA const& mma,
++    TiledMMAF const& mma_f,
++    const int* rows_per_expert,
++    const int32_t num_experts,
++    const int32_t gemm_n,
++    const int32_t gemm_k,
++    int32_t* atomic_buffer,
++    const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
++  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++  auto wg_tile = mma.tile_mnk();
++  auto wg_tile_m = get<0>(wg_tile);
++  auto wg_tile_n = get<1>(wg_tile);
++
++  int group_id = item.get_group_linear_id();
++  int gemm_n_pad = (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
++  int group_m_id = (group_id * wg_tile_n) / gemm_n_pad;
++  int group_range = item.get_group_range(1);
++  int local_id = item.get_local_linear_id();
++  const int group_num = gemm_k / GroupSize;
++
++  int pre_rows = 0;
++  int pre_tiles = 0;
++
++  int32_t* slm_mem = static_cast<int32_t*>(
++      slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
++          .get());
++
++  for (int i = 0; i < num_experts; ++i) {
++    int gemm_m = rows_per_expert[i];
++    int cumsum_rows_for_experts = pre_rows + gemm_m;
++    int cumsum_tiles_for_experts =
++        (gemm_m + wg_tile_m - 1) / wg_tile_m + pre_tiles;
++
++    if (group_m_id >= cumsum_tiles_for_experts) {
++      pre_rows = cumsum_rows_for_experts;
++      pre_tiles = cumsum_tiles_for_experts;
++      continue;
++    }
++
++    const int64_t B_offset = static_cast<int64_t>(i) *
++                             static_cast<int64_t>(gemm_n) *
++                             static_cast<int64_t>(gemm_k) / 2;
++    const int8_t* ptr_A = Activations + static_cast<int64_t>(pre_rows) * gemm_k;
++    const float* ptr_AS = ActScales + pre_rows;
++    const uint8_t* ptr_B = Weights + B_offset;
++    const ElementS* ptr_S = Scales + static_cast<int64_t>(i) * gemm_n * group_num;
++    const ElementD* ptr_Bias =
++        Bias != nullptr ? Bias + static_cast<int64_t>(i) * gemm_n : nullptr;
++    ElementD* ptr_D = Outputs + static_cast<int64_t>(pre_rows) * gemm_n;
++
++    auto A_tensor = make_tensor(
++        make_gmem_ptr(const_cast<int8_t*>(ptr_A)),
++        make_layout(make_shape(gemm_m, gemm_k), make_stride(gemm_k, _1{})));
++    auto B_tensor = make_tensor(
++        make_gmem_ptr(reinterpret_cast<int4_t*>(const_cast<uint8_t*>(ptr_B))),
++        make_layout(make_shape(gemm_n, gemm_k), make_stride(gemm_k, _1{})));
++    auto D_tensor = make_tensor(
++        make_gmem_ptr(ptr_D),
++        make_layout(make_shape(gemm_m, gemm_n), make_stride(gemm_n, _1{})));
++
++    while (group_m_id < cumsum_tiles_for_experts) {
++      int n_coord = (group_id * wg_tile_n) % gemm_n_pad / wg_tile_n;
++      int m_coord = (group_m_id - pre_tiles);
++      auto tile_coord = make_coord(m_coord, n_coord, _, 0);
++
++      xe_gemm_w4a8<GroupSize, GmemTiledCopyD>(
++          A_tensor,
++          B_tensor,
++          ptr_S,
++          ptr_AS,
++          ptr_Bias,
++          D_tensor,
++          tile_coord,
++          mma,
++          mma_f);
++
++      if (local_id == 0) {
++        slm_mem[0] = cutlass::atomicAdd(atomic_buffer, 1);
++      }
++      sycl::group_barrier(item.get_group());
++      group_id = group_range + slm_mem[0];
++      group_m_id = (group_id * wg_tile_n) / gemm_n_pad;
++    }
++    pre_rows = cumsum_rows_for_experts;
++    pre_tiles = cumsum_tiles_for_experts;
++  }
++}
++
++template <class policy, int GroupSize, typename ElementS, typename ElementD>
++void launch(
++    sycl::queue& stream,
++    const int8_t* activations,
++    const float* act_scales,
++    const uint8_t* weights,
++    const ElementS* scales,
++    const ElementD* bias,
++    ElementD* outputs,
++    int gemm_n,
++    int gemm_k,
++    const int* rows_per_expert,
++    int num_experts,
++    int32_t* atomic_buffer) {
++  using WGTile = typename policy::WGTile;
++  using SGLayout = typename policy::SGLayout;
++  // s8 x s4 -> s32 (dpas.s4.s8), and its 16-bit twin for the f32 C layout.
++  using MMA = typename TiledMMAHelper<
++      MMA_Atom<XE_DPAS_TT<8, int32_t, int8_t, int4_t>>,
++      Layout<WGTile>,
++      SGLayout>::TiledMMA;
++  using MMAF = typename TiledMMAHelper<
++      MMA_Atom<XE_DPAS_TT<8, float, ElementD>>,
++      Layout<WGTile>,
++      SGLayout>::TiledMMA;
++  static_assert(
++      is_same_v<decltype(MMA{}.tile_mnk()), decltype(MMAF{}.tile_mnk())>,
++      "s8 and 16-bit TiledMMA must have the same WG tile");
++  using CS32 = decltype(MMA{}
++                            .get_slice(0)
++                            .partition_sg_fragment_C(make_identity_tensor(
++                                select<0, 1>(WGTile{})))
++                            .layout());
++  using CF32 = decltype(MMAF{}
++                            .get_slice(0)
++                            .partition_sg_fragment_C(make_identity_tensor(
++                                select<0, 1>(WGTile{})))
++                            .layout());
++  static_assert(
++      is_same_v<CS32, CF32>,
++      "s32 and f32 C fragments must share one layout");
++
++  auto mma = MMA{};
++  auto mma_f = MMAF{};
++
++  int sm_count =
++      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
++  auto MaxThreadsPerWorkgroup = size(mma);
++  static constexpr int MaxThreadsPerSM = 512;
++  TORCH_CHECK(
++      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0,
++      "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup");
++
++  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
++  sycl::range<3> global(
++      1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
++
++  namespace syclex = sycl::ext::oneapi::experimental;
++  namespace intelex = sycl::ext::intel::experimental;
++  syclex::properties kernel_props{
++      syclex::sub_group_size<16>, intelex::grf_size<256>};
++
++  using GmemTiledCopyD = typename policy::GmemTiledCopyD;
++
++  stream.submit([&](sycl::handler& cgh) {
++    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
++    cgh.parallel_for<W4A8GemmName<ElementS, ElementD, policy, GroupSize>>(
++        sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
++          MoEGEMMW4A8<GmemTiledCopyD, GroupSize>(
++              activations,
++              act_scales,
++              weights,
++              scales,
++              bias,
++              outputs,
++              mma,
++              mma_f,
++              rows_per_expert,
++              num_experts,
++              gemm_n,
++              gemm_k,
++              atomic_buffer,
++              local_mem);
++        });
++  });
++}
++
++static int env_int(const char* name, int dflt) {
++  const char* v = std::getenv(name);
++  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
++}
++
++template <typename ElementS, typename ElementD>
++void dispatch(
++    sycl::queue& q,
++    at::Tensor& A,
++    at::Tensor& A_scale,
++    at::Tensor& B,
++    at::Tensor& B_scale,
++    const c10::optional<at::Tensor>& bias,
++    at::Tensor& D,
++    at::Tensor& rows_per_expert,
++    int N,
++    int K,
++    int E,
++    int group_size,
++    int avg_m,
++    at::Tensor& atomic_buffer) {
++  // Tile K: 64 by default (two s8 x s4 atoms deep, the A bytes per k-tile of
++  // the bf16 path); B70_W4A8_TILE_K=32 for one atom.
++  const int tk = env_int("B70_W4A8_TILE_K", 64) == 32 ? 32 : 64;
++  // M-tile selection mirrors W4A16 (avg rows per expert); the thresholds can
++  // be moved with B70_W4A8_M8 / _M16 / _M32 (upper bounds, inclusive).
++  const int t8 = env_int("B70_W4A8_M8", 4);
++  const int t16 = env_int("B70_W4A8_M16", 8);
++  const int t32 = env_int("B70_W4A8_M32", 128);
++
++  auto* pa = reinterpret_cast<const int8_t*>(A.data_ptr());
++  auto* pas = reinterpret_cast<const float*>(A_scale.data_ptr());
++  auto* pb = reinterpret_cast<const uint8_t*>(B.data_ptr());
++  auto* ps = reinterpret_cast<const ElementS*>(B_scale.data_ptr());
++  auto* pbi = bias.has_value()
++                  ? reinterpret_cast<const ElementD*>(bias->data_ptr())
++                  : static_cast<const ElementD*>(nullptr);
++  auto* pd = reinterpret_cast<ElementD*>(D.data_ptr());
++  auto* prow = reinterpret_cast<const int*>(rows_per_expert.data_ptr());
++  auto* patom = static_cast<int32_t*>(atomic_buffer.data_ptr());
++
++#define W4A8_LAUNCH(POLICY, GS)                                             \
++  launch<POLICY, GS, ElementS, ElementD>(                                   \
++      q, pa, pas, pb, ps, pbi, pd, N, K, prow, E, patom)
++
++  // Only g128 is instantiated (Intel AutoRound / GPTQ g128); add more group
++  // sizes here and in the host check below when a checkpoint needs them.
++#define W4A8_BY_GS(POLICY) W4A8_LAUNCH(POLICY, 128);
++
++#define W4A8_BY_M(TK)                                                       \
++  if (avg_m <= t8) {                                                        \
++    W4A8_BY_GS(w4a8_policy_m_8<TK>)                                         \
++  } else if (avg_m <= t16) {                                                \
++    W4A8_BY_GS(w4a8_policy_m_16<TK>)                                        \
++  } else if (avg_m <= t32) {                                                \
++    W4A8_BY_GS(w4a8_policy_m_32<TK>)                                        \
++  } else {                                                                  \
++    W4A8_BY_GS(w4a8_policy_big<TK>)                                         \
++  }
++
++  if (tk == 32) {
++    W4A8_BY_M(32)
++  } else {
++    W4A8_BY_M(64)
++  }
++#undef W4A8_BY_M
++#undef W4A8_BY_GS
++#undef W4A8_LAUNCH
++}
++
++}  // namespace MoEW4A8
++
++at::Tensor cutlass_grouped_gemm_w4a8_xe2(
++    at::Tensor ptr_A,
++    at::Tensor ptr_A_scale,
++    at::Tensor ptr_B,
++    at::Tensor ptr_B_scale,
++    const c10::optional<at::Tensor>& ptr_bias,
++    at::Tensor ptr_D,
++    at::Tensor rows_per_expert,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts) {
++  TORCH_CHECK(ptr_A.scalar_type() == at::kChar, "w4a8: A must be int8");
++  TORCH_CHECK(
++      ptr_A.dim() == 2 && ptr_A.size(1) == K && ptr_A.is_contiguous(),
++      "w4a8: A must be contiguous [M, K]");
++  const int64_t M = ptr_A.size(0);
++  TORCH_CHECK(
++      ptr_A_scale.scalar_type() == at::kFloat && ptr_A_scale.is_contiguous() &&
++          ptr_A_scale.numel() == M,
++      "w4a8: A_scale must be contiguous float32 with one entry per row of A");
++  TORCH_CHECK(
++      ptr_B.scalar_type() == at::kChar || ptr_B.scalar_type() == at::kByte,
++      "w4a8: B must be packed int4 bytes (int8/uint8)");
++  TORCH_CHECK(
++      ptr_B.dim() == 3 && ptr_B.size(0) == num_experts && ptr_B.size(1) == N &&
++          ptr_B.size(2) * 2 == K && ptr_B.is_contiguous(),
++      "w4a8: B must be contiguous [E, N, K/2]");
++  TORCH_CHECK(
++      ptr_B_scale.dim() == 3 && ptr_B_scale.size(0) == num_experts &&
++          ptr_B_scale.size(1) == N && ptr_B_scale.is_contiguous() &&
++          K % ptr_B_scale.size(2) == 0,
++      "w4a8: B_scale must be contiguous [E, N, K/group_size]");
++  const int group_size = static_cast<int>(K / ptr_B_scale.size(2));
++  TORCH_CHECK(group_size == 128, "w4a8: only group_size 128 is built");
++  TORCH_CHECK(K % 64 == 0, "w4a8: K must be a multiple of 64");
++  TORCH_CHECK(N % 64 == 0, "w4a8: N must be a multiple of 64");
++  TORCH_CHECK(
++      ptr_D.dim() == 2 && ptr_D.size(0) == M && ptr_D.size(1) == N &&
++          ptr_D.is_contiguous(),
++      "w4a8: D must be contiguous [M, N]");
++  TORCH_CHECK(
++      ptr_D.scalar_type() == at::kBFloat16, "w4a8: D must be bf16 (built)");
++  TORCH_CHECK(
++      ptr_B_scale.scalar_type() == ptr_D.scalar_type(),
++      "w4a8: B_scale dtype must match D (bf16/fp16)");
++  if (ptr_bias.has_value()) {
++    TORCH_CHECK(
++        ptr_bias->dim() == 2 && ptr_bias->size(0) == num_experts &&
++            ptr_bias->size(1) == N && ptr_bias->is_contiguous() &&
++            ptr_bias->scalar_type() == ptr_D.scalar_type(),
++        "w4a8: bias must be contiguous [E, N] in the D dtype");
++  }
++  TORCH_CHECK(
++      rows_per_expert.scalar_type() == at::kInt &&
++          rows_per_expert.numel() == num_experts,
++      "w4a8: rows_per_expert must be int32 [E]");
++  if (M == 0) return ptr_D;
++
++  auto& q = at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
++  at::Tensor atomic_buffer =
++      at::zeros({1}, ptr_A.options().dtype(at::kInt));
++  const int avg_m = static_cast<int>(M / num_experts);
++
++  MoEW4A8::dispatch<cute::bfloat16_t, cute::bfloat16_t>(
++      q, ptr_A, ptr_A_scale, ptr_B, ptr_B_scale, ptr_bias, ptr_D,
++      rows_per_expert, static_cast<int>(N), static_cast<int>(K),
++      static_cast<int>(num_experts), group_size, avg_m, atomic_buffer);
++  return ptr_D;
++}
+diff --git a/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h b/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h
+new file mode 100644
+index 0000000..81fc382
+--- /dev/null
++++ b/csrc/xpu/grouped_gemm/xe_2_w4a8/grouped_gemm_w4a8_xe2.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <torch/all.h>
++
++// int8 A [M, K] (per-row fp32 scale [M]) x packed int4 B [E, N, K/2]
++// (bf16 scales [E, N, K/128]) -> bf16 D [M, N]; rows of A grouped by expert.
++at::Tensor cutlass_grouped_gemm_w4a8_xe2(
++    at::Tensor ptr_A,
++    at::Tensor ptr_A_scale,
++    at::Tensor ptr_B,
++    at::Tensor ptr_B_scale,
++    const c10::optional<at::Tensor>& ptr_bias,
++    at::Tensor ptr_D,
++    at::Tensor rows_per_expert,
++    int64_t N,
++    int64_t K,
++    int64_t num_experts);
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index d960521..f07496f 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -71,6 +71,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "cutlass_grouped_gemm_interface",
+       torch::kXPU,
+       &cutlass_grouped_gemm_interface);
++
++  // B70 W4A8 grouped GEMM: int8 per-token activations x int4 g128 weights.
++  xpu_ops.def(
++      "cutlass_grouped_gemm_w4a8(Tensor ptr_A, Tensor ptr_A_scale, "
++      "Tensor ptr_B, Tensor ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
++      "Tensor rows_per_expert, int N, int K, int num_experts) -> Tensor");
++  xpu_ops.impl(
++      "cutlass_grouped_gemm_w4a8", torch::kXPU, &cutlass_grouped_gemm_w4a8);
+ #endif
+ 
+   xpu_ops.def(
+diff --git a/setup.py b/setup.py
+index e841c75..9aa8274 100755
+--- a/setup.py
++++ b/setup.py
+@@ -201,6 +201,11 @@ class cmake_build_ext(build_ext):
+             cmake_args.append('-D{}={}'.format(
+                 opt, "ON" if _is_enabled(opt) else "OFF"))
+ 
++        # The standalone W4A8 module is opt-in (default OFF).
++        cmake_args.append('-DB70_W4A8_STANDALONE={}'.format(
++            "ON" if _is_enabled("B70_W4A8_STANDALONE", default="OFF")
++            else "OFF"))
++
+         # XE3 (CRI/Xe3p) kernels are enabled by default, like XE2. Forward the
+         # toggle so users can still disable them explicitly.
+         cmake_args.append('-DVLLM_XPU_ENABLE_XE3P={}'.format(
+@@ -571,6 +576,8 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
+         if _is_enabled("MOE_KERNELS_ENABLED"):
+             additional_libraries["grouped_gemm_xe_2"] = (
+                 "/csrc/xpu/grouped_gemm/xe_2")
++            additional_libraries["grouped_gemm_w4a8_xe_2"] = (
++                "/csrc/xpu/grouped_gemm/xe_2_w4a8")
+     # Attention-only XE3 upstreaming: the XE3 grouped_gemm / quant_asm
+     # components are intentionally not wired here.
+     if _is_enabled("VLLM_XPU_ENABLE_XE3P", default="ON") and _is_enabled(
+@@ -590,6 +597,10 @@ if _build_custom_ops():
+         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._moe_C"))
+     if _is_enabled("XPU_SPECIFIC_KERNELS_ENABLED"):
+         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._xpu_C"))
++    if _is_enabled("B70_W4A8_STANDALONE", default="OFF") and _is_enabled(
++            "MOE_KERNELS_ENABLED"):
++        ext_modules.append(
++            CMakeExtension(name="vllm_xpu_kernels._b70_w4a8_C"))
+     if _is_enabled("XPUMEM_ALLOCATOR_ENABLED"):
+         ext_modules.append(
+             CMakeExtension(name="vllm_xpu_kernels.xpumem_allocator"))
+diff --git a/tests/b70/t_w4a8_cutlass.py b/tests/b70/t_w4a8_cutlass.py
+new file mode 100644
+index 0000000..f0eca11
+--- /dev/null
++++ b/tests/b70/t_w4a8_cutlass.py
+@@ -0,0 +1,312 @@
++#!/usr/bin/env python3
++"""GPU test + microbench: W4A8 cutlass grouped GEMM (s8 x s4 DPAS) vs stock W4A16.
++
++Loads the standalone _b70_w4a8_C module from --lib-dir (torch.ops.load_library, the
++installed vllm_xpu_kernels wheel is untouched) and b70_moe_w4a8.py from this directory.
++
++  gemm   GEMM-level exactness vs a float64 reference over the same int4 bytes and int8 rows
++         (every M policy, both tile K), plus agreement with the stock W4A16 op.
++  moe    MoE-level (per-rank shape of a 512-expert top-10 MoE: hidden 2560, inter 640, 512 experts / EP2 = 256 local,
++         top-10): W4A8 vs stock XpuFusedMoe.apply vs an fp32 reference.
++  bench  ms of the full MoE (stock apply vs W4A8) at decode 1..256 and prefill 512..4096,
++         and GEMM-only ms / TOPS of gemm1 and gemm2 (stock cutlass bf16 vs W4A8) at the
++         routed rows of each token count.
++"""
++import argparse
++import json
++import math
++import os
++import statistics
++import sys
++import time
++
++import torch
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++
++try:  # the staged copy next to this file (installed wheel untouched)
++    import b70_moe_w4a8 as w4  # noqa: E402
++except ImportError:  # in-tree: tests/b70/ of vllm-xpu-kernels
++    from vllm_xpu_kernels import b70_moe_w4a8 as w4  # noqa: E402
++from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe  # noqa: E402
++
++DEV = "xpu"
++H, INTER, E_GLOBAL, EP, TOPK, G = 2560, 640, 512, 2, 10, 128
++
++
++def sync():
++    torch.xpu.synchronize()
++
++
++def bench(fn, iters=20, reps=5, warm=3):
++    for _ in range(warm):
++        fn()
++    sync()
++    ts = []
++    for _ in range(reps):
++        t0 = time.perf_counter()
++        for _ in range(iters):
++            fn()
++        sync()
++        ts.append((time.perf_counter() - t0) / iters * 1e3)
++    return statistics.median(ts)
++
++
++def unpack_s4(b):
++    """[.., N, K/2] int8 (implement_zp bytes) -> [.., N, K] int8 values in [-8, 7]."""
++    u = b.to(torch.int16) & 0xFF
++    lo = u & 0xF
++    hi = (u >> 4) & 0xF
++    lo = torch.where(lo >= 8, lo - 16, lo)
++    hi = torch.where(hi >= 8, hi - 16, hi)
++    return torch.stack((lo, hi), dim=-1).flatten(-2).to(torch.int8)
++
++
++def dequant(b, s):
++    """W[n, k] = s4 * scale[n, k // 128] (fp32)."""
++    w = unpack_s4(b).float()
++    return (w.view(*w.shape[:-1], -1, G) * s.float().unsqueeze(-1)).flatten(-2)
++
++
++def rel(a, b):
++    a, b = a.float(), b.float()
++    return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
++
++
++def cos_rows(a, b):
++    c = torch.nn.functional.cosine_similarity(a.float(), b.float(), dim=-1)
++    return c.mean().item(), c.min().item()
++
++
++# --------------------------------------------------------------------------- gemm
++def gemm_case(op, rows, N, K, tile_k, seed):
++    g = torch.Generator(device="cpu").manual_seed(seed)
++    E = len(rows)
++    M = sum(rows)
++    a = torch.randint(-127, 128, (M, K), dtype=torch.int8, generator=g)
++    a_s = torch.rand(M, 1, generator=g) * 0.02 + 0.001
++    wb = torch.randint(-128, 128, (E, N, K // 2), dtype=torch.int8, generator=g)
++    ws = (torch.rand(E, N, K // G, generator=g) * 0.02 + 0.002).to(torch.bfloat16)
++    rpe = torch.tensor(rows, dtype=torch.int32)
++    # float64 reference: as[m] * sum_g ws[n,g] * sum_{k in g} a[m,k] * w[n,k]
++    ref = torch.empty(M, N, dtype=torch.float64)
++    wv = unpack_s4(wb).double()
++    r0 = 0
++    for e, m in enumerate(rows):
++        if m:
++            ae = a[r0:r0 + m].double().view(m, K // G, G)
++            we = wv[e].view(N, K // G, G)
++            part = torch.einsum("mgk,ngk->mng", ae, we)
++            ref[r0:r0 + m] = (part * ws[e].double().unsqueeze(0)).sum(-1) * a_s[r0:r0 + m].double()
++        r0 += m
++    os.environ["B70_W4A8_TILE_K"] = str(tile_k)
++    d = torch.empty(M, N, dtype=torch.bfloat16, device=DEV)
++    op(a.to(DEV), a_s.to(DEV), wb.to(DEV), ws.to(DEV), None, d, rpe.to(DEV), N, K, E)
++    sync()
++    out = d.cpu().double()
++    err = (out - ref).abs()
++    # stock W4A16 on the dequantized activations (bf16 A), same weights
++    ab = (a.float() * a_s).to(torch.bfloat16).to(DEV)
++    ds = torch.empty(M, N, dtype=torch.bfloat16, device=DEV)
++    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        ptr_A=ab, ptr_A_scale=None, ptr_B=wb.to(DEV), ptr_B_scale=ws.to(DEV), ptr_bias=None,
++        ptr_D=ds, rows_per_expert=rpe.to(DEV), N=N, K=K, num_experts=E)
++    sync()
++    return {
++        "rows": rows, "N": N, "K": K, "tile_k": tile_k, "avg_m": M / E,
++        "max_abs_err": err.max().item(), "ref_max": ref.abs().max().item(),
++        "rel_vs_f64": rel(out, ref), "max_rel_elem": (err / ref.abs().clamp_min(1e-3 * ref.abs().max())).max().item(),
++        "rel_stock_vs_f64": rel(ds.cpu().double(), ref),
++        "rel_w4a8_vs_stock": rel(out, ds.cpu().double()),
++        "nan": bool(torch.isnan(out).any()),
++    }
++
++
++def run_gemm(op):
++    cases = [
++        [1, 2, 3, 4, 0, 6],            # avg <= 4   -> m_8 tile
++        [5, 7, 9, 0, 11, 6],           # avg <= 8   -> m_16 tile
++        [33, 0, 64, 127, 17, 130],     # avg <= 128 -> m_32 tile
++        [300, 0, 129, 513, 7, 257],    # avg > 128  -> 128 x 256 tile
++    ]
++    res = []
++    for tk in (64, 32):
++        for i, rows in enumerate(cases):
++            for N, K in ((1280, 2560), (2560, 640)):
++                r = gemm_case(op, rows, N, K, tk, seed=100 + i)
++                r["ok"] = (not r["nan"]) and r["rel_vs_f64"] < 5e-3
++                print("GEMM", json.dumps(r), flush=True)
++                res.append(r)
++    return res
++
++
++# --------------------------------------------------------------------------- moe
++def make_moe(seed, n_local):
++    g = torch.Generator(device="cpu").manual_seed(seed)
++    w13 = torch.randint(0, 256, (n_local, 2 * INTER, H // 2), dtype=torch.uint8, generator=g)
++    w2 = torch.randint(0, 256, (n_local, H, INTER // 2), dtype=torch.uint8, generator=g)
++    s13 = (torch.rand(n_local, 2 * INTER, H // G, generator=g) * 0.004 + 0.001).to(torch.bfloat16)
++    s2 = (torch.rand(n_local, H, INTER // G, generator=g) * 0.004 + 0.001).to(torch.bfloat16)
++    fm = XpuFusedMoe(w13.to(DEV), s13.to(DEV), None, w2.to(DEV), s2.to(DEV), None,
++                     n_experts_per_token=TOPK, activation="silu", num_experts=n_local,
++                     ep_rank=0, ep_size=EP)
++    return fm
++
++
++def routing(T, seed, skew=0.8):
++    g = torch.Generator(device="cpu").manual_seed(seed)
++    perm = torch.randperm(E_GLOBAL, generator=g)
++    p = torch.empty(E_GLOBAL)
++    p[perm] = 1.0 / torch.arange(1, E_GLOBAL + 1).float() ** skew
++    ids = torch.multinomial(p.expand(T, E_GLOBAL), TOPK, replacement=False, generator=g)
++    w = torch.softmax(torch.randn(T, TOPK, generator=g), dim=-1)
++    return ids.to(torch.int32).to(DEV), w.to(DEV)
++
++
++def moe_ref(fm, x, tw, ids):
++    """fp32 over the dequantized int4 weights, one local expert at a time."""
++    out = torch.zeros(x.shape, dtype=torch.float32, device=DEV)
++    emap = fm.expert_map
++    loc = emap[ids.long()]  # [T, K] local id or -1
++    xf = x.float()
++    for e in range(fm.num_experts):
++        tok, slot = (loc == e).nonzero(as_tuple=True)
++        if tok.numel() == 0:
++            continue
++        w13 = dequant(fm.w13[e], fm.gemm1_wei_scales[e])
++        w2 = dequant(fm.w2[e], fm.gemm2_wei_scales[e])
++        h1 = xf[tok] @ w13.t()
++        act = torch.nn.functional.silu(h1[:, :INTER]) * h1[:, INTER:]
++        out.index_add_(0, tok, (act @ w2.t()) * tw[tok, slot].unsqueeze(1))
++    return out
++
++
++def run_moe(fm, tokens, seed):
++    res = []
++    for T in tokens:
++        ids, tw = routing(T, seed + T)
++        g = torch.Generator(device="cpu").manual_seed(seed + 7 * T)
++        x = (torch.randn(T, H, generator=g) * 0.5).to(torch.bfloat16).to(DEV)
++        for kind in ("gauss", "outlier"):
++            xx = x.clone()
++            if kind == "outlier":
++                xx[:, :16] *= 20
++            o_s = torch.zeros(T, H, dtype=torch.bfloat16, device=DEV)
++            o_q = torch.zeros_like(o_s)
++            fm.apply(o_s, xx, tw, ids)
++            w4.apply(fm, o_q, xx, tw, ids)
++            ref = moe_ref(fm, xx, tw, ids)
++            sync()
++            r = {"T": T, "input": kind,
++                 "w4a16_rel": rel(o_s, ref), "w4a16_cos": cos_rows(o_s, ref),
++                 "w4a8_rel": rel(o_q, ref), "w4a8_cos": cos_rows(o_q, ref),
++                 "w4a8_vs_w4a16_rel": rel(o_q, o_s),
++                 "nan": bool(torch.isnan(o_q).any())}
++            print("MOE", json.dumps(r), flush=True)
++            res.append(r)
++    return res
++
++
++# --------------------------------------------------------------------------- bench
++def routed_rows(fm, T, seed):
++    ids, tw = routing(T, seed + T)
++    x = torch.randn(T, H, device=DEV).to(torch.bfloat16)
++    rpe = torch.zeros(fm.num_experts, dtype=torch.int32, device=DEV)
++    rem = torch.empty(T * TOPK, H, dtype=torch.bfloat16, device=DEV)
++    unp = torch.empty(T, TOPK, dtype=torch.int32, device=DEV)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=x, hidden_states_scales=None, remapped_hidden_states=rem,
++        remapped_hidden_states_scales=None, expert_map=fm.expert_map, rows_per_expert=rpe,
++        unpermuted_row_to_permuted_row=unp, topk_ids=ids, total_experts_num=fm.total_experts_num,
++        local_experts_num=fm.local_experts_num)
++    return x, ids, tw, rpe
++
++
++def run_bench(fm, op, tokens, seed, tile_ks):
++    res = []
++    for T in tokens:
++        x, ids, tw, rpe = routed_rows(fm, T, seed)
++        rows = int(rpe.sum().item())
++        o = torch.empty(T, H, dtype=torch.bfloat16, device=DEV)
++        r = {"T": T, "local_rows": rows, "max_rows_per_expert": int(rpe.max().item())}
++        r["moe_w4a16_ms"] = bench(lambda: fm.apply(o, x, tw, ids))
++        for tk in tile_ks:
++            os.environ["B70_W4A8_TILE_K"] = str(tk)
++            r[f"moe_w4a8_tk{tk}_ms"] = bench(lambda: w4.apply(fm, o, x, tw, ids))
++        if rows:
++            # GEMM-only at the routed grouping (rows sorted by expert)
++            a16 = (torch.randn(rows, H, device=DEV) * 0.5).to(torch.bfloat16)
++            a8, as8 = w4.quant_rows(a16)
++            i16 = (torch.randn(rows, INTER, device=DEV) * 0.5).to(torch.bfloat16)
++            i8, is8 = w4.quant_rows(i16)
++            d1 = torch.empty(rows, 2 * INTER, dtype=torch.bfloat16, device=DEV)
++            d2 = torch.empty(rows, H, dtype=torch.bfloat16, device=DEV)
++            E = fm.num_experts
++
++            def s1():
++                torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++                    ptr_A=a16, ptr_A_scale=None, ptr_B=fm.w13, ptr_B_scale=fm.gemm1_wei_scales,
++                    ptr_bias=None, ptr_D=d1, rows_per_expert=rpe, N=2 * INTER, K=H, num_experts=E)
++
++            def s2():
++                torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++                    ptr_A=i16, ptr_A_scale=None, ptr_B=fm.w2, ptr_B_scale=fm.gemm2_wei_scales,
++                    ptr_bias=None, ptr_D=d2, rows_per_expert=rpe, N=H, K=INTER, num_experts=E)
++
++            f1 = 2.0 * rows * 2 * INTER * H
++            f2 = 2.0 * rows * H * INTER
++            r["g1_w4a16_ms"] = bench(s1)
++            r["g2_w4a16_ms"] = bench(s2)
++            r["g1_w4a16_tflops"] = f1 / r["g1_w4a16_ms"] / 1e9
++            r["g2_w4a16_tflops"] = f2 / r["g2_w4a16_ms"] / 1e9
++            for tk in tile_ks:
++                os.environ["B70_W4A8_TILE_K"] = str(tk)
++                r[f"g1_w4a8_tk{tk}_ms"] = bench(lambda: op(a8, as8, fm.w13, fm.gemm1_wei_scales, None, d1,
++                                                          rpe, 2 * INTER, H, E))
++                r[f"g2_w4a8_tk{tk}_ms"] = bench(lambda: op(i8, is8, fm.w2, fm.gemm2_wei_scales, None, d2,
++                                                          rpe, H, INTER, E))
++                r[f"g1_w4a8_tk{tk}_tops"] = f1 / r[f"g1_w4a8_tk{tk}_ms"] / 1e9
++                r[f"g2_w4a8_tk{tk}_tops"] = f2 / r[f"g2_w4a8_tk{tk}_ms"] / 1e9
++            r["quant_rows_h_ms"] = bench(lambda: w4.quant_rows(a16))
++        print("BENCH", json.dumps(r), flush=True)
++        res.append(r)
++    return res
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--lib-dir", default=os.path.join(HERE, "lib"))
++    ap.add_argument("--mode", default="gemm,moe,bench")
++    ap.add_argument("--experts", type=int, default=E_GLOBAL // EP, help="local experts (256 = 512 experts / EP2)")
++    ap.add_argument("--moe-tokens", default="1,16,256,1024")
++    ap.add_argument("--bench-tokens", default="1,2,4,8,16,32,64,128,256,512,1024,2048,4096")
++    ap.add_argument("--tile-k", default="64,32")
++    ap.add_argument("--seed", type=int, default=1)
++    ap.add_argument("--out", default=os.path.join(HERE, "result.json"))
++    args = ap.parse_args()
++
++    op = w4.load_op(args.lib_dir)
++    print("OP", op, "device", torch.xpu.get_device_name(0), flush=True)
++    out = {"lib_dir": args.lib_dir}
++    modes = args.mode.split(",")
++    if "gemm" in modes:
++        out["gemm"] = run_gemm(op)
++        print("GEMM_ALL_OK", all(r["ok"] for r in out["gemm"]), flush=True)
++    if "moe" in modes or "bench" in modes:
++        fm = make_moe(args.seed, args.experts)
++        sync()
++        if "moe" in modes:
++            out["moe"] = run_moe(fm, [int(t) for t in args.moe_tokens.split(",")], args.seed)
++        if "bench" in modes:
++            out["bench"] = run_bench(fm, op, [int(t) for t in args.bench_tokens.split(",")], args.seed,
++                                     [int(t) for t in args.tile_k.split(",")])
++    out["peak_gib"] = torch.xpu.max_memory_allocated() / 2**30
++    print("PEAK_GIB", round(out["peak_gib"], 3), flush=True)
++    with open(args.out, "w") as f:
++        json.dump(out, f, indent=1)
++    print("WROTE", args.out, flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm_xpu_kernels/b70_moe_w4a8.py b/vllm_xpu_kernels/b70_moe_w4a8.py
+new file mode 100644
+index 0000000..2a358a7
+--- /dev/null
++++ b/vllm_xpu_kernels/b70_moe_w4a8.py
+@@ -0,0 +1,145 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 W4A8 routed experts on the cutlass Xe2 grouped GEMM.
++
++The int4 g128 expert weights stay the bytes ``XpuFusedMoe`` holds after
++``implement_zp`` (signed nibbles, [E, N, K/2], bf16 scales [E, N, K/128]); no
++copy, no repack. Activations are quantized to int8 per token (dynamic,
++symmetric) once before each grouped GEMM: the token rows before the routing
++remap (the remap moves int8 bytes and their scales together), the SiLU output
++before gemm2. The GEMM is ``cutlass_grouped_gemm_w4a8``: the Xe2
++mixed-precision DPAS s8 x s4 -> s32 reads the nibbles directly (no unpack),
++the int32 partial of each 128-wide K group is scaled by w_scale[n, g] into
++fp32, and the token scale is applied once at the end.
++
++The op is taken from ``_xpu_C`` when the installed wheel has it, else from the
++standalone ``_b70_w4a8_C`` module in ``B70_W4A8_LIB_DIR`` (loaded next to the
++installed wheel, nothing replaced).
++"""
++
++import ctypes
++import glob
++import os
++from typing import Optional
++
++import torch
++
++GROUP = 128
++
++_OP = None
++
++
++def load_op(lib_dir: Optional[str] = None):
++    """The W4A8 grouped GEMM op (``_xpu_C`` first, then the standalone)."""
++    global _OP
++    if _OP is not None:
++        return _OP
++    try:
++        _OP = torch.ops._xpu_C.cutlass_grouped_gemm_w4a8
++        return _OP
++    except (AttributeError, RuntimeError):
++        pass
++    lib_dir = lib_dir or os.environ.get("B70_W4A8_LIB_DIR", "")
++    if not lib_dir:
++        raise RuntimeError(
++            "cutlass_grouped_gemm_w4a8 is not in _xpu_C; set B70_W4A8_LIB_DIR "
++            "to the directory holding _b70_w4a8_C*.so")
++    dep = os.path.join(lib_dir, "libgrouped_gemm_w4a8_xe_2.so")
++    if os.path.exists(dep):
++        ctypes.CDLL(dep, mode=ctypes.RTLD_GLOBAL)
++    mods = sorted(glob.glob(os.path.join(lib_dir, "_b70_w4a8_C*.so")))
++    if not mods:
++        raise RuntimeError(f"no _b70_w4a8_C*.so in {lib_dir}")
++    torch.ops.load_library(mods[0])
++    _OP = torch.ops._b70_w4a8_C.cutlass_grouped_gemm_w4a8
++    return _OP
++
++
++def quant_rows(x: torch.Tensor):
++    """Symmetric dynamic int8 per row: (int8 [T, H], fp32 scale [T, 1])."""
++    t = x.shape[0]
++    q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
++    s = torch.empty((t, 1), dtype=torch.float32, device=x.device)
++    if t == 0:
++        return q, s
++    try:
++        torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x.contiguous(), s)
++    except (AttributeError, RuntimeError):
++        xf = x.float()
++        s = (xf.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-10)
++        q = torch.round(xf / s).clamp_(-128, 127).to(torch.int8)
++    return q, s
++
++
++def eligible(impl) -> Optional[str]:
++    """None if ``impl`` (an XpuFusedMoe) can run W4A8, else the reason."""
++    if not getattr(impl, "is_int4", False):
++        return "not an int4 MoE"
++    if impl.activation != "silu" or impl.gemm1_clamp_limit:
++        return f"activation {impl.activation} / clamp {impl.gemm1_clamp_limit}"
++    if getattr(impl, "_astra_groups", None) is not None:
++        return "astra group ownership re-laid out the weights"
++    for w, s in ((impl.w13, impl.gemm1_wei_scales),
++                 (impl.w2, impl.gemm2_wei_scales)):
++        if w.element_size() != 1 or w.dim() != 3 or not w.is_contiguous():
++            return f"weight {w.dtype} {tuple(w.shape)}"
++        if (s is None or s.dim() != 3 or s.dtype != torch.bfloat16
++                or s.shape[-1] * GROUP != w.shape[-1] * 2
++                or not s.is_contiguous()):
++            return "scales are not bf16 [E, N, K/128] contiguous"
++        if w.shape[1] % 64 or (w.shape[2] * 2) % 64:
++            return f"N/K of {tuple(w.shape)} not multiples of 64"
++    return None
++
++
++def apply(impl,
++          output: torch.Tensor,
++          hidden_states: torch.Tensor,
++          topk_weights: torch.Tensor,
++          topk_ids: torch.Tensor,
++          expert_map: Optional[torch.Tensor] = None) -> None:
++    """Drop-in for XpuFusedMoe._apply_kernel with the W4A8 grouped GEMMs."""
++    op = load_op()
++    num_rows, hidden = hidden_states.shape
++    topk = impl.n_experts_per_token
++    n_moe = num_rows * topk
++    inter = impl.inter_size
++    dev = hidden_states.device
++    if expert_map is None and impl.ep_size > 1:
++        expert_map = impl.expert_map
++    # Same as stock: rows routed nowhere (all -1, DP padding) are zeroed.
++    invalid = (topk_ids < 0).all(dim=1)
++    hs = hidden_states.masked_fill(invalid.unsqueeze(1), 0)
++
++    hq, hsc = quant_rows(hs)
++    # The stock remap copies bytes (e4m3 = uint8 path) and routes the
++    # per-token scale ([T, 1] -> block_k = hidden) with them.
++    remapped = torch.empty((n_moe, hidden), dtype=torch.float8_e4m3fn,
++                           device=dev)
++    remapped_sc = torch.empty((n_moe, 1), dtype=torch.float32, device=dev)
++    rows_per_expert = torch.zeros((impl.num_experts, ), dtype=torch.int32,
++                                  device=dev)
++    unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=hq.view(torch.float8_e4m3fn),
++        hidden_states_scales=hsc,
++        remapped_hidden_states=remapped,
++        remapped_hidden_states_scales=remapped_sc,
++        expert_map=expert_map,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unp,
++        topk_ids=topk_ids,
++        total_experts_num=impl.total_experts_num,
++        local_experts_num=impl.local_experts_num)
++
++    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
++    op(remapped.view(torch.int8), remapped_sc, impl.w13,
++       impl.gemm1_wei_scales, impl.w13_bias, g1, rows_per_expert, 2 * inter,
++       hidden, impl.num_experts)
++    act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
++    impl.act_func(act, g1)
++    aq, asc = quant_rows(act)
++    g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
++    op(aq, asc, impl.w2, impl.gemm2_wei_scales, impl.w2_bias, g2,
++       rows_per_expert, hidden, inter, impl.num_experts)
++    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp,
++                                impl.num_experts)
+diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
+index 32a9576..d43772a 100755
+--- a/vllm_xpu_kernels/fused_moe_interface.py
++++ b/vllm_xpu_kernels/fused_moe_interface.py
+@@ -319,7 +319,19 @@ class XpuFusedMoe:
+         topk_ids,
+         expert_map=None,
+         a1q_scale=None,
++        w4a8: bool = False,
+     ):
++        # w4a8=True: int4 g128 SiLU experts run the B70 W4A8 grouped GEMM
++        # (int8 per-token activations, s8 x s4 DPAS); anything it cannot take
++        # (other dtypes, clamp, act-quant input) stays on the path below.
++        if w4a8 and a1q_scale is None and not self._use_ref:
++            from . import b70_moe_w4a8
++            if getattr(self, "_b70_w4a8_why", "") == "":
++                self._b70_w4a8_why = b70_moe_w4a8.eligible(self)
++            if self._b70_w4a8_why is None:
++                b70_moe_w4a8.apply(self, output, hidden_states, topk_weights,
++                                   topk_ids, expert_map)
++                return
+         if self._use_ref:
+             self._apply_ref(output, hidden_states,
+                             topk_weights, topk_ids,
+-- 
+2.43.0
+

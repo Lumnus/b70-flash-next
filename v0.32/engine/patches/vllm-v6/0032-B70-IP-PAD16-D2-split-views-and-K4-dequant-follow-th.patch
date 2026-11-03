@@ -1,0 +1,159 @@
+From 26f51dae6bcfc4aa872f8cbc8e646e9d4fffce5e Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 23:52:48 +0000
+Subject: [PATCH 32/51] B70-IP-PAD16: D2 split views and K4 dequant follow the
+ 16-B padded per-token-head slot
+
+FLASH_ATTN's D2 spec already delegates to TritonAttentionBackend.customize_spec,
+so D2 pages stay byte-identical to TRITON_ATTN / QSA pages (544 B per slot at
+hs 256; hybrid unify and K3 unchanged). split_layout_views now accepts the
+spec's content width (pth_half_ok: tight or 16-B padded) instead of exactly
+2 * (D + 4); the kernel's block-local split layout [int8 K|V | K scales |
+V scales] uses the first H*N*(2D+8) bytes of each page and leaves the rest
+unused, all surfaces still 64-B aligned (page = N*H*544 is a 64-B multiple
+whenever N*H is even). K4 dequant reads [:hs] of any half (comment only).
+
+Tests (CPU, Triton interpreter; every test on both layouts): spec 544/520 ==
+TRITON_ATTN, split views == kernel reference views, wrong content refused,
+writer round trip through the split views, K4 parity inline vs split,
+fa_int8_forward routing vs an fp32 reference.
+---
+ tests/v1/core/test_b70_ip_d2.py          | 34 ++++++++++++++++++++----
+ vllm/v1/attention/backends/b70_pth_fa.py | 14 +++++++---
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/core/test_b70_ip_d2.py b/tests/v1/core/test_b70_ip_d2.py
+index 32a9f4525e..227ae6b14a 100644
+--- a/tests/v1/core/test_b70_ip_d2.py
++++ b/tests/v1/core/test_b70_ip_d2.py
+@@ -32,11 +32,22 @@ import pytest
+ import torch
+ 
+ from vllm.v1.attention.backends import b70_pth_fa
++from vllm.v1.attention.backends.triton_attn import pth_half_bytes
+ 
+ INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+ HS = 256
+ 
+ 
++@pytest.fixture(autouse=True, params=["pad16", "tight"])
++def pth_layout(request, monkeypatch):
++    """B70-IP-PAD16: every test runs on vllm#62113's 16-B padded inline halves
++    (default; 544-B slot at HS 256) and on the tight 520-B slot
++    (B70_PTH_PAD16=0). D2 keeps the same page bytes as TRITON_ATTN either way;
++    its split layout uses the first H*N*(2D+8) bytes of each page."""
++    monkeypatch.setenv("B70_PTH_PAD16", "1" if request.param == "pad16" else "0")
++    return request.param
++
++
+ class _XPU:
+     @staticmethod
+     def is_xpu():
+@@ -85,7 +96,7 @@ def kernel_ref_views(raw, block_size, nkv, hs):
+ def make_layer_cache(nb, nkv, bs, hs=HS, nhd=True, pad=0, layer_off=0, fill=0x5A):
+     """A vLLM-style logical (B, H, N, C) int8 layer view over a flat buffer.
+     Returns (raw [nb, page] uint8 over the same bytes, kv_cache view)."""
+-    c = 2 * (hs + 4)
++    c = 2 * pth_half_bytes(hs)
+     page = bs * nkv * c + pad
+     buf = torch.full((layer_off + nb * page,), fill, dtype=torch.uint8)
+     raw = buf[layer_off:].view(nb, page)
+@@ -99,11 +110,13 @@ def make_layer_cache(nb, nkv, bs, hs=HS, nhd=True, pad=0, layer_off=0, fill=0x5A
+ def inline_views(kv_cache):
+     """TRITON_ATTN / K4 views over the inline layout (TritonAttentionImpl)."""
+     from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
++    from vllm.v1.kv_cache_interface import KVQuantMode
+ 
+     impl = object.__new__(TritonAttentionImpl)
+     impl._k_scale_cache = None
+     impl._v_scale_cache = None
+-    impl._kv_quant_mode = None
++    impl.head_size = HS
++    impl._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
+     impl._ensure_scale_caches(kv_cache)
+     padded = kv_cache.shape[-1] // 2
+     k, v = kv_cache.transpose(1, 2).split(padded, dim=-1)
+@@ -125,7 +138,7 @@ def _spec(block=64, nkv=2):
+     )
+ 
+ 
+-def test_spec_matches_triton_when_on(d2_on):
++def test_spec_matches_triton_when_on(d2_on, pth_layout):
+     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+     from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+ 
+@@ -134,7 +147,8 @@ def test_spec_matches_triton_when_on(d2_on):
+         fa = FlashAttentionBackend.customize_spec(spec)
+         tr = TritonAttentionBackend.customize_spec(spec)
+         assert fa == tr
+-        assert fa.page_size_bytes == block * nkv * 2 * (HS + 4)
++        slot = 544 if pth_layout == "pad16" else 520
++        assert fa.page_size_bytes == block * nkv * slot
+     assert FlashAttentionBackend.supports_kv_cache_dtype("int8_per_token_head")
+ 
+ 
+@@ -196,7 +210,7 @@ def test_split_views_contract(nhd, nkv, bs, pad, off):
+ def test_split_views_refuse_bad_layouts():
+     # head dims outside the block (LHBNC-like): not block-compact
+     nb, nkv, bs = 3, 2, 64
+-    c = 2 * (HS + 4)
++    c = 2 * pth_half_bytes(HS)
+     buf = torch.zeros(nb * nkv * bs * c, dtype=torch.int8)
+     kv = torch.as_strided(buf, (nb, nkv, bs, c), (bs * c, nb * bs * c, c, 1))
+     with pytest.raises(ValueError, match="block-compact"):
+@@ -211,6 +225,16 @@ def test_split_views_refuse_bad_layouts():
+         b70_pth_fa.split_layout_views(kv, 2, 96)
+ 
+ 
++@pytest.mark.parametrize("content", [2 * HS, 2 * (HS + 4) + 4, 2 * (HS + 24)])
++def test_split_views_refuse_wrong_content(content):
++    """B70-IP-PAD16: the content width must be a per-token-head cell for this
++    head size (tight or 16-B padded), not a fixed 2 * (D + 4)."""
++    buf = torch.zeros(3 * 2 * 64 * content, dtype=torch.int8)
++    kv = buf.view(3, 64, 2, content).transpose(1, 2)
++    with pytest.raises(ValueError, match="does not match"):
++        b70_pth_fa.split_layout_views(kv, 2, HS)
++
++
+ def test_views_cache_follows_runner_reset():
+     _, kv = make_layer_cache(3, 2, 64)
+     impl = SimpleNamespace(num_kv_heads=2, head_size=HS, _k_scale_cache=None)
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index c06fddee83..af2c34a545 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -91,7 +91,8 @@ def ensure_scratch(impl, kv_cache: torch.Tensor, dtype, force: bool = False) ->
+ 
+ 
+ def _dequant_blocks(src_data, src_scale, ids, dst, hs, chunk=4):
+-    # src_data: (nb, bs, nkv, hs+pad) int8 view; src_scale: (nb, bs, nkv) fp32
++    # src_data: (nb, bs, nkv, >= hs) int8 view (an inline half, padded or not,
++    # or a D2 split view); src_scale: (nb, bs, nkv) fp32. Only [:hs] is read.
+     n = ids.numel()
+     for i in range(0, n, chunk):
+         sel = ids[i : i + chunk]
+@@ -259,8 +260,11 @@ def split_layout_views(
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Block-local split views over one layer's int8 per-token-head cache.
+ 
+-    ``kv_cache`` is the logical ``(B, H, N, 2 * (D + 4))`` int8 layer view vLLM
+-    allocates for the spec (same bytes as TRITON_ATTN's inline layout). Each
++    ``kv_cache`` is the logical ``(B, H, N, C)`` int8 layer view vLLM
++    allocates for the spec (same bytes as TRITON_ATTN's inline layout: ``C =
++    2 * half``, ``half`` = D + 4 padded to 16 B since vllm#62113, B70-IP-PAD16;
++    the split layout uses ``H * N * (2D + 8)`` of the ``H * N * C`` bytes and
++    leaves the rest of the page unused). Each
+     block is re-read as ``[int8 K|V (N, H, 2D) | K scales fp32 (N, H) |
+     V scales fp32 (N, H)]``. Returns key / value int8 ``[B, N, H, D]`` with
+     strides ``(page, H*2D, 2D, 1)`` (value = key + D bytes) and k_scale /
+@@ -272,7 +276,9 @@ def split_layout_views(
+     if kv_cache.dtype != torch.int8:
+         raise ValueError(f"int8_per_token_head cache is int8, got {kv_cache.dtype}")
+     num_blocks, nkv, block_size, content = kv_cache.shape
+-    if nkv != num_kv_heads or content != 2 * (head_size + 4):
++    from vllm.v1.attention.backends.triton_attn import pth_half_ok
++
++    if nkv != num_kv_heads or content % 2 or not pth_half_ok(content // 2, head_size):
+         raise ValueError(
+             f"int8_per_token_head cache shape {tuple(kv_cache.shape)} does not match "
+             f"num_kv_heads={num_kv_heads}, head_size={head_size}"

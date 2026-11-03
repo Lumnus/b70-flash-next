@@ -1,0 +1,110 @@
+From 3135234534a9425e8d4a8e6f18f1ca6545935ef6 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 13:54:29 +0000
+Subject: [PATCH 03/51] B70-IP-K1/K2: CPU tests (TD guard launch flag, scale
+ views leave cache bytes unchanged)
+
+---
+ tests/v1/attention/test_b70_ip_pth_kv.py | 93 ++++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create mode 100644 tests/v1/attention/test_b70_ip_pth_kv.py
+
+diff --git a/tests/v1/attention/test_b70_ip_pth_kv.py b/tests/v1/attention/test_b70_ip_pth_kv.py
+new file mode 100644
+index 0000000000..1d464d82d4
+--- /dev/null
++++ b/tests/v1/attention/test_b70_ip_pth_kv.py
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-IP-K1 / K2: per-token-head KV on the Triton backend, CPU-only checks.
++
++K1: unified_attention launches the kernel with USE_TD=False for per-token-head
++    KV (inline fp32 scales make the K/V pitch unaligned for Xe2 2D block
++    reads), unless B70_PTH_TD_GUARD=0.
++K2: building the scale views does not write the cache (hybrid models share the
++    pages with GDN state; vllm#63944).
++"""
++
++import pytest
++import torch
++
++import vllm.v1.attention.ops.triton_unified_attention as ua
++from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
++from vllm.v1.kv_cache_interface import KVQuantMode
++
++
++def test_scale_views_leave_cache_bytes_unchanged():
++    nb, nkv, bs, hs = 4, 2, 16, 64
++    pad = 4  # fp32 scale in int8 units
++    cache = torch.full((nb, nkv, bs, 2 * (hs + pad)), 37, dtype=torch.int8)
++    before = cache.clone()
++    impl = TritonAttentionImpl.__new__(TritonAttentionImpl)
++    impl._k_scale_cache = None
++    impl._v_scale_cache = None
++    impl._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
++    impl._ensure_scale_caches(cache)
++    assert torch.equal(cache, before)
++    # the views address the inline scale bytes
++    assert impl._k_scale_cache.shape == (nb, bs, nkv)
++    impl._k_scale_cache[1, 3, 1] = 2.5
++    raw = cache[1, 1, 3, hs : hs + pad].contiguous().view(torch.float32)
++    assert raw.item() == 2.5
++    impl._v_scale_cache[2, 0, 0] = -1.0
++    raw = cache[2, 0, 0, 2 * hs + pad : 2 * hs + 2 * pad].contiguous()
++    assert raw.view(torch.float32).item() == -1.0
++
++
++class _FakeKernel:
++    def __init__(self):
++        self.kwargs = None
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.kwargs = kwargs
++
++        return launch
++
++
++def _call(monkeypatch, mode, use_td):
++    fake = _FakeKernel()
++    monkeypatch.setattr(ua, "kernel_unified_attention", fake)
++    # With no device, vllm.triton_utils hands out a placeholder module.
++    monkeypatch.setattr(
++        ua.triton, "next_power_of_2", lambda n: 1 << (n - 1).bit_length(),
++        raising=False,
++    )
++    monkeypatch.setattr(ua.triton, "cdiv", lambda a, b: -(-a // b), raising=False)
++    nkv, nq, hs, bs = 2, 4, 64, 16
++    q = torch.zeros(3, nq, hs, dtype=torch.bfloat16)
++    pth = mode.is_per_token_head
++    width = hs + (4 if pth else 0)
++    kv = torch.zeros(8, bs, nkv, width, dtype=torch.int8 if pth else torch.bfloat16)
++    scale = torch.ones(8, bs, nkv) if pth else None
++    one = torch.ones(1)
++    ua.unified_attention(
++        q=q, k=kv[..., :hs], v=kv[..., :hs], out=torch.empty_like(q),
++        cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32), max_seqlen_q=3,
++        seqused_k=torch.tensor([3], dtype=torch.int32), max_seqlen_k=3,
++        softmax_scale=0.125, causal=True, alibi_slopes=None,
++        window_size=(-1, -1), block_table=torch.zeros(1, 1, dtype=torch.int32),
++        softcap=0, q_descale=None, k_descale=one.expand(1, nkv),
++        v_descale=one.expand(1, nkv), kv_quant_mode=mode,
++        k_scale_cache=scale, v_scale_cache=scale, use_td=use_td,
++    )
++    return fake.kwargs
++
++
++@pytest.mark.parametrize("guard", [None, "0"])
++def test_td_guard_per_token_head(monkeypatch, guard):
++    if guard is None:
++        monkeypatch.delenv("B70_PTH_TD_GUARD", raising=False)
++    else:
++        monkeypatch.setenv("B70_PTH_TD_GUARD", guard)
++    kw = _call(monkeypatch, KVQuantMode.INT8_PER_TOKEN_HEAD, use_td=True)
++    assert kw["USE_TD"] is (guard == "0")
++
++
++def test_td_untouched_without_per_token_head(monkeypatch):
++    monkeypatch.delenv("B70_PTH_TD_GUARD", raising=False)
++    kw = _call(monkeypatch, KVQuantMode.NONE, use_td=True)
++    assert kw["USE_TD"] is True

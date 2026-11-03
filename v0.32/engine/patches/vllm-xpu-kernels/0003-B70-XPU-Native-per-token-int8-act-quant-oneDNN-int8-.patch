@@ -1,8 +1,8 @@
 From 9d52b84363a8dd2b02d17d419241d8838ea8e313 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Thu, 29 Oct 2026 02:11:07 +0000
-Subject: [PATCH 3/5] [B70][XPU] Native per-token int8 act quant + oneDNN int8
- W8A8 GEMM
+Subject: [PATCH 03/15] [B70][XPU] Native per-token int8 act quant + oneDNN
+ int8 W8A8 GEMM
 
 _C::dynamic_per_token_scaled_int8_quant: one work-group per token row,
 absmax reduce then quantize, bit-exact mirror of vLLM's
@@ -15,27 +15,9 @@ per-tensor A scale, per-channel or per-tensor B scale, bias). Per-token
 scale as a oneDNN src-scale attribute (groups {1,K}); falls back to a
 binary_mul post-op (bias moved behind it) when oneDNN reports it
 unimplemented, or with B70_INT8_GEMM_SCALE_MODE=postop.
----
- CMakeLists.txt                           |   1 +
- csrc/ops.h                               |   5 +
- csrc/quantization/int8/int8_quant.cpp    | 195 +++++++++++++++++++
- csrc/quantization/int8/int8_quant_math.h |  45 +++++
- csrc/torch_bindings.cpp                  |   9 +
- csrc/xpu/onednn/int8_gemm_w8a8.h         | 228 +++++++++++++++++++++++
- csrc/xpu/onednn/onednn_ext.h             |  52 ++++++
- csrc/xpu/onednn/onednn_matmul.cpp        |  52 ++++++
- csrc/xpu/onednn/onednn_stub.cpp          |  10 +
- csrc/xpu/ops.h                           |  10 +
- csrc/xpu/torch_bindings.cpp              |   7 +
- tests/test_b70_int8_native.py            |  60 ++++++
- 12 files changed, 674 insertions(+)
- create mode 100644 csrc/quantization/int8/int8_quant.cpp
- create mode 100644 csrc/quantization/int8/int8_quant_math.h
- create mode 100644 csrc/xpu/onednn/int8_gemm_w8a8.h
- create mode 100644 tests/test_b70_int8_native.py
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 997d657ed8..3b06d2a45e 100644
+index 997d657..3b06d2a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -596,6 +596,7 @@ if(BASIC_KERNELS_ENABLED)
@@ -47,7 +29,7 @@ index 997d657ed8..3b06d2a45e 100644
        "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cpp"
        "csrc/quantization/fused_kernels/fused_silu_mul_mxfp4_quant.cpp"
 diff --git a/csrc/ops.h b/csrc/ops.h
-index 5d3770d39c..8e1a9faf65 100644
+index 5d3770d..8e1a9fa 100644
 --- a/csrc/ops.h
 +++ b/csrc/ops.h
 @@ -236,6 +236,11 @@ void static_scaled_fp8_quant(
@@ -64,7 +46,7 @@ index 5d3770d39c..8e1a9faf65 100644
      torch::Tensor const& input,
 diff --git a/csrc/quantization/int8/int8_quant.cpp b/csrc/quantization/int8/int8_quant.cpp
 new file mode 100644
-index 0000000000..61a2ca5754
+index 0000000..61a2ca5
 --- /dev/null
 +++ b/csrc/quantization/int8/int8_quant.cpp
 @@ -0,0 +1,195 @@
@@ -265,7 +247,7 @@ index 0000000000..61a2ca5754
 +}
 diff --git a/csrc/quantization/int8/int8_quant_math.h b/csrc/quantization/int8/int8_quant_math.h
 new file mode 100644
-index 0000000000..78fabb9361
+index 0000000..78fabb9
 --- /dev/null
 +++ b/csrc/quantization/int8/int8_quant_math.h
 @@ -0,0 +1,45 @@
@@ -315,7 +297,7 @@ index 0000000000..78fabb9361
 +
 +#pragma float_control(pop)
 diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
-index 33f4ed4876..ca31b9e7a2 100644
+index 33f4ed4..ca31b9e 100644
 --- a/csrc/torch_bindings.cpp
 +++ b/csrc/torch_bindings.cpp
 @@ -202,6 +202,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
@@ -336,7 +318,7 @@ index 33f4ed4876..ca31b9e7a2 100644
        "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
 diff --git a/csrc/xpu/onednn/int8_gemm_w8a8.h b/csrc/xpu/onednn/int8_gemm_w8a8.h
 new file mode 100644
-index 0000000000..a8a3e42da6
+index 0000000..a8a3e42
 --- /dev/null
 +++ b/csrc/xpu/onednn/int8_gemm_w8a8.h
 @@ -0,0 +1,228 @@
@@ -569,7 +551,7 @@ index 0000000000..a8a3e42da6
 +
 +}  // namespace oneDNN
 diff --git a/csrc/xpu/onednn/onednn_ext.h b/csrc/xpu/onednn/onednn_ext.h
-index 9a29844255..5d1adad437 100644
+index 9a29844..5d1adad 100644
 --- a/csrc/xpu/onednn/onednn_ext.h
 +++ b/csrc/xpu/onednn/onednn_ext.h
 @@ -53,11 +53,33 @@ enum class joint_dtypes_t {
@@ -644,7 +626,7 @@ index 9a29844255..5d1adad437 100644
        throw std::runtime_error("Only support int4 and fp8 gemm ...");
    }
 diff --git a/csrc/xpu/onednn/onednn_matmul.cpp b/csrc/xpu/onednn/onednn_matmul.cpp
-index 58209f9b7f..e598e760c4 100644
+index 58209f9..e598e76 100644
 --- a/csrc/xpu/onednn/onednn_matmul.cpp
 +++ b/csrc/xpu/onednn/onednn_matmul.cpp
 @@ -4,6 +4,7 @@
@@ -714,7 +696,7 @@ index 58209f9b7f..e598e760c4 100644
      const torch::Tensor& A_,       // quantized inputs, [b, m, k]
      const torch::Tensor& A_scale,  // [b * m, 1] or [b]
 diff --git a/csrc/xpu/onednn/onednn_stub.cpp b/csrc/xpu/onednn/onednn_stub.cpp
-index 7e63b16ec3..3c6c7ce7ab 100644
+index 7e63b16..3c6c7ce 100644
 --- a/csrc/xpu/onednn/onednn_stub.cpp
 +++ b/csrc/xpu/onednn/onednn_stub.cpp
 @@ -78,6 +78,16 @@ torch::Tensor int4_gemm_w4a16(
@@ -735,7 +717,7 @@ index 7e63b16ec3..3c6c7ce7ab 100644
      const torch::Tensor& A_,
      const torch::Tensor& A_scale,
 diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
-index cb72527565..5000ae246c 100644
+index cb72527..5000ae2 100644
 --- a/csrc/xpu/ops.h
 +++ b/csrc/xpu/ops.h
 @@ -62,6 +62,16 @@ torch::Tensor int4_gemm_w4a16(
@@ -756,7 +738,7 @@ index cb72527565..5000ae246c 100644
      const torch::Tensor& A_,
      const torch::Tensor& A_scale,
 diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
-index 75c8b9b2d5..d96052195e 100644
+index 75c8b9b..d960521 100644
 --- a/csrc/xpu/torch_bindings.cpp
 +++ b/csrc/xpu/torch_bindings.cpp
 @@ -55,6 +55,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
@@ -775,7 +757,7 @@ index 75c8b9b2d5..d96052195e 100644
        "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
 diff --git a/tests/test_b70_int8_native.py b/tests/test_b70_int8_native.py
 new file mode 100644
-index 0000000000..0434cefd35
+index 0000000..0434cef
 --- /dev/null
 +++ b/tests/test_b70_int8_native.py
 @@ -0,0 +1,60 @@
@@ -839,3 +821,6 @@ index 0000000000..0434cefd35
 +    out = torch.ops._xpu_C.int8_scaled_mm(a, sa, w.t(), sw, out_dtype, bias)
 +    torch.testing.assert_close(out.cpu().double(), ref.to(out_dtype).double(),
 +                               rtol=1.6e-2, atol=1e-2)
+-- 
+2.43.0
+

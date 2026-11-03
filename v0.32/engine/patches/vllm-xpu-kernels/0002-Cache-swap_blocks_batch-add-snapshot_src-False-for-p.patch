@@ -1,7 +1,7 @@
 From cd24fc53779f33103a413a03f79a092220a39030 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 24 Oct 2026 10:25:38 +0000
-Subject: [PATCH 2/5] [Cache] swap_blocks_batch: add snapshot_src=False for
+Subject: [PATCH 02/15] [Cache] swap_blocks_batch: add snapshot_src=False for
  pinned and registered H2D sources
 
 swap_blocks_batch stages every H2D batch through a pinned buffer from the
@@ -22,19 +22,9 @@ usm::alloc::unknown, so hostRegister now records the ranges it registers.
 Pageable sources are always staged.
 
 Upstream: vllm-project/vllm-xpu-kernels#662
----
- csrc/cache.cpp               |   6 +-
- csrc/ops.h                   |   3 +-
- csrc/torch_bindings.cpp      |   2 +-
- csrc/utils/host_register.cpp |  33 +++++++++++
- csrc/utils/mem_cpy.cpp       |  24 +++++++-
- csrc/utils/mem_cpy.h         |  14 ++++-
- tests/register_ops.py        |  10 +++-
- tests/test_cache.py          | 111 +++++++++++++++++++++++++++++++++++
- 8 files changed, 193 insertions(+), 10 deletions(-)
 
 diff --git a/csrc/cache.cpp b/csrc/cache.cpp
-index d6de3ab502..1b6cb4231b 100644
+index d6de3ab..1b6cb42 100644
 --- a/csrc/cache.cpp
 +++ b/csrc/cache.cpp
 @@ -1373,7 +1373,8 @@ void swap_blocks(
@@ -58,7 +48,7 @@ index d6de3ab502..1b6cb4231b 100644
  
  namespace vllm {
 diff --git a/csrc/ops.h b/csrc/ops.h
-index e65a9343cd..5d3770d39c 100644
+index e65a934..5d3770d 100644
 --- a/csrc/ops.h
 +++ b/csrc/ops.h
 @@ -290,7 +290,8 @@ void swap_blocks(
@@ -72,7 +62,7 @@ index e65a9343cd..5d3770d39c 100644
  void top_k_per_row_decode(
      const torch::Tensor& logits,
 diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
-index 491d4b012b..33f4ed4876 100644
+index 491d4b0..33f4ed4 100644
 --- a/csrc/torch_bindings.cpp
 +++ b/csrc/torch_bindings.cpp
 @@ -360,7 +360,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
@@ -85,7 +75,7 @@ index 491d4b012b..33f4ed4876 100644
    cache_ops.def(
        "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache,"
 diff --git a/csrc/utils/host_register.cpp b/csrc/utils/host_register.cpp
-index 10c3aad3f0..1149613ddd 100644
+index 10c3aad..1149613 100644
 --- a/csrc/utils/host_register.cpp
 +++ b/csrc/utils/host_register.cpp
 @@ -2,15 +2,30 @@
@@ -159,7 +149,7 @@ index 10c3aad3f0..1149613ddd 100644
  }  // namespace vllm
  
 diff --git a/csrc/utils/mem_cpy.cpp b/csrc/utils/mem_cpy.cpp
-index b49a4828ae..8c56610005 100644
+index b49a482..8c56610 100644
 --- a/csrc/utils/mem_cpy.cpp
 +++ b/csrc/utils/mem_cpy.cpp
 @@ -183,7 +183,8 @@ void xpuAsyncMemcpyBatch(
@@ -208,7 +198,7 @@ index b49a4828ae..8c56610005 100644
      for (int64_t i = 0; i < n; i++) {
        size_t sz = static_cast<size_t>(sizes[i]);
 diff --git a/csrc/utils/mem_cpy.h b/csrc/utils/mem_cpy.h
-index 465ef4c1d7..ca0f8dd7b8 100644
+index 465ef4c..ca0f8dd 100644
 --- a/csrc/utils/mem_cpy.h
 +++ b/csrc/utils/mem_cpy.h
 @@ -33,6 +33,11 @@ void xpuAsyncMemcpy(
@@ -251,7 +241,7 @@ index 465ef4c1d7..ca0f8dd7b8 100644
  }  // namespace xpu
  }  // namespace vllm
 diff --git a/tests/register_ops.py b/tests/register_ops.py
-index a4466d4e78..2a3917aff4 100644
+index a4466d4..2a3917a 100644
 --- a/tests/register_ops.py
 +++ b/tests/register_ops.py
 @@ -659,11 +659,17 @@ def swap_blocks_batch(
@@ -275,7 +265,7 @@ index a4466d4e78..2a3917aff4 100644
  
  def xpu_host_register(ptr: int, n_bytes: int) -> bool:
 diff --git a/tests/test_cache.py b/tests/test_cache.py
-index ebcec30b73..b010b1b80f 100644
+index ebcec30..b010b1b 100644
 --- a/tests/test_cache.py
 +++ b/tests/test_cache.py
 @@ -1,5 +1,6 @@
@@ -409,3 +399,6 @@ index ebcec30b73..b010b1b80f 100644
  @pytest.mark.skipif(torch.xpu.device_count() < 2,
                      reason="device-inference bug only manifests on a "
                      "non-zero XPU device (needs >= 2 devices)")
+-- 
+2.43.0
+

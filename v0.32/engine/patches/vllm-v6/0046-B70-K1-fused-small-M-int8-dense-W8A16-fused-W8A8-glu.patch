@@ -1,0 +1,93 @@
+From be216577412bf2a17a9c2a4c7ce5f2d60ecafc23 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:37:43 +0000
+Subject: [PATCH 46/51] B70-K1: fused small-M int8 dense (W8A16 / fused W8A8)
+ glue for the vllm-xpu-kernels v7 wheel (B70_DENSE_INT8_FUSED=1)
+
+---
+ vllm/model_executor/layers/b70_dense_int8.py | 58 ++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/vllm/model_executor/layers/b70_dense_int8.py b/vllm/model_executor/layers/b70_dense_int8.py
+index 70fe5d4aec..b71e1640cc 100644
+--- a/vllm/model_executor/layers/b70_dense_int8.py
++++ b/vllm/model_executor/layers/b70_dense_int8.py
+@@ -20,6 +20,18 @@ Env:
+   B70_DENSE_INT8_EXCLUDE=<regex>      prefixes to keep BF16 (default below)
+   B70_DENSE_INT8_MIN_PARAMS=<n>       skip smaller weights (default 1<<20)
+   B70_DENSE_INT8_TRITON_MAX_M=<n>     Triton for M <= n (default 64)
++
++B70-K1 small-M kernels (needs the v7 vllm_xpu_kernels wheel; default off):
++  B70_DENSE_INT8_FUSED=1              route M <= FUSED_MAX_M to the K1 ops, which
++                                      read the same int8 weights + fp32 row scale:
++                                      M <= W8A16_MAX_M -> _xpu_C.b70_w8a16_gemm
++                                      (weight-only, bf16 act, no quant pass), else
++                                      _xpu_C.b70_w8a8_fused_gemm (act quant in the
++                                      GEMM, s8 x s8 DPAS). Missing ops -> W1 path.
++  B70_DENSE_INT8_FUSED_MAX_M=<n>      default 64 (the fused op's ceiling)
++  B70_DENSE_INT8_W8A16_MAX_M=<n>      default 8 (0 = fused W8A8 only)
++  To reach the shared expert and in_proj_ba, also lower
++  B70_DENSE_INT8_MIN_PARAMS (e.g. 0) and drop in_proj_ba from B70_DENSE_INT8_EXCLUDE.
+ """
+ 
+ import os
+@@ -45,6 +57,43 @@ DEFAULT_EXCLUDE = (
+ _stats = {"layers": 0, "bytes_saved": 0, "skipped": 0}
+ _logged_first = False
+ 
++# B70-K1: read once at import (graph capture must see one path).
++_K1_FUSED = os.environ.get("B70_DENSE_INT8_FUSED", "0") == "1"
++_K1_FUSED_MAX_M = int(os.environ.get("B70_DENSE_INT8_FUSED_MAX_M", "64"))
++_K1_W8A16_MAX_M = int(os.environ.get("B70_DENSE_INT8_W8A16_MAX_M", "8"))
++_k1_ops = None  # None = not probed, False = absent, else the module
++
++
++def _k1():
++    """vllm_xpu_kernels.b70_int8_dense if B70_DENSE_INT8_FUSED=1 and the ops exist."""
++    global _k1_ops
++    if _k1_ops is None:
++        _k1_ops = False
++        if _K1_FUSED:
++            try:
++                from vllm_xpu_kernels import b70_int8_dense as k1
++
++                if k1.available():
++                    _k1_ops = k1
++                    logger.info(
++                        "B70-K1 dense int8: small-M kernels on (W8A16 M<=%d, "
++                        "fused W8A8 M<=%d, W1 path above)",
++                        _K1_W8A16_MAX_M,
++                        min(_K1_FUSED_MAX_M, 64),
++                    )
++                else:
++                    logger.warning(
++                        "B70-K1 dense int8: B70_DENSE_INT8_FUSED=1 but the "
++                        "installed vllm_xpu_kernels has no b70_w8a16_gemm / "
++                        "b70_w8a8_fused_gemm; keeping the W1 path"
++                    )
++            except ImportError:
++                logger.warning(
++                    "B70-K1 dense int8: vllm_xpu_kernels.b70_int8_dense missing; "
++                    "keeping the W1 path"
++                )
++    return _k1_ops or None
++
+ 
+ def _enabled() -> bool:
+     return os.environ.get("B70_DENSE_INT8", "0") == "1" and current_platform.is_xpu()
+@@ -128,6 +177,15 @@ def _b70_int8_dense_mm(
+     """One opaque op for torch.compile: native act quant + the int8 GEMM by M."""
+     from vllm import _custom_ops as ops
+ 
++    if _K1_FUSED and x.shape[0] <= max(_K1_FUSED_MAX_M, _K1_W8A16_MAX_M):
++        k1 = _k1()
++        if k1 is not None:
++            out = k1.mm(
++                x.contiguous(), w_q, w_s, bias, _K1_W8A16_MAX_M, _K1_FUSED_MAX_M
++            )
++            if out is not None:
++                return out
++
+     x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), None, None, True)
+     if x.shape[0] > triton_max_m and hasattr(torch.ops._xpu_C, "int8_scaled_mm"):
+         return torch.ops._xpu_C.int8_scaled_mm(

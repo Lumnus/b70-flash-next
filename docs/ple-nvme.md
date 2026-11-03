@@ -1,4 +1,4 @@
-# The INT8 PLE table served from NVMe (patches 0013, 0013b)
+# The INT8 PLE table served from NVMe (patches 0013, 0013b; the 2-card presets)
 
 With 0008 the INT8 PLE table still pins 48.9 GiB of host RAM. 0013 leaves it on the NVMe and keeps only a small pinned
 row cache, which frees that RAM for a larger CPU KV tier (or makes the model fit a 128 GB unified-memory box at all).
@@ -17,8 +17,9 @@ row cache, which frees that RAM for a larger CPU KV tier (or makes the model fit
 4. **0013b** adds a native reader (a C thread pool, one call per batch, GIL released; compiled with `gcc` at first use)
    and an optional one-chunk prefill lookahead read by a background thread per rank.
 
-Switches: `B70_PLE_INT8_NVME*` in docs/switches.md. It needs `B70_PLE_INT8=1` and a table built by
-`tools/build_int8_ple.py`.
+Switches: `B70_PLE_INT8_NVME*` in [switches](switches.md). On the 0.32 line `B70_PLE_INT8_NVME=1` is set instead of `B70_PLE_INT8=1`
+(both raises at init) with `B70_PLE_INT8_PATH` at a table built by `tools/build_int8_ple.py`; `B70_PLE_INT8_NVME_PRELOAD=1`
+(`vllm-v6` 0033) fills the row cache with the rank's rows at boot. The 2-card presets use a 4 GiB row cache in total.
 
 ## Measured (4× Arc Pro B70, TP4 + EP, native reader, 2 GiB pinned row cache per rank, 64 GiB CPU KV tier)
 

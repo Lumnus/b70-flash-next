@@ -1,0 +1,421 @@
+From f5e8721607e93a5ea0f2ab54051732c2d94ebebe Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 23:52:35 +0000
+Subject: [PATCH 30/51] B70-IP-PAD16: TRITON_ATTN (K1/K2) follows the 16-B
+ padded per-token-head slot
+
+One definition of the per-token-head slot half in triton_attn
+(pth_half_bytes / pth_half_ok / pth_check_half); customize_spec packs through
+it and every reader validates against it or derives from the cache's content
+width, never from 2 * (D + 4). INT8/FP8 halves are 16-B padded as in
+vllm#62113 (hs 256: 520 -> 544 B, V at +272; hs 128: 264 -> 288); INT4 stays
+tight. _ensure_scale_caches refuses a cache whose half cannot hold the impl's
+head.
+
+B70_PTH_PAD16 (default 1): 0 packs the halves tight again. Kept as an A/B
+lever only (pool size vs vectorized loads on B70, and a bisect handle while
+TRITON_ATTN int8 output on XPU is under investigation); all readers follow
+either layout.
+
+K1 TD guard stays on: the padded pitch is 16-B aligned, but the per-(block,
+head) descriptor base is not 64-B aligned for V (+272 = 16 mod 64) nor, in
+NHD, for K of odd heads (544 = 32 mod 64). Pointer loads now see 16-B
+aligned rows and V base. Comment updated.
+
+Tests (CPU, Triton interpreter): spec halves for hs 64/128/256 vs
+vllm#62113; scale views on both layouts write nothing; a writer -> scale
+views -> kernel_unified_attention round trip on both layouts, HND and NHD,
+hs 128/256 (rel 2.5e-4 vs fp32 dequant reference; pad bytes never written).
+---
+ tests/v1/attention/test_b70_ip_pth_kv.py      | 213 ++++++++++++++++--
+ vllm/v1/attention/backends/triton_attn.py     |  67 +++++-
+ .../attention/ops/triton_unified_attention.py |  16 +-
+ 3 files changed, 264 insertions(+), 32 deletions(-)
+
+diff --git a/tests/v1/attention/test_b70_ip_pth_kv.py b/tests/v1/attention/test_b70_ip_pth_kv.py
+index 1d464d82d4..d9caa6aeec 100644
+--- a/tests/v1/attention/test_b70_ip_pth_kv.py
++++ b/tests/v1/attention/test_b70_ip_pth_kv.py
+@@ -6,37 +6,197 @@ K1: unified_attention launches the kernel with USE_TD=False for per-token-head
+     reads), unless B70_PTH_TD_GUARD=0.
+ K2: building the scale views does not write the cache (hybrid models share the
+     pages with GDN state; vllm#63944).
++PAD16: vllm#62113's 16-B padded halves (B70_PTH_PAD16, default 1) and the tight
++    layout both round-trip writer -> scale views -> kernel_unified_attention
++    (interpreter) against an fp32 reference over the dequantized cache.
+ """
+ 
++import os
++
+ import pytest
+ import torch
+ 
+ import vllm.v1.attention.ops.triton_unified_attention as ua
+-from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+-from vllm.v1.kv_cache_interface import KVQuantMode
++from vllm.v1.attention.backends.triton_attn import (
++    TritonAttentionBackend,
++    TritonAttentionImpl,
++    pth_half_bytes,
++)
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+ 
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+ 
+-def test_scale_views_leave_cache_bytes_unchanged():
+-    nb, nkv, bs, hs = 4, 2, 16, 64
+-    pad = 4  # fp32 scale in int8 units
+-    cache = torch.full((nb, nkv, bs, 2 * (hs + pad)), 37, dtype=torch.int8)
+-    before = cache.clone()
++
++@pytest.fixture(params=["pad16", "tight"])
++def pth_layout(request, monkeypatch):
++    monkeypatch.setenv("B70_PTH_PAD16", "1" if request.param == "pad16" else "0")
++    return request.param
++
++
++def _impl(hs, mode=KVQuantMode.INT8_PER_TOKEN_HEAD):
+     impl = TritonAttentionImpl.__new__(TritonAttentionImpl)
+     impl._k_scale_cache = None
+     impl._v_scale_cache = None
+-    impl._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
++    impl.head_size = hs
++    impl._kv_quant_mode = mode
++    return impl
++
++
++@pytest.mark.parametrize("hs", [64, 128, 256])
++def test_spec_half_matches_upstream_62113(pth_layout, hs):
++    spec = TritonAttentionBackend.customize_spec(
++        FullAttentionSpec(
++            block_size=16,
++            num_kv_heads=2,
++            head_size=hs,
++            dtype=torch.int8,
++            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++        )
++    )
++    half = {64: 80, 128: 144, 256: 272} if pth_layout == "pad16" else None
++    want = half[hs] if half else hs + 4
++    assert pth_half_bytes(hs) == want
++    assert spec.state_content_bytes == 2 * want
++    assert spec.page_size_bytes == 16 * 2 * 2 * want
++
++
++def test_scale_views_leave_cache_bytes_unchanged(pth_layout):
++    nb, nkv, bs, hs = 4, 2, 16, 64
++    h = pth_half_bytes(hs)
++    cache = torch.full((nb, nkv, bs, 2 * h), 37, dtype=torch.int8)
++    before = cache.clone()
++    impl = _impl(hs)
+     impl._ensure_scale_caches(cache)
+     assert torch.equal(cache, before)
+     # the views address the inline scale bytes
+     assert impl._k_scale_cache.shape == (nb, bs, nkv)
+     impl._k_scale_cache[1, 3, 1] = 2.5
+-    raw = cache[1, 1, 3, hs : hs + pad].contiguous().view(torch.float32)
++    raw = cache[1, 1, 3, hs : hs + 4].contiguous().view(torch.float32)
+     assert raw.item() == 2.5
+     impl._v_scale_cache[2, 0, 0] = -1.0
+-    raw = cache[2, 0, 0, 2 * hs + pad : 2 * hs + 2 * pad].contiguous()
++    raw = cache[2, 0, 0, h + hs : h + hs + 4].contiguous()
+     assert raw.view(torch.float32).item() == -1.0
+ 
+ 
++def test_scale_views_refuse_mismatched_head(pth_layout):
++    # A cache whose half cannot hold this impl's head is refused, not misread.
++    cache = torch.zeros(2, 1, 16, 2 * pth_half_bytes(64), dtype=torch.int8)
++    with pytest.raises(ValueError):
++        _impl(128)._ensure_scale_caches(cache)
++
++
++def _quant_ref(x):
++    xf = x.float()
++    scale = torch.clamp(xf.abs().amax(-1) / 127.0, min=1e-6)
++    y = xf * (1.0 / scale)[..., None]
++    y = torch.where(y >= 0, y + 0.5, y - 0.5).clamp(-128.0, 127.0).trunc()
++    return y.to(torch.int8), scale
++
++
++@pytest.mark.skipif(
++    not INTERPRET, reason='needs TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES=""'
++)
++@pytest.mark.parametrize("nhd", [False, True])
++@pytest.mark.parametrize("hs", [128, 256])
++def test_triton_attn_roundtrip_writer_to_kernel(pth_layout, nhd, hs, monkeypatch):
++    """TRITON_ATTN round trip under the active layout: the per-token-head
++    writer through _pth_key_value_caches, then the unified kernel through the
++    same views, vs an fp32 reference over the dequantized tokens. The pad
++    bytes are never written."""
++    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++        triton_reshape_and_cache_flash_per_token_head_quant,
++    )
++
++    monkeypatch.delenv("B70_PTH_TD_GUARD", raising=False)
++    torch.manual_seed(hs)
++    nb, nkv, nq, bs = 6, 2, 4, 16
++    h = pth_half_bytes(hs)
++    shape = (nb, bs, nkv, 2 * h) if nhd else (nb, nkv, bs, 2 * h)
++    cache = torch.zeros(shape, dtype=torch.int8)
++    kv_cache = cache.transpose(1, 2) if nhd else cache  # logical (B, H, N, C)
++    impl = _impl(hs)
++    impl.fp8_dtype = None
++    key_cache, value_cache = impl._pth_key_value_caches(kv_cache)
++    assert value_cache.data_ptr() - key_cache.data_ptr() == h
++    if pth_layout == "pad16":
++        assert h % 16 == 0 and key_cache.stride(1 if nhd else 2) % 16 == 0
++
++    seq_lens, q_lens = [37, 20], [3, 1]
++    ntok = sum(seq_lens)
++    key = torch.randn(ntok, nkv, hs) * 2
++    val = torch.randn(ntok, nkv, hs)
++    block_table = torch.tensor([[4, 1, 5], [0, 3, 2]], dtype=torch.int32)
++    slots = []
++    for r, n in enumerate(seq_lens):
++        for t in range(n):
++            slots.append(int(block_table[r, t // bs]) * bs + t % bs)
++    slot_mapping = torch.tensor(slots, dtype=torch.int64)
++    triton_reshape_and_cache_flash_per_token_head_quant(
++        key,
++        val,
++        key_cache,
++        value_cache,
++        impl._k_scale_cache,
++        impl._v_scale_cache,
++        slot_mapping,
++        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++    )
++    flat = kv_cache.transpose(1, 2).reshape(nb * bs, nkv, 2 * h)
++    # pad bytes untouched
++    assert not flat[..., hs + 4 : h].any() and not flat[..., h + hs + 4 :].any()
++    kq, ks = _quant_ref(key)
++    vq, vs = _quant_ref(val)
++    assert torch.equal(flat[slot_mapping, :, :hs], kq)
++    assert torch.equal(flat[slot_mapping, :, h : h + hs], vq)
++
++    q = torch.randn(sum(q_lens), nq, hs, dtype=torch.float16)
++    out = torch.zeros_like(q)
++    cu_q = torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32)
++    scale = hs**-0.5
++    ua.unified_attention(
++        q=q,
++        k=key_cache,
++        v=value_cache,
++        out=out,
++        cu_seqlens_q=cu_q,
++        max_seqlen_q=max(q_lens),
++        seqused_k=torch.tensor(seq_lens, dtype=torch.int32),
++        max_seqlen_k=max(seq_lens),
++        softmax_scale=scale,
++        causal=True,
++        alibi_slopes=None,
++        window_size=(-1, -1),
++        block_table=block_table,
++        softcap=0,
++        q_descale=None,
++        k_descale=None,
++        v_descale=None,
++        kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
++        k_scale_cache=impl._k_scale_cache,
++        v_scale_cache=impl._v_scale_cache,
++    )
++    kd = kq.float() * ks[..., None]
++    vd = vq.float() * vs[..., None]
++    ref, t0, q0 = [], 0, 0
++    for n, ql in zip(seq_lens, q_lens):
++        k_r = kd[t0 : t0 + n].repeat_interleave(nq // nkv, dim=1)
++        v_r = vd[t0 : t0 + n].repeat_interleave(nq // nkv, dim=1)
++        for i in range(ql):
++            pos = n - ql + i  # causal: query i sees keys [0, pos]
++            s_ = torch.einsum("hd,thd->ht", q[q0 + i].float(), k_r[: pos + 1]) * scale
++            ref.append(torch.einsum("ht,thd->hd", s_.softmax(-1), v_r[: pos + 1]))
++        t0 += n
++        q0 += ql
++    ref = torch.stack(ref)
++    got = out.float()
++    rel = ((got - ref).norm() / ref.norm()).item()
++    cos = torch.nn.functional.cosine_similarity(
++        got.flatten(), ref.flatten(), dim=0
++    ).item()
++    print(f"[PAD16] triton {pth_layout} nhd={nhd} hs={hs}: rel={rel:.2e} cos={cos:.6f}")
++    assert rel < 5e-3 and cos > 0.99999
++
++
+ class _FakeKernel:
+     def __init__(self):
+         self.kwargs = None
+@@ -53,7 +213,9 @@ def _call(monkeypatch, mode, use_td):
+     monkeypatch.setattr(ua, "kernel_unified_attention", fake)
+     # With no device, vllm.triton_utils hands out a placeholder module.
+     monkeypatch.setattr(
+-        ua.triton, "next_power_of_2", lambda n: 1 << (n - 1).bit_length(),
++        ua.triton,
++        "next_power_of_2",
++        lambda n: 1 << (n - 1).bit_length(),
+         raising=False,
+     )
+     monkeypatch.setattr(ua.triton, "cdiv", lambda a, b: -(-a // b), raising=False)
+@@ -65,14 +227,27 @@ def _call(monkeypatch, mode, use_td):
+     scale = torch.ones(8, bs, nkv) if pth else None
+     one = torch.ones(1)
+     ua.unified_attention(
+-        q=q, k=kv[..., :hs], v=kv[..., :hs], out=torch.empty_like(q),
+-        cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32), max_seqlen_q=3,
+-        seqused_k=torch.tensor([3], dtype=torch.int32), max_seqlen_k=3,
+-        softmax_scale=0.125, causal=True, alibi_slopes=None,
+-        window_size=(-1, -1), block_table=torch.zeros(1, 1, dtype=torch.int32),
+-        softcap=0, q_descale=None, k_descale=one.expand(1, nkv),
+-        v_descale=one.expand(1, nkv), kv_quant_mode=mode,
+-        k_scale_cache=scale, v_scale_cache=scale, use_td=use_td,
++        q=q,
++        k=kv[..., :hs],
++        v=kv[..., :hs],
++        out=torch.empty_like(q),
++        cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
++        max_seqlen_q=3,
++        seqused_k=torch.tensor([3], dtype=torch.int32),
++        max_seqlen_k=3,
++        softmax_scale=0.125,
++        causal=True,
++        alibi_slopes=None,
++        window_size=(-1, -1),
++        block_table=torch.zeros(1, 1, dtype=torch.int32),
++        softcap=0,
++        q_descale=None,
++        k_descale=one.expand(1, nkv),
++        v_descale=one.expand(1, nkv),
++        kv_quant_mode=mode,
++        k_scale_cache=scale,
++        v_scale_cache=scale,
++        use_td=use_td,
+     )
+     return fake.kwargs
+ 
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index ee273ba4d8..7b0e99d5c0 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """High-Performance Triton-only Attention layer."""
+ 
++import os
+ from dataclasses import dataclass, replace
+ from typing import ClassVar
+ 
+@@ -49,6 +50,59 @@ from vllm.v1.kv_cache_interface import (
+ logger = init_logger(__name__)
+ 
+ 
++# B70-IP-PAD16: the one definition of the per-token-head slot half. Every
++# reader and writer of the inline layout (TRITON_ATTN, the QSA kernels and
++# fused writer, the B70-IP-D2 split views, the K4 dequant) derives its offsets
++# from this or from the cache tensor's content width, never from 2 * (D + 4).
++PTH_SCALE_BYTES = 4
++PTH_HALF_ALIGN = 16
++
++
++def pth_pad16_enabled() -> bool:
++    """B70_PTH_PAD16 (default 1): the vllm#62113 16-byte K/V halves. 0 packs
++    the halves tight again (data + scale), for an A/B of pool vs speed only."""
++    return os.environ.get("B70_PTH_PAD16", "1") != "0"
++
++
++def pth_half_bytes(
++    head_size: int,
++    dtype_size: int = 1,
++    kv_quant_mode: KVQuantMode = KVQuantMode.INT8_PER_TOKEN_HEAD,
++) -> int:
++    """Bytes of one K (or V) half of a per-token-head slot: the head's data,
++    its fp32 scale, then zero or more pad bytes. ``head_size`` is the logical
++    head size (INT4 packs two per byte)."""
++    data = (
++        head_size // 2
++        if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
++        else (head_size * dtype_size)
++    )
++    align = 1
++    if kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD and pth_pad16_enabled():
++        align = PTH_HALF_ALIGN
++    return round_up(data + PTH_SCALE_BYTES, align)
++
++
++def pth_half_ok(half_bytes: int, data_bytes: int) -> bool:
++    """A cache's per-token-head half width fits a ``data_bytes`` head: room for
++    data + the fp32 scale, a 4-byte aligned scale, and no more padding than
++    either layout (tight or 16-B) produces."""
++    need = data_bytes + PTH_SCALE_BYTES
++    return (
++        need <= half_bytes < need + PTH_HALF_ALIGN
++        and half_bytes % PTH_SCALE_BYTES == 0
++        and data_bytes % PTH_SCALE_BYTES == 0
++    )
++
++
++def pth_check_half(half_bytes: int, data_bytes: int) -> None:
++    if not pth_half_ok(half_bytes, data_bytes):
++        raise ValueError(
++            f"per-token-head KV half {half_bytes} B does not fit a {data_bytes} B "
++            f"head + {PTH_SCALE_BYTES} B scale (tight or {PTH_HALF_ALIGN}-B padded)"
++        )
++
++
+ # constants
+ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+@@ -288,15 +342,12 @@ class TritonAttentionBackend(AttentionBackend):
+         mode = spec.kv_quant_mode
+         if spec.state_content_bytes is not None or not mode.is_per_token_head:
+             return spec
+-        hs_k, hs_v = spec.head_size, spec.head_size_v
+-        align = 16
+-        if mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+-            hs_k, hs_v = hs_k // 2, hs_v // 2
+-            align = 1
+-        scale_bytes = get_dtype_size(torch.float32)
++        # B70-IP-PAD16: one definition (pth_half_bytes) for every reader;
++        # B70_PTH_PAD16=0 drops the 16-B pad (A/B only).
+         dtype_size = get_dtype_size(spec.dtype)
+         content = sum(
+-            round_up(hs * dtype_size + scale_bytes, align) for hs in (hs_k, hs_v)
++            pth_half_bytes(hs, dtype_size, mode)
++            for hs in (spec.head_size, spec.head_size_v)
+         )
+         return replace(spec, state_content_bytes=content)
+ 
+@@ -416,6 +467,8 @@ class TritonAttentionImpl(AttentionImpl):
+         hs = self.head_size
+         if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+             hs //= 2
++        # B70-IP-PAD16: the cache's half must fit this head (tight or padded).
++        pth_check_half(padded_hs * dtype_sz, hs * dtype_sz)
+ 
+         raw = kv_cache.untyped_storage()
+         base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index 8c4857d5de..fc66c48368 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -1031,12 +1031,16 @@ def unified_attention(
+     use_td_qo = use_td and _is_pow2_nq and _is_pow2_hs
+ 
+     # B70-IP-K1: per-token-head KV caches pack one fp32 scale after each
+-    # head's data ([K(hs) | s | V(hs) | s] per slot), so the K/V row pitch and
+-    # the V base are not 16-byte aligned (hs=256 int8: pitch 520 B, V at
+-    # +260 B).  Xe2 2D block reads (tensor descriptors) need an aligned base
+-    # and pitch and return wrong data otherwise (measured on B70: cos 0.22
+-    # against an fp32 reference, 0.9998 with the pointer path).  Use the
+-    # pointer path for K/V loads in these modes; Q/O descriptors stay.
++    # head's data ([K(hs) | s | pad | V(hs) | s | pad] per slot).  Xe2 2D
++    # block reads (tensor descriptors) need a 64-byte surface base and a
++    # 16-byte pitch and return wrong data otherwise (measured on B70 with the
++    # tight 520-B slot, V at +260 B: cos 0.22 against an fp32 reference,
++    # 0.9998 with the pointer path).  B70-IP-PAD16 (vllm#62113) pads each half
++    # to 16 B: hs=256 int8 is a 544-B pitch with V at +272 B.  The pitch is
++    # now 16-B aligned, but the per-(block, head) descriptor base is not 64-B
++    # aligned for V (+272 = 16 mod 64) nor, in NHD, for K of odd heads
++    # (544 = 32 mod 64), so the guard stays: pointer path for K/V loads in
++    # these modes (now 16-B vectorizable), Q/O descriptors stay.
+     # B70_PTH_TD_GUARD=0 restores the old behaviour (A/B only).
+     if (
+         use_td

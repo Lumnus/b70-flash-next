@@ -1,0 +1,36 @@
+From ecb838a93cb11203c635adff5ce2f795c11b7eca Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 13:52:01 +0000
+Subject: [PATCH 02/51] B70-IP-K2: per-token-head scale views are not filled
+ (backport of vllm#64141)
+
+In hybrid models the attention layers and the GDN layers view the same
+physical pages; the first real forward builds the scale views after GDN
+layers wrote recurrent state there, and fill_(1.0) overwrote it (vllm#63944:
+first request garbage). Scales are written before any unmasked read.
+
+Upstream: https://github.com/vllm-project/vllm/pull/64141 (open)
+---
+ vllm/v1/attention/backends/triton_attn.py | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index a95b0c1d0e..f5f97d7410 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -439,7 +439,6 @@ class TritonAttentionImpl(AttentionImpl):
+             stride=(block_f32, slot_f32, head_f32),
+             storage_offset=k_scale_off_f32,
+         )
+-        self._k_scale_cache.fill_(1.0)
+ 
+         # V scales (second content half)
+         self._v_scale_cache = torch.as_strided(
+@@ -448,7 +447,6 @@ class TritonAttentionImpl(AttentionImpl):
+             stride=(block_f32, slot_f32, head_f32),
+             storage_offset=v_scale_off_f32,
+         )
+-        self._v_scale_cache.fill_(1.0)
+ 
+     def fused_output_quant_supported(self, quant_key: QuantKey):
+         return quant_key == kFp8StaticTensorSym

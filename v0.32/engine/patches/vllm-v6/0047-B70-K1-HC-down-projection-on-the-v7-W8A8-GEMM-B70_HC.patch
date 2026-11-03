@@ -1,0 +1,128 @@
+From 699ea54353a3fe5acf7e5c4211626f0bf406d2f3 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 11:55:45 +0000
+Subject: [PATCH 47/51] B70-K1: HC down projection on the v7 W8A8 GEMM
+ (B70_HC_DOWN_INT8=1; deterministic int32 split-K; HCDET_ALL_OK)
+
+---
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   | 72 +++++++++++++++++++
+ 1 file changed, 72 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index ad368bf031..80fc555bc7 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -60,6 +60,15 @@ _B70_HC_ORDERED_MAX_ROWS = int(os.environ.get("B70_HC_ORDERED_MAX_ROWS", str(1 <
+ # B70_HC_PARALLEL_MAX_ROWS). Default off.
+ _B70_HC_SILU_FUSE = os.environ.get("B70_HC_SILU_FUSE", "0") == "1"
+ _B70_HC_SILU_FUSE_LOGGED = False
++# B70-K1: HC down projection in int8 (v7 vllm_xpu_kernels wheel, b70_int8_dense.hc_down):
++# per-token int8 quant + s8 x s8 DPAS GEMM over an int8 copy of the down weight (per-row RTN, made at
++# load). A row's output depends only on that row (exact int32 accumulation for every K split), so it is
++# run-to-run deterministic and batch-invariant, which the ordered DFlash2 path requires; it replaces the
++# ordered / K-split / stock down GEMM for rows <= B70_HC_DOWN_INT8_MAX_ROWS (default: every width, so the
++# invariance holds across widths). Default off. Costs one int8 copy of each down weight (N x 10240 bytes).
++_B70_HC_DOWN_INT8 = os.environ.get("B70_HC_DOWN_INT8", "0") == "1"
++_B70_HC_DOWN_INT8_MAX_ROWS = int(os.environ.get("B70_HC_DOWN_INT8_MAX_ROWS", str(1 << 30)))
++_B70_HC_DOWN_INT8_LOGGED = False
+ 
+ 
+ def _is_xpu() -> bool:
+@@ -199,6 +208,9 @@ class GatedResidual(nn.Module):
+         self._kdown_lo: torch.Tensor | None = None
+         self._kdown_hi: torch.Tensor | None = None
+         self._kdown_k = 0
++        # B70-K1 int8 down weight (B70_HC_DOWN_INT8=1), prepared with the K-split halves.
++        self._kdown_q: torch.Tensor | None = None
++        self._kdown_qs: torch.Tensor | None = None
+         down_linear = (
+             self.input_mix_weight_down_block_inject
+             if use_combine
+@@ -210,6 +222,8 @@ class GatedResidual(nn.Module):
+ 
+     def _prepare_kdown_ksplit(self) -> None:
+         """One-time contiguous K-half prep for the deterministic XPU split."""
++        if _B70_HC_DOWN_INT8 and self._kdown_q is None:
++            self._prepare_kdown_int8()
+         if self._ordered_hc or self._kdown_lo is not None:
+             return
+         down_linear = (
+@@ -235,6 +249,61 @@ class GatedResidual(nn.Module):
+             weight.shape[0],
+         )
+ 
++    def _prepare_kdown_int8(self) -> None:
++        """B70-K1: int8 copy of the down weight for b70_int8_dense.hc_down (load time, before capture)."""
++        down_linear = (
++            self.input_mix_weight_down_block_inject
++            if self.use_combine
++            else self.input_mix_weight_down
++        )
++        weight = getattr(down_linear, "weight", None)
++        if (
++            weight is None
++            or weight.ndim != 2
++            or weight.dtype != torch.bfloat16
++            or weight.shape[1] % 32
++            or weight.shape[0] % 16
++            or weight.shape[0] < 32
++        ):
++            logger.warning(
++                "B70-K1 HC down int8: unsupported weight %s; keeping the BF16 path",
++                None if weight is None else (tuple(weight.shape), weight.dtype),
++            )
++            return
++        try:
++            from vllm_xpu_kernels import b70_int8_dense as k1
++        except ImportError:
++            logger.warning("B70-K1 HC down int8: vllm_xpu_kernels.b70_int8_dense missing")
++            return
++        if not hasattr(k1, "hc_down") or not hasattr(torch.ops._xpu_C, "b70_w8a8_fused_gemm"):
++            logger.warning("B70-K1 HC down int8: wheel lacks hc_down / b70_w8a8_fused_gemm")
++            return
++        self._kdown_q, self._kdown_qs = k1.quantize_weight_int8(weight.data)
++
++    def _down_int8_takes(self, xn: torch.Tensor) -> bool:
++        return (
++            self._kdown_q is not None
++            and xn.dtype == torch.bfloat16
++            and xn.shape[0] <= _B70_HC_DOWN_INT8_MAX_ROWS
++        )
++
++    def _down_int8(self, xn: torch.Tensor) -> torch.Tensor:
++        global _B70_HC_DOWN_INT8_LOGGED
++        from vllm_xpu_kernels import b70_int8_dense as k1
++
++        if not _B70_HC_DOWN_INT8_LOGGED:
++            _B70_HC_DOWN_INT8_LOGGED = True
++            logger.info(
++                "B70-K1: HC down int8 on (per-token int8 x int8 weight, batch-invariant; "
++                "rows <= %d; N=%d K=%d)",
++                _B70_HC_DOWN_INT8_MAX_ROWS,
++                self._kdown_q.shape[0],
++                self._kdown_q.shape[1],
++            )
++        shape = xn.shape
++        out = k1.hc_down(xn.reshape(-1, shape[-1]), self._kdown_q, self._kdown_qs)
++        return out.view(*shape[:-1], out.shape[-1])
++
+     def _mix_up(self, lora: torch.Tensor, normalized: torch.Tensor) -> torch.Tensor:
+         if self._ordered_hc and not self._astra_hc_up_prepared:
+             from vllm_xpu_kernels.astra_structural import prepare_hc_weight
+@@ -251,6 +320,8 @@ class GatedResidual(nn.Module):
+ 
+     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+         """Use ordered DFlash2 projection or the legacy target-only policy."""
++        if self._down_int8_takes(xn):
++            return self._down_int8(xn)
+         if self._ordered_hc and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS:
+             from .b70_hc_gemm import ordered_hc_gemm
+ 
+@@ -294,6 +365,7 @@ class GatedResidual(nn.Module):
+             _B70_HC_SILU_FUSE
+             and self._ordered_hc
+             and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS
++            and not self._down_int8_takes(xn)
+         ):
+             from .b70_hc_gemm import parallel_hc_gemm_silu, takes_parallel_route
+ 

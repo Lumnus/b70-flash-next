@@ -1,0 +1,566 @@
+From faffecd37997162d95dadd91bd0ac9309911c614 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:20 +0000
+Subject: [PATCH 40/51] B70-V7: CPU tests for KV8, DFA, K4F, AUX, PLEG
+
+TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q --noconftest tests/v1/core/test_b70_v7.py
+(30 passed on CPU, torch 2.14.0+xpu, Triton 3.8 interpreter).
+---
+ tests/v1/core/test_b70_v7.py | 548 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 548 insertions(+)
+ create mode 100644 tests/v1/core/test_b70_v7.py
+
+diff --git a/tests/v1/core/test_b70_v7.py b/tests/v1/core/test_b70_v7.py
+new file mode 100644
+index 0000000000..ef48723620
+--- /dev/null
++++ b/tests/v1/core/test_b70_v7.py
+@@ -0,0 +1,548 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70 v7 candidate, CPU tests.
++
++    TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= \
++        pytest -q --noconftest tests/v1/core/test_b70_v7.py
++
++1. KV8 (B70_DFLASH_KV_INT8): the KV-only int8 GEMM gives the per-layer qkv
++   path's K/V bit for bit; refusals log and keep the old path.
++2. DFA (B70_DRAFT_FA_INT8): non-causal sliding-window draft blocks take the
++   INT8 decode call with window [w, 0] from the block end; deviation from the
++   per-row TRITON_ATTN window measured; backend override and its refusals.
++3. K4F (B70_PTH_FA_PREFILL_FAST): one-launch dequant equals _dequant_blocks
++   bit for bit; the fast prefill equals the stock loop bit for bit.
++4. AUX (B70_DFLASH2_AUX_REUSE): hc_combine_norm's materialized state equals
++   hc_combine bit for bit; deferred capture keeps the feature order.
++5. PLEG (B70_PLE_DEVICE_GATHER): the Triton n-gram hash equals the host hash;
++   the device gather equals the host stage (multi-slab, padding, split heads).
++"""
++
++import os
++import sys
++import types
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++from torch import nn
++
++INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
++needs_interp = pytest.mark.skipif(not INTERPRET, reason="needs TRITON_INTERPRET=1")
++
++
++# --------------------------------------------------------------------------
++# 1. KV8
++# --------------------------------------------------------------------------
++class _RefInt8Kernel:
++    """Torch twin of the W8A8 int8 kernels' contract: weight [K, N] int8 view,
++    channelwise fp32 scale [N, 1], dynamic symmetric per-token activations."""
++
++    layer_param_names = (
++        "weight",
++        "weight_scale",
++        "input_scale",
++        "input_zero_point",
++        "azp_adj",
++    )
++
++    def apply_weights(self, layer, x, bias=None):
++        w = layer.weight  # [K, N]
++        ws = layer.weight_scale.reshape(-1).float()
++        x2 = x.reshape(-1, x.shape[-1]).float()
++        xs = (x2.abs().amax(-1, keepdim=True) / 127.0).clamp_min(1e-10)
++        xq = torch.round(x2 / xs).clamp(-128, 127).to(torch.int64)
++        acc = xq @ w.to(torch.int64)  # exact int dot products
++        out = (acc.double() * xs.double() * ws.double()[None, :]).float()
++        if bias is not None:
++            out = out + bias.float()
++        return out.to(x.dtype).view(*x.shape[:-1], w.shape[1])
++
++
++class _Proj(nn.Module):
++    def __init__(self, k, q_size, kv, kernel, seed, static=False, asym=False):
++        super().__init__()
++        g = torch.Generator().manual_seed(seed)
++        n = q_size + 2 * kv
++        w_nk = torch.randint(-127, 128, (n, k), generator=g, dtype=torch.int8)
++        self.weight = nn.Parameter(w_nk.t(), requires_grad=False)  # processed view
++        self.weight_scale = nn.Parameter(
++            torch.rand(n, 1, generator=g) * 1e-2 + 1e-4, requires_grad=False
++        )
++        self.input_scale = torch.ones(()) if static else None
++        self.input_zero_point = None
++        self.azp_adj = torch.ones(1, n) if asym else None
++        self.bias = None
++        self.input_size_per_partition = k
++        self.output_size_per_partition = n
++        self.scheme = SimpleNamespace(kernel=kernel)
++        self.kernel = kernel
++
++    def forward(self, x):
++        return self.kernel.apply_weights(self, x), None
++
++
++def _fake_dflash(L=5, k=256, q=128, kv=64, **kw):
++    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
++
++    kern = _RefInt8Kernel()
++    m = SimpleNamespace()
++    m._context_qkv_projs = [_Proj(k, q, kv, kern, 10 + i, **kw) for i in range(L)]
++    m._context_q_sizes = [q] * L
++    m._fused_kv_weight = None
++    m._fused_kv_bias = None
++    m._kv_int8 = None
++    m._hidden_norm_weight = torch.ones(k)
++    m._rms_norm_eps = 1e-6
++    m.build_int8_context_kv = types.MethodType(
++        DFlashQwen3Model.build_int8_context_kv, m
++    )
++    m._project_context_kv = types.MethodType(DFlashQwen3Model._project_context_kv, m)
++    return m
++
++
++@pytest.fixture
++def cpu_rms(monkeypatch):
++    from vllm.model_executor.models import qwen3_dflash
++
++    def rms_norm(out, x, w, eps):
++        xf = x.float()
++        out.copy_(
++            (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w).to(x.dtype)
++        )
++
++    monkeypatch.setattr(qwen3_dflash.ops, "rms_norm", rms_norm, raising=False)
++
++
++@pytest.mark.parametrize("num_ctx", [8, 64, 333])
++def test_kv8_bit_equal(monkeypatch, cpu_rms, num_ctx):
++    L, k, q, kv, nkv, hd = 5, 256, 128, 64, 2, 32
++    m = _fake_dflash(L, k, q, kv)
++    x = torch.randn(num_ctx, k).to(torch.bfloat16)
++    monkeypatch.delenv("B70_DFLASH_KV_INT8", raising=False)
++    assert not m.build_int8_context_kv()
++    k_ref, v_ref = m._project_context_kv(x, num_ctx, L, nkv, hd)
++    monkeypatch.setenv("B70_DFLASH_KV_INT8", "1")
++    assert m.build_int8_context_kv()
++    _, holder = m._kv_int8
++    assert tuple(holder.weight.shape) == (k, L * 2 * kv)
++    k_new, v_new = m._project_context_kv(x, num_ctx, L, nkv, hd)
++    assert torch.equal(k_ref, k_new) and torch.equal(v_ref, v_new)
++
++
++@pytest.mark.parametrize("kw", [{"static": True}, {"asym": True}])
++def test_kv8_refuses(monkeypatch, caplog, kw):
++    monkeypatch.setenv("B70_DFLASH_KV_INT8", "1")
++    m = _fake_dflash(**kw)
++    assert not m.build_int8_context_kv()
++    assert m._kv_int8 is None
++
++
++def test_kv8_refuses_unprocessed_weight(monkeypatch):
++    monkeypatch.setenv("B70_DFLASH_KV_INT8", "1")
++    m = _fake_dflash(q=192)  # N = 320 != K = 256, as on the real drafter
++    for p in m._context_qkv_projs:  # still the checkpoint's [N, K]
++        p.weight = nn.Parameter(p.weight.t().contiguous(), requires_grad=False)
++    assert not m.build_int8_context_kv()
++
++
++# --------------------------------------------------------------------------
++# 2-3. attention: reuse the D2 test's stand-ins
++# --------------------------------------------------------------------------
++from vllm.v1.attention.backends import b70_pth_fa  # noqa: E402
++
++sys.path.insert(0, os.path.dirname(__file__))
++import test_b70_ip_d2 as d2  # noqa: E402
++
++
++class _WinFakeOps(d2._FakeXpuOps):
++    """Adds the decode kernel's window to the D2 stand-in: a causal q-1 row at
++    seqused L with window [wl, 0] reads keys [max(0, L-1-wl), L)."""
++
++    def flash_attn_varlen_func(
++        self, q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, window_size=None, **kw
++    ):
++        self.windows = getattr(self, "windows", []) + [window_size]
++        if window_size is None or window_size[0] < 0 or k.dtype != torch.int8:
++            return super().flash_attn_varlen_func(
++                q, k, v, cu_seqlens_q, max_seqlen_q, max_seqlen_k, **kw
++            )
++        assert max_seqlen_q == 1 and kw.get("causal") and k.dtype == torch.int8
++        self.calls.append(SimpleNamespace(kdtype=k.dtype, max_q=1, causal=True))
++        wl, out, bt = window_size[0], kw["out"], kw["block_table"]
++        kf = k.float() * kw["k_descale"][..., None]
++        vf = v.float() * kw["v_descale"][..., None]
++        bs, nkv = k.shape[1], k.shape[2]
++        used = kw["seqused_k"].tolist()
++        for r in range(cu_seqlens_q.numel() - 1):
++            L = used[r]
++            lo = max(0, L - 1 - wl)
++            blocks = bt[r, : -(-L // bs)].long()
++            K = kf[blocks].reshape(-1, nkv, kf.shape[-1])[lo:L]
++            V = vf[blocks].reshape(-1, nkv, vf.shape[-1])[lo:L]
++            out[r : r + 1] = d2._ref_attn(
++                q[r : r + 1].float(), K, V, kw["softmax_scale"], False
++            ).to(out.dtype)
++        return out
++
++
++def _ref_window(q, K, V, scale, lo_per_row):
++    g = q.shape[1] // K.shape[1]
++    K, V = K.repeat_interleave(g, 1), V.repeat_interleave(g, 1)
++    s = torch.einsum("qhd,khd->hqk", q, K) * scale
++    kp = torch.arange(K.shape[0])
++    mask = kp[None, :] >= torch.tensor(lo_per_row)[:, None]
++    s = s.masked_fill(~mask[None], float("-inf"))
++    return torch.einsum("hqk,khd->qhd", torch.softmax(s, -1), V)
++
++
++@pytest.fixture
++def win_kernels(monkeypatch):
++    ops = _WinFakeOps()
++    mod = types.ModuleType("vllm._xpu_ops")
++    mod.xpu_ops = ops
++    monkeypatch.setitem(sys.modules, "vllm._xpu_ops", mod)
++    pkg = types.ModuleType("vllm_xpu_kernels")
++    fai = types.ModuleType("vllm_xpu_kernels.flash_attn_interface")
++    fai._SPEC_DECODE_MAX_QLEN = 16
++    pkg.flash_attn_interface = fai
++    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels", pkg)
++    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels.flash_attn_interface", fai)
++    monkeypatch.setattr(b70_pth_fa, "_scratch", {})
++    monkeypatch.setattr(b70_pth_fa, "current_platform", d2._XPU())
++    return ops
++
++
++@pytest.mark.parametrize(
++    "hs,W,seqs",
++    [
++        (128, 96, [150, 64, 300]),
++        (256, 96, [150, 64, 300]),
++        (128, 2048, [2040, 2100, 3000]),
++    ],
++)
++def test_dfa_swa_noncausal_rows(win_kernels, monkeypatch, hs, W, seqs):
++    import functools
++
++    monkeypatch.setattr(d2, "HS", hs)
++    monkeypatch.setattr(
++        d2, "make_layer_cache", functools.partial(d2.make_layer_cache, hs=hs)
++    )
++    monkeypatch.setenv("B70_DRAFT_FA_INT8", "1")
++    nkv, hq, bs = 2, 8, 64
++    nb = sum(-(-s // bs) for s in seqs) + 2
++    q_lens = [8, 8, 8]
++    _, kv_sp, bt, dk, dv = d2._fill_both(nkv, bs, nb, seqs, seed=3)
++    meta = d2._meta(q_lens, seqs, bt, causal=False)
++    q = torch.randn(sum(q_lens), hq, hs).to(torch.bfloat16)
++    out = torch.zeros_like(q)
++    impl = d2._impl(nkv, hq)
++    impl.head_size, impl.scale = hs, hs**-0.5
++    b70_pth_fa.fa_int8_forward(impl, q, kv_sp, meta, out, q.shape[0], (W - 1, W - 1))
++    assert win_kernels.windows == [[W - 1, 0]]
++    qsl = meta.query_start_loc.tolist()
++    worst = 0.0
++    for i, S in enumerate(seqs):
++        qi = q[qsl[i] : qsl[i + 1]].float()
++        lo_impl = [max(0, S - W)] * 8  # window from the block end
++        ref = _ref_window(qi, dk[i], dv[i], impl.scale, lo_impl)
++        got = out[qsl[i] : qsl[i + 1]].float()
++        assert ((got - ref).norm() / ref.norm()) < 1.5e-2
++        # TRITON_ATTN semantics: |p - k| <= W - 1 per row
++        lo_tri = [max(0, (S - 8 + j) - (W - 1)) for j in range(8)]
++        tri = _ref_window(qi, dk[i], dv[i], impl.scale, lo_tri)
++        dev = ((got - tri).norm() / tri.norm()).item()
++        if S <= W - 7:
++            assert dev < 1.5e-2
++        worst = max(worst, dev)
++    print(f"DFA hs={hs} W={W} seqs={seqs}: max rel dev vs per-row window {worst:.4f}")
++
++
++def test_dfa_off_keeps_k4_route(win_kernels, monkeypatch):
++    monkeypatch.delenv("B70_DRAFT_FA_INT8", raising=False)
++    monkeypatch.setattr(d2, "HS", 256)
++    nkv, hq, bs, nb = 2, 8, 64, 12
++    seqs = [150, 64, 129]
++    _, kv_sp, bt, _, _ = d2._fill_both(nkv, bs, nb, seqs, seed=2)
++    meta = d2._meta([8, 8, 8], seqs, bt, causal=False)
++    q = torch.randn(24, hq, 256).to(torch.bfloat16)
++    impl = d2._impl(nkv, hq)
++    b70_pth_fa.fa_int8_forward(impl, q, kv_sp, meta, torch.zeros_like(q), 24, (95, 95))
++    assert all(c.kdtype == torch.bfloat16 for c in win_kernels.calls)  # K4
++
++
++def test_dfa_backend_override(monkeypatch):
++    from vllm.v1.attention.backends.registry import AttentionBackendEnum
++    from vllm.v1.worker.gpu.spec_decode.dflash import utils
++
++    monkeypatch.setattr(b70_pth_fa, "current_platform", d2._XPU())
++    hf = SimpleNamespace(head_dim=128, hidden_size=2560, num_attention_heads=32)
++    cfg = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            attention_backend=AttentionBackendEnum.TRITON_ATTN,
++            kv_cache_dtype=None,
++            draft_model_config=SimpleNamespace(hf_config=hf),
++        ),
++        cache_config=SimpleNamespace(cache_dtype="int8_per_token_head"),
++    )
++    monkeypatch.delenv("B70_DRAFT_FA_INT8", raising=False)
++    assert utils._b70_draft_attention_backend(cfg) is AttentionBackendEnum.TRITON_ATTN
++    monkeypatch.setenv("B70_DRAFT_FA_INT8", "1")
++    monkeypatch.setenv("B70_PTH_FA_DECODE", "1")
++    assert utils._b70_draft_attention_backend(cfg) is AttentionBackendEnum.FLASH_ATTN
++    hf.head_dim = 96
++    assert utils._b70_draft_attention_backend(cfg) is AttentionBackendEnum.TRITON_ATTN
++    hf.head_dim = 128
++    cfg.cache_config.cache_dtype = "auto"
++    assert utils._b70_draft_attention_backend(cfg) is AttentionBackendEnum.TRITON_ATTN
++    cfg.cache_config.cache_dtype = "int8_per_token_head"
++    monkeypatch.setenv("B70_PTH_FA_DECODE", "0")
++    assert utils._b70_draft_attention_backend(cfg) is AttentionBackendEnum.TRITON_ATTN
++
++
++# --------------------------------------------------------------------------
++# 3. K4F
++# --------------------------------------------------------------------------
++@needs_interp
++@pytest.mark.parametrize("hs,nkv", [(256, 1), (256, 2), (128, 2)])
++def test_k4f_dequant_kernel_bit_equal(monkeypatch, hs, nkv):
++    import functools
++
++    monkeypatch.setattr(d2, "HS", hs)
++    monkeypatch.setattr(
++        d2, "make_layer_cache", functools.partial(d2.make_layer_cache, hs=hs)
++    )
++    bs, nb = 64, 9
++    seqs = [70, 130, 5]
++    kv_in, kv_sp, bt, _, _ = d2._fill_both(nkv, bs, nb, seqs)
++    for views in (
++        d2.inline_views(kv_in),
++        b70_pth_fa.split_layout_views(kv_sp, nkv, hs),
++    ):
++        kc, vc, ksc, vsc = views
++        nblk = [-(-s // bs) for s in seqs]
++        stride = max(nblk)
++        ks = torch.full((len(seqs) * stride, bs, nkv, hs), 7.0, dtype=torch.bfloat16)
++        vs = ks.clone()
++        b70_pth_fa.dequant_group(
++            kc,
++            vc,
++            ksc,
++            vsc,
++            bt[: len(seqs)],
++            torch.tensor(seqs, dtype=torch.int32),
++            ks,
++            vs,
++            stride,
++            stride,
++            hs,
++        )
++        for r, n in enumerate(nblk):
++            ids = bt[r, :n].long()
++            a = torch.empty(n, bs, nkv, hs, dtype=torch.bfloat16)
++            b70_pth_fa._dequant_blocks(kc, ksc, ids, a, hs)
++            assert torch.equal(ks[r * stride : r * stride + n], a)
++            b70_pth_fa._dequant_blocks(vc, vsc, ids, a, hs)
++            assert torch.equal(vs[r * stride : r * stride + n], a)
++
++
++@needs_interp
++@pytest.mark.parametrize("split", [False, True])
++def test_k4f_prefill_equals_stock(monkeypatch, split):
++    monkeypatch.setattr(d2, "HS", 256)
++    monkeypatch.setattr(b70_pth_fa, "current_platform", d2._XPU())
++    ops = d2._FakeXpuOps()
++    mod = types.ModuleType("vllm._xpu_ops")
++    mod.xpu_ops = ops
++    monkeypatch.setitem(sys.modules, "vllm._xpu_ops", mod)
++    nkv, hq, bs, nb = 2, 8, 64, 16
++    seqs, q_lens = [200, 90, 130, 30], [100, 90, 70, 1]
++    kv_in, kv_sp, bt, _, _ = d2._fill_both(nkv, bs, nb, seqs, seed=1)
++    meta = d2._meta(q_lens, seqs, bt)
++    q = torch.randn(sum(q_lens), hq, 256).to(torch.bfloat16)
++    if split:
++        kc, vc, ksc, vsc = b70_pth_fa.split_layout_views(kv_sp, nkv, 256)
++    else:
++        kc, vc, ksc, vsc = d2.inline_views(kv_in)
++
++    def run(fast, max_len):
++        monkeypatch.setattr(b70_pth_fa, "_scratch", {})
++        if fast:
++            monkeypatch.setenv("B70_PTH_FA_PREFILL_FAST", "1")
++        else:
++            monkeypatch.delenv("B70_PTH_FA_PREFILL_FAST", raising=False)
++        b70_pth_fa.attach_host_lens(
++            meta,
++            SimpleNamespace(
++                query_start_loc_cpu=meta.query_start_loc.clone(),
++                seq_lens_cpu_upper_bound=meta.seq_lens.clone() + 3,
++            ),
++        )  # an upper bound
++        imp = d2._impl(nkv, hq, max_len=max_len)
++        out = torch.zeros_like(q)
++        ops.calls.clear()
++        assert b70_pth_fa.maybe_fa_prefill(
++            imp, q, kc, vc, out, meta, q.shape[0], pth_scales=(ksc, vsc), force=True
++        )
++        return out, len(ops.calls)
++
++    for max_len in (4096, 300):  # one group / several groups
++        a, na = run(False, max_len)
++        b, nb_ = run(True, max_len)
++        assert torch.equal(a, b), max_len
++        print(f"K4F max_len {max_len}: stock {na} FA calls, fast {nb_}")
++
++
++def test_k4f_without_host_lens_falls_back(monkeypatch):
++    monkeypatch.setenv("B70_PTH_FA_PREFILL_FAST", "1")
++    meta = SimpleNamespace(query_start_loc=torch.zeros(2))
++    assert (
++        b70_pth_fa._fa_prefill_fast(
++            None, None, None, None, None, meta, None, None, True, None, None
++        )
++        is None
++    )
++
++
++# --------------------------------------------------------------------------
++# 4. AUX
++# --------------------------------------------------------------------------
++@needs_interp
++@pytest.mark.parametrize("inj", [True, False])
++@pytest.mark.parametrize("rows", [1, 8, 37])
++def test_aux_combine_norm_state_equals_combine(inj, rows):
++    from vllm.models.qwen4_exp.nvidia.ops import hc as hc_ops
++
++    torch.manual_seed(rows)
++    H, D = 4, 2560
++    res = torch.randn(rows, H * D).to(torch.bfloat16)
++    blk = torch.randn(rows, D).to(torch.bfloat16)
++    injection = torch.randn(rows, H).to(torch.bfloat16) if inj else None
++    w = torch.randn(H * D).to(torch.bfloat16)
++    a = hc_ops._hc_combine(res, blk, injection, H)
++    b, _ = hc_ops._hc_combine_norm(res, blk, injection, w, 1e-6, H)
++    assert torch.equal(a, b)
++
++
++def test_aux_deferred_order(monkeypatch):
++    from vllm.models.qwen4_exp.nvidia import dflash2_features as f
++
++    monkeypatch.setattr(f, "_AUX_REUSE", True)
++    m = SimpleNamespace(
++        aux_hidden_state_layers=(6, 16),
++        end_layer=20,
++        layers=[SimpleNamespace(ple=None) for _ in range(20)],
++    )
++    m.layers[16].ple = object()  # a PLE layer after a boundary: not deferred
++    cap = types.MethodType(f.DFlash2FeatureCapture.capture_completed_layer, m)
++    col = types.MethodType(f.DFlash2FeatureCapture.collect_deferred_feature, m)
++    aux = []
++    combined = {}
++    for i in range(20):
++        layer = m.layers[i]
++        if getattr(m, "_b70_aux_defer", None) == i:
++            combined[i] = torch.randn(3, 4 * 2560)
++            layer.__dict__["_b70_combined"] = combined[i]
++            col(aux, i, layer)
++        mlp = SimpleNamespace(combine=lambda h, b, j: h + b.repeat(1, 4))
++        layer.mlp_hyper_connection = mlp
++        h, b = torch.randn(3, 4 * 2560), torch.randn(3, 2560)
++        if i == 15:
++            want16 = f.aux_feature(h + b.repeat(1, 4))
++        cap(aux, i, layer, h, b, None)
++    assert len(aux) == 2
++    assert torch.equal(aux[0], f.aux_feature(combined[6]))
++    assert torch.equal(aux[1], want16)
++
++
++# --------------------------------------------------------------------------
++# 5. PLEG
++# --------------------------------------------------------------------------
++def _ple_consts(heads=16, hpn=8):
++    rng = np.random.default_rng(0)
++    sizes = rng.integers(500, 900, size=heads).astype(np.int64)
++    offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
++    mult = [int(x) for x in rng.integers(1, 2**31, size=3)]
++    return sizes, offsets, mult, hpn
++
++
++def _batch(rng, q_lens, eos, vocab=50):
++    ids = rng.integers(0, vocab, size=sum(q_lens)).astype(np.int64)
++    ids[rng.random(ids.size) < 0.1] = eos
++    qsl = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int64)
++    ctx = rng.integers(0, vocab, size=(len(q_lens), 2)).astype(np.int64)
++    return ids, qsl, ctx
++
++
++@needs_interp
++@pytest.mark.parametrize("q_lens", [[8, 8, 8], [1, 5, 8, 3], [40]])
++def test_pleg_device_hash_equals_host(q_lens):
++    from vllm.models.qwen4_exp.common.ops.ple import ple_ngram_ids
++    from vllm.models.qwen4_exp.nvidia.ngram_embedding import b70_host_ngram_ids
++
++    sizes, offsets, mult, hpn = _ple_consts()
++    eos = 7
++    rng = np.random.default_rng(len(q_lens))
++    ids, qsl, ctx = _batch(rng, q_lens, eos)
++    host = b70_host_ngram_ids(ids, qsl, ctx, mult, sizes, offsets, eos, hpn, 3)
++    max_reqs = len(q_lens) + 3  # trailing zero-length requests, like the model state
++    qsl_pad = np.concatenate([qsl, [qsl[-1]] * 3]).astype(np.int32)
++    ctx_pad = np.concatenate([ctx, np.full((3, 2), eos)]).astype(np.int32)
++    T_pad = ids.size + 5
++    ids_pad = np.concatenate([ids, np.zeros(5, dtype=np.int64)]).astype(np.int32)
++    dev = ple_ngram_ids(
++        torch.from_numpy(ids_pad),
++        torch.from_numpy(qsl_pad),
++        torch.from_numpy(ctx_pad),
++        torch.tensor(mult, dtype=torch.int64),
++        torch.from_numpy(sizes),
++        torch.from_numpy(offsets),
++        eos,
++        hpn,
++    )
++    assert dev.shape == (T_pad, 16)
++    assert np.array_equal(dev[: ids.size].numpy(), host), max_reqs
++
++
++@needs_interp
++@pytest.mark.parametrize("max_slab", [1 << 30, 164 * 2048, 164 * 1500])
++def test_pleg_gather_equals_host_stage(max_slab):
++    from vllm.models.qwen4_exp.nvidia.b70_ple_devgather import DeviceGather
++    from vllm.models.qwen4_exp.nvidia.ple_nvme import owned_heads
++    from vllm.models.qwen4_exp.nvidia.ple_ram import PleRamTable
++
++    sizes, offsets, _, _ = _ple_consts()
++    total = int(offsets[-1] + sizes[-1])
++    ROW, H = 164, 16
++    tp_start, tp_end = (
++        int(offsets[3]) + 100,
++        int(offsets[8]) + 50,
++    )  # split heads 3 and 8
++    tensors = []
++
++    def alloc(rows, rb):
++        t = torch.zeros(rows, rb, dtype=torch.uint8)
++        tensors.append(t)
++        return t.numpy()
++
++    table = PleRamTable(
++        tp_start, tp_end, ROW, alloc=alloc, max_slab_bytes=max_slab, tail_bytes=164 * 64
++    )
++    rng = np.random.default_rng(1)
++    for s in table.slabs:
++        s[:] = rng.integers(0, 256, size=s.shape, dtype=np.uint8)
++    own = owned_heads(sizes, offsets, tp_start, tp_end)
++    T, n_act = 24, 19
++    ids = (offsets[None, :] + rng.integers(0, sizes[None, :], size=(T, H))).astype(
++        np.int64
++    )
++    stage = np.full((T, H, ROW), 0xAB, dtype=np.uint8)
++    stage[:T].fill(0)  # _fill_stage zero-fills max(dirty, padded) rows
++    table.gather_into(stage, ids[:n_act][:, own], own)
++    dg = DeviceGather(tensors, table.bounds, tp_start, tp_end, ROW, view_fn=lambda t: t)
++    qsl = torch.tensor([0, 8, 16, n_act, n_act, n_act], dtype=torch.int32)
++    out = torch.full((T, H, ROW), 0xCD, dtype=torch.uint8)
++    dg(torch.from_numpy(ids), qsl, out)
++    assert len(tensors) >= 1
++    assert np.array_equal(out.numpy(), stage), len(tensors)
++    assert total > tp_end

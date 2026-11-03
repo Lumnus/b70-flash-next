@@ -1,4 +1,4 @@
-# preset-1card.args — `vllm serve` flags of the Qwen3.6-35B-A3B 1-card preset, 0.32.0-b70.5: one B70, DFlash K=7, bf16 KV, 8 slots,
+# preset-1card.args — `vllm serve` flags of the Qwen3.6-35B-A3B 1-card preset (last measured on engine tag v0.32.0-b70.5, kernels b70/v0.1.16, not re-measured on the b70.6 kernels): one B70, DFlash K=7, bf16 KV, 8 slots,
 # 196,608-token context, 32 GiB host-RAM KV tier. One flag and its value per line; pair with preset-1card.env. Measured 2026-10-31
 # (numbers in meta.md). Run: v0.32/engine/serve.sh qwen36-35b-a3b preset-1card
 --served-model-name qwen36-35b-a3b

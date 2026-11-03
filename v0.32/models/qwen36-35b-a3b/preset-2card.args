@@ -1,4 +1,4 @@
-# preset-2card.args — `vllm serve` flags of the Qwen3.6-35B-A3B 2-card preset, 0.32.0-b70.5: tensor parallel 2, DFlash K=7 (draft
+# preset-2card.args — `vllm serve` flags of the Qwen3.6-35B-A3B 2-card preset (last measured on engine tag v0.32.0-b70.5, kernels b70/v0.1.16, not re-measured on the b70.6 kernels): tensor parallel 2, DFlash K=7 (draft
 # TP2), bf16 KV, 16 slots, the full 262,144-token context, 64 GiB host-RAM KV tier. One flag and its value per line; pair with
 # preset-2card.env. Measured 2026-10-29 (numbers in meta.md). Run: v0.32/engine/serve.sh qwen36-35b-a3b preset-2card
 --served-model-name qwen36-35b-a3b

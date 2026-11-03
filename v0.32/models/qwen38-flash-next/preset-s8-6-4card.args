@@ -1,0 +1,36 @@
+# preset-s8-6-4card.args — `vllm serve` flags of Qwen3.8-Flash-Next S8-6, sparse QSA, INT8 execution, INT8 KV, 4 cards. One flag and its value per line.
+# Run: v0.32/engine/serve.sh qwen38-flash-next preset-s8-6-4card
+--served-model-name qwen38-flash-next
+--host 0.0.0.0
+--port 8000
+--dtype bfloat16
+--tensor-parallel-size 4
+--enable-expert-parallel
+--trust-remote-code
+--max-model-len 262144
+# 8-bit KV, per-token-head scale
+--kv-cache-dtype int8_per_token_head
+# prefill chunk
+--max-num-batched-tokens 4096
+# keep the capture list a multiple of 1+K = 8 up to slots x 8
+--max-num-seqs 12
+--limit-mm-per-prompt {"image":2,"video":0}
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,72,80,88,96,256,512,1024]}
+--cudagraph-metrics
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
+--reasoning-parser qwen3
+# generic template, relative to the kit root
+--chat-template v0.32/models/qwen38-flash-next/chat_template.jinja
+# CPU KV tier, GiB of pinned host RAM split evenly over the ranks; a power of two per rank.
+--kv-offloading-size 128
+--kv-offloading-backend native
+# DFlash2 block-diffusion drafter, 7 draft tokens, W8A8 weights
+--speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2-w8a8","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
+--enable-prompt-tokens-details
+# server default temperature; a request's own value wins
+--override-generation-config {"temperature": 0.7}
+# when the per-effort thinking budget runs out, close thinking with a short transition
+--reasoning-config {"reasoning_end_str": "\n\nI have thought enough; time to answer.\n</think>\n\n"}
+# the highest value vLLM's start-up free-memory check accepts on compute-runtime 26.35
+--gpu-memory-utilization 0.89

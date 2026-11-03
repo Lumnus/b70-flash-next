@@ -1,0 +1,124 @@
+From 7c7c33f5ede43df2e7c57f56d8e6d5b06df52444 Mon Sep 17 00:00:00 2001
+From: riceharvest <myappleiddarimaan@gmail.com>
+Date: Sat, 31 Oct 2026 22:57:29 +0000
+Subject: [PATCH 27/51] B70-V6x: riceharvest patch_asym_gptq (inert unless a
+ sym=false GPTQ checkpoint loads, B70_ASYM_GPTQ marker)
+
+riceharvest/vllm b70/v0.32 43fb2ee310: load asymmetric GPTQ (sym=false,
+uint4 + qzeros) on XPU through AutoGPTQ:
+- TYPE_MAP gains (4, False) -> uint4 (before: "Unsupported quantization
+  config" at load);
+- the Marlin support check runs for symmetric configs only;
+- the linear kernel config carries zero_points=not is_sym;
+- on XPU, process_weights_after_loading adds the GPTQ v1 +1 back to every
+  qzeros nibble (the kernel takes raw z).
+
+B70-V6x change: the stock XPUwNa16 kernel transposes w_zp for every
+zero-point layer; rice's commit dropped that transpose for all of them,
+which would also change AWQ and compressed-tensors asym wNa16 on XPU. Here
+the transpose is skipped only when AutoGPTQ flags the layer
+(layer._b70_gptq_asym_zp, set only for sym=false on XPU), so every other
+loader and every symmetric GPTQ checkpoint takes the stock path unchanged.
+No env flag: with no asymmetric checkpoint loaded nothing changes.
+
+Linear layers only; an asymmetric GPTQ MoE goes through AutoGPTQMoEMethod
+with may_have_zp=True, which this commit does not touch. Not GPU-tested here.
+
+Generated from patches/b70/patch_asym_gptq.py of
+riceharvest/b70-qwen38-cookbook@9f7fa83.
+---
+ .../kernels/linear/mixed_precision/xpu.py     | 14 ++++++++----
+ .../layers/quantization/auto_gptq.py          | 22 ++++++++++++++-----
+ 2 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
+index dac8a503a3..974cde3fe9 100644
+--- a/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
++++ b/vllm/model_executor/kernels/linear/mixed_precision/xpu.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# B70_ASYM_GPTQ
+ 
+ 
+ import torch
+@@ -79,10 +80,15 @@ class XPUwNa16LinearKernel(MPLinearKernel):
+             )
+ 
+         if self.config.zero_points:
+-            # (FIXME): maybe zero points should also be transposed.
+-            getattr(layer, self.w_zp_name).data = (
+-                getattr(layer, self.w_zp_name).data.t().contiguous()
+-            )
++            if getattr(layer, "_b70_gptq_asym_zp", False):
++                # B70_ASYM_GPTQ: asymmetric AutoGPTQ qzeros are already
++                # [K/G, N/8] packed along N; only that loader sets the flag.
++                pass
++            else:
++                # (FIXME): maybe zero points should also be transposed.
++                getattr(layer, self.w_zp_name).data = (
++                    getattr(layer, self.w_zp_name).data.t().contiguous()
++                )
+         else:
+             weight_zero_point = torch.Tensor([8]).to(torch.int8).to("xpu")
+             setattr(
+diff --git a/vllm/model_executor/layers/quantization/auto_gptq.py b/vllm/model_executor/layers/quantization/auto_gptq.py
+index 39cde492a3..f86ce1bb8d 100644
+--- a/vllm/model_executor/layers/quantization/auto_gptq.py
++++ b/vllm/model_executor/layers/quantization/auto_gptq.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# B70_ASYM_GPTQ
+ 
+ from copy import deepcopy
+ from typing import Any
+@@ -98,6 +99,7 @@ class AutoGPTQConfig(QuantizationConfig):
+     # (num_bits, is_sym) -> quant_type
+     TYPE_MAP = {
+         (4, True): scalar_types.uint4b8,
++        (4, False): scalar_types.uint4,
+         (8, True): scalar_types.uint8b128,
+     }
+ 
+@@ -314,10 +316,13 @@ class AutoGPTQLinearMethod(LinearMethodBase):
+         self.quant_type = self.quant_config.quant_type
+ 
+         # Verify supported on platform.
+-        verify_marlin_supported(
+-            quant_type=self.quant_config.quant_type,
+-            group_size=self.quant_config.group_size,
+-        )
++        # B70_ASYM_GPTQ: asymmetric (sym=false) checkpoints skip the Marlin
++        # check; the mixed-precision kernel chooser validates them instead.
++        if self.quant_config.is_sym:
++            verify_marlin_supported(
++                quant_type=self.quant_config.quant_type,
++                group_size=self.quant_config.group_size,
++            )
+ 
+     def create_weights(
+         self,
+@@ -343,7 +348,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
+             weight_type=self.quant_config.quant_type,
+             act_type=params_dtype if input_dtype is None else input_dtype,
+             group_size=self.quant_config.group_size,
+-            zero_points=False,
++            zero_points=not self.quant_config.is_sym,
+         )
+ 
+         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+@@ -436,6 +441,13 @@ class AutoGPTQLinearMethod(LinearMethodBase):
+         )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        from vllm.platforms import current_platform
++
++        if not self.quant_config.is_sym and current_platform.is_xpu():
++            # B70_ASYM_GPTQ: GPTQ v1 stores z-1 per nibble; the XPU kernel
++            # takes raw z, and its qzeros are already [K/G, N/8] (no transpose).
++            layer.qzeros.data += 0x11111111
++            layer._b70_gptq_asym_zp = True
+         self.kernel.process_weights_after_loading(layer)
+ 
+     def apply(

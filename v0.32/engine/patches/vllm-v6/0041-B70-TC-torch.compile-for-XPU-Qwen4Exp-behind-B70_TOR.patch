@@ -1,0 +1,397 @@
+From 8dc0ea8c99300a43b9f46655da5c8c3adf08255f Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:01:58 +0000
+Subject: [PATCH 41/51] B70-TC: torch.compile for XPU Qwen4Exp behind
+ B70_TORCH_COMPILE=1 (carried unchanged)
+
+Re-decorates Qwen4ExpModel with support_torch_compile (enable_if B70_TORCH_COMPILE=1),
+puts HC mix/combine_and_mix, GDN in_proj_ba and PLE behind opaque custom ops.
+Unset flag = previous build.
+---
+ vllm/config/compilation.py                    |   2 +
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  44 +++--
+ .../qwen4_exp/nvidia/b70_compile_ops.py       | 151 ++++++++++++++++++
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   |  15 ++
+ vllm/models/qwen4_exp/nvidia/model.py         |  53 +++++-
+ 5 files changed, 245 insertions(+), 20 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/b70_compile_ops.py
+
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 7a16e3d6a0..2b8715aa6c 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -773,6 +773,8 @@ class CompilationConfig:
+         "vllm::short_conv",
+         # Qwen4Exp's AMD backend still uses these splitting ops.
+         "vllm::qwen4_exp_ple_short_conv",
++        # B70-TC: XPU Qwen4Exp PLE layer under B70_TORCH_COMPILE=1.
++        "vllm::b70_qwen4_exp_ple",
+         "vllm::qwen4_exp_qsa_with_output",
+         # The fused prepare calls this op instead of the one above.
+         "vllm::qwen4_exp_qsa_prepare_with_output",
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 0e304ab94a..bee4748d9d 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -476,6 +476,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         super().__init__(config, vllm_config, prefix)
+ 
+         self._deterministic_prefill_gates = config.model_type == "qwen4_exp_text"
++        # B70-TC: opaque in_proj_ba op under torch.compile (B70_TORCH_COMPILE=1, XPU only).
++        self._b70_tc_name = None
++        if os.environ.get("B70_TORCH_COMPILE", "0") == "1" and current_platform.is_xpu():
++            from vllm.models.qwen4_exp.nvidia import b70_compile_ops
++
++            self._b70_tc_name = prefix
++            b70_compile_ops.register(prefix, self)
+         self.num_k_heads = config.linear_num_key_heads
+         self.num_v_heads = config.linear_num_value_heads
+         self.head_k_dim = config.linear_key_head_dim
+@@ -1072,21 +1079,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # Part 1: Input Projection
+         # ============================================================
+         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-        if (
+-            self._deterministic_prefill_gates
+-            and hidden_states.shape[0] > 8
+-            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
+-            and self.in_proj_ba.weight.dtype == torch.bfloat16
+-            and self.in_proj_ba.bias is None
+-        ):
+-            # oneDNN's 85-row gate GEMM changes results for identical inputs.
+-            # Fixed K order makes cached and fresh prefill reproducible.
+-            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
+-
+-            weight = self.in_proj_ba.weight
+-            projected_states_ba = ordered_hc_gemm(hidden_states, weight, weight.shape[0])
++        if getattr(self, "_b70_tc_name", None) is not None and torch.compiler.is_compiling():
++            # B70-TC: keep the row-count gate dispatch out of the traced graph.
++            projected_states_ba = torch.ops.vllm.b70_gdn_in_proj_ba(
++                hidden_states, self.in_proj_ba.weight.shape[0], self._b70_tc_name
++            )
+         else:
+-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
++            projected_states_ba = self._b70_in_proj_ba_eager(hidden_states)
+ 
+         # ============================================================
+         # Part 2: Core Attention
+@@ -1111,6 +1110,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # ============================================================
+         return self._output_projection(core_attn_out, z)
+ 
++    def _b70_in_proj_ba_eager(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        if (
++            self._deterministic_prefill_gates
++            and hidden_states.shape[0] > 8
++            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
++            and self.in_proj_ba.weight.dtype == torch.bfloat16
++            and self.in_proj_ba.bias is None
++        ):
++            # oneDNN's 85-row gate GEMM changes results for identical inputs.
++            # Fixed K order makes cached and fresh prefill reproducible.
++            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
++
++            weight = self.in_proj_ba.weight
++            return ordered_hc_gemm(hidden_states, weight, weight.shape[0])
++        projected_states_ba, _ = self.in_proj_ba(hidden_states)
++        return projected_states_ba
++
+     def forward_cpu(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_compile_ops.py b/vllm/models/qwen4_exp/nvidia/b70_compile_ops.py
+new file mode 100644
+index 0000000000..71d72e45bc
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/b70_compile_ops.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-TC: opaque custom ops so the XPU Qwen4Exp target can run under VLLM_COMPILE.
++
++Off unless B70_TORCH_COMPILE=1 (read at import). With it unset, nothing here is
++reached and the model is the upstream breakable-graph build.
++
++Why ops and not plain tracing: vLLM compiles with guards dropped, so every
++Python branch on a batch dimension is frozen at the trace size (the profile
++run, 4096 rows). The B70 HC, GDN-gate and PLE paths dispatch on row count
++(fixed-order DFlash2 HC down GEMM <= B70_HC_ORDERED_MAX_ROWS, astra HC up at
++<= 8 rows, parallel HC GEMM at <= 32 rows, ordered in_proj_ba above 8 rows) and
++PLE keeps host-side state. Behind an op the branch runs at call time with the
++real width; Inductor fuses the glue around the ops.
++
++PLE is a splitting op (listed in CompilationConfig._attention_ops): its short
++conv reads per-request metadata, like attention, so it must stay outside the
++PIECEWISE graphs. HC and the GDN gate are graph-safe kernels, not splitting ops.
++"""
++
++import os
++
++import torch
++from torch import nn
++
++from vllm.utils.torch_utils import direct_register_custom_op
++
++ENABLED = os.environ.get("B70_TORCH_COMPILE", "0") == "1"
++
++_MODULES: dict[str, nn.Module] = {}
++
++
++def register(name: str, module: nn.Module) -> None:
++    if ENABLED:
++        if name in _MODULES and _MODULES[name] is not module:
++            raise RuntimeError(f"B70-TC: duplicate module name {name!r}")
++        _MODULES[name] = module
++
++
++def compile_enabled(vllm_config) -> bool:  # support_torch_compile(enable_if=...)
++    return ENABLED
++
++
++# -- HC mix / combine_and_mix ------------------------------------------------
++def _hc_mix(hidden_states: torch.Tensor, layer_name: str) -> list[torch.Tensor]:
++    m = _MODULES[layer_name]
++    _, block_input, injection = m._mix_eager(hidden_states)
++    if injection is None:
++        injection = hidden_states.new_empty((hidden_states.shape[0], 0))
++    return [block_input, injection]
++
++
++def _hc_mix_fake(hidden_states: torch.Tensor, layer_name: str) -> list[torch.Tensor]:
++    m = _MODULES[layer_name]
++    t = hidden_states.shape[0]
++    block_input = hidden_states.new_empty((t, m.hidden_size))
++    if not m.use_combine:
++        return [block_input, hidden_states.new_empty((t, 0))]
++    # Same strides as the real split view of the merged down projection.
++    down = hidden_states.new_empty((t, m.lora_rank + m.hc_count + m.pad_size))
++    return [block_input, down[:, m.lora_rank : m.lora_rank + m.hc_count]]
++
++
++def _hc_combine_and_mix(
++    hidden_states: torch.Tensor,
++    prev_block_output: torch.Tensor,
++    prev_injection: torch.Tensor | None,
++    layer_name: str,
++) -> list[torch.Tensor]:
++    m = _MODULES[layer_name]
++    out, block_input, injection = m._combine_and_mix_eager(
++        hidden_states, prev_block_output, prev_injection
++    )
++    if injection is None:
++        injection = hidden_states.new_empty((hidden_states.shape[0], 0))
++    return [out, block_input, injection]
++
++
++def _hc_combine_and_mix_fake(
++    hidden_states: torch.Tensor,
++    prev_block_output: torch.Tensor,
++    prev_injection: torch.Tensor | None,
++    layer_name: str,
++) -> list[torch.Tensor]:
++    return [torch.empty_like(hidden_states, memory_format=torch.contiguous_format)] + (
++        _hc_mix_fake(hidden_states, layer_name)
++    )
++
++
++direct_register_custom_op(
++    op_name="b70_hc_mix", op_func=_hc_mix, mutates_args=[], fake_impl=_hc_mix_fake
++)
++direct_register_custom_op(
++    op_name="b70_hc_combine_and_mix",
++    op_func=_hc_combine_and_mix,
++    mutates_args=[],
++    fake_impl=_hc_combine_and_mix_fake,
++)
++
++
++# -- GDN in_proj_ba (size-dispatched: F.linear <= 8 rows, ordered Triton above) --
++def _gdn_in_proj_ba(
++    hidden_states: torch.Tensor, out_features: int, layer_name: str
++) -> torch.Tensor:
++    return _MODULES[layer_name]._b70_in_proj_ba_eager(hidden_states)
++
++
++def _gdn_in_proj_ba_fake(
++    hidden_states: torch.Tensor, out_features: int, layer_name: str
++) -> torch.Tensor:
++    return hidden_states.new_empty((hidden_states.shape[0], out_features))
++
++
++direct_register_custom_op(
++    op_name="b70_gdn_in_proj_ba",
++    op_func=_gdn_in_proj_ba,
++    mutates_args=[],
++    fake_impl=_gdn_in_proj_ba_fake,
++)
++
++
++# -- PLE layer (splitting op; writes graph-owned storage) ---------------------
++def _qwen4_exp_ple(
++    hidden_states: torch.Tensor,
++    input_ids: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    ngram_context: torch.Tensor,
++    output: torch.Tensor,
++    layer_name: str,
++) -> None:
++    output.copy_(
++        _MODULES[layer_name](hidden_states, input_ids, query_start_loc, ngram_context)
++    )
++
++
++def _qwen4_exp_ple_fake(
++    hidden_states: torch.Tensor,
++    input_ids: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    ngram_context: torch.Tensor,
++    output: torch.Tensor,
++    layer_name: str,
++) -> None:
++    return None
++
++
++direct_register_custom_op(
++    op_name="b70_qwen4_exp_ple",
++    op_func=_qwen4_exp_ple,
++    mutates_args=["output"],
++    fake_impl=_qwen4_exp_ple_fake,
++)
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index 48f70620c2..bec384dd6a 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -41,6 +41,7 @@ from ..common.hyperconnection import (
+     GroupedGemmaRMSNorm,
+     HyperConnectionConfig,
+ )
++from . import b70_compile_ops
+ from .ops.hc import (
+     grouped_gemma_rmsnorm,
+     hc_combine,
+@@ -120,6 +121,9 @@ class GatedResidual(nn.Module):
+         self.use_combine = use_combine
+         self._astra_hc_up_weight = None
+         self._astra_hc_up_prepared = False
++        # B70-TC: name for the opaque compile ops (no-op unless B70_TORCH_COMPILE=1).
++        self._b70_layer_name = prefix
++        b70_compile_ops.register(prefix, self)
+         spec = get_current_vllm_config().speculative_config
+         self._ordered_hc = (
+             spec is not None
+@@ -276,6 +280,12 @@ class GatedResidual(nn.Module):
+     def mix(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        if b70_compile_ops.ENABLED and torch.compiler.is_compiling():
++            # B70-TC: row-count dispatch runs at call time, not at trace time.
++            block_input, injection = torch.ops.vllm.b70_hc_mix(
++                hidden_states, self._b70_layer_name
++            )
++            return hidden_states, block_input, (injection if self.use_combine else None)
+         if self._ordered_hc:
+             from .b70_c1_graph import replay_hc
+ 
+@@ -312,6 +322,11 @@ class GatedResidual(nn.Module):
+         prev_block_output: torch.Tensor,
+         prev_injection: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        if b70_compile_ops.ENABLED and torch.compiler.is_compiling():
++            out, block_input, injection = torch.ops.vllm.b70_hc_combine_and_mix(
++                hidden_states, prev_block_output, prev_injection, self._b70_layer_name
++            )
++            return out, block_input, (injection if self.use_combine else None)
+         if self._ordered_hc:
+             from .b70_c1_graph import replay_hc
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index f138ebba07..5f402f2990 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -7,6 +7,8 @@ from itertools import islice
+ 
+ import torch
+ from torch import nn
++
++from vllm.compilation.decorators import support_torch_compile
+ from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
+ 
+ from vllm import envs
+@@ -85,6 +87,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+ if current_platform.is_xpu():
++    from . import b70_compile_ops
+     from .b70_hyperconnection import GatedResidual, HyperConnectionConfig
+ else:
+     from .hyperconnection import GatedResidual, HyperConnectionConfig
+@@ -236,6 +239,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
+                 prefix=f"{prefix}.ple",
+                 use_sequence_parallel=self.use_hc_sequence_parallel,
+             )
++            if current_platform.is_xpu():
++                b70_compile_ops.register(f"{prefix}.ple", self.ple)
+ 
+         if layer_type == "linear_attention":
+             self.linear_attn = QwenGatedDeltaNetAttention(
+@@ -316,12 +321,30 @@ class Qwen4ExpDecoderLayer(nn.Module):
+ 
+             if input_ids is None or query_start_loc is None or ngram_context is None:
+                 raise RuntimeError("PLE inputs were not prepared")
+-            hidden_states = self.ple(
+-                hidden_states,
+-                input_ids,
+-                query_start_loc,
+-                ngram_context,
+-            )
++            if (
++                current_platform.is_xpu()
++                and b70_compile_ops.ENABLED
++                and torch.compiler.is_compiling()
++            ):
++                # B70-TC: PLE is a splitting op (host-prepared rows, per-request
++                # short-conv state); it writes graph-owned storage.
++                ple_out = torch.empty_like(hidden_states)
++                torch.ops.vllm.b70_qwen4_exp_ple(
++                    hidden_states,
++                    input_ids,
++                    query_start_loc,
++                    ngram_context,
++                    ple_out,
++                    self.ple.prefix,
++                )
++                hidden_states = ple_out
++            else:
++                hidden_states = self.ple(
++                    hidden_states,
++                    input_ids,
++                    query_start_loc,
++                    ngram_context,
++                )
+ 
+         # Fuse a pending combine with this HC module's mix when possible.
+         if prev_block_output is not None:
+@@ -421,6 +444,24 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
+             moe.experts.update_expert_map()
+ 
+ 
++def _b70_compile_enabled(vllm_config: VllmConfig) -> bool:
++    # B70-TC: upstream #55272 removed torch.compile for this implementation;
++    # B70_TORCH_COMPILE=1 restores it on XPU through b70_compile_ops.
++    return current_platform.is_xpu() and b70_compile_ops.ENABLED
++
++
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++        "query_start_loc": 0,
++        "ngram_context": 0,
++        "deepstack_input_embeds": 0,
++    },
++    enable_if=_b70_compile_enabled,
++)
+ class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
+     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+ 

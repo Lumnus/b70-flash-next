@@ -1,0 +1,105 @@
+From 34e029db70904dbc47ec871898601040de923794 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Wed, 21 Oct 2026 22:19:15 +0800
+Subject: [PATCH 21/51] [XPU] Enable spec-decode adaptive verification without
+ a confidence head (#62244)
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+Co-authored-by: vllm-agent <claw@inferact.ai>
+---
+ .../spec_decode/test_acceptance_estimator.py  | 19 +++++++++++--------
+ vllm/v1/attention/backends/flash_attn.py      |  2 +-
+ 2 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_acceptance_estimator.py b/tests/v1/spec_decode/test_acceptance_estimator.py
+index 18ab172706..41e42a1b19 100644
+--- a/tests/v1/spec_decode/test_acceptance_estimator.py
++++ b/tests/v1/spec_decode/test_acceptance_estimator.py
+@@ -12,6 +12,7 @@ metrics to hint at.
+ import pytest
+ import torch
+ 
++from vllm.platforms import current_platform
+ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+     OnlineAcceptanceEstimator,
+     _accumulate_kernel,
+@@ -19,8 +20,10 @@ from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+ )
+ 
+ pytest.importorskip("triton")
+-if not torch.cuda.is_available():
+-    pytest.skip("CUDA required for acceptance estimator tests", allow_module_level=True)
++if not current_platform.is_cuda_alike() and not current_platform.is_xpu():
++    pytest.skip(
++        "CUDA/XPU required for acceptance estimator tests", allow_module_level=True
++    )
+ 
+ MAX_NUM_REQS = 16
+ NUM_STEPS = 4
+@@ -63,7 +66,7 @@ def test_predict_agrees_across_slot_and_batch_order(tokens_per_req: int):
+     Which one it is is inferred from whether the draft step is per-row, so the
+     two cases differ only in how ``draft_step`` is shaped.
+     """
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     torch.manual_seed(0)
+     estimator = _make_estimator(device)
+     num_reqs = 5
+@@ -103,7 +106,7 @@ def test_predict_agrees_across_slot_and_batch_order(tokens_per_req: int):
+ 
+ def test_predict_skips_cudagraph_padded_rows():
+     """Padded rows carry slot -1 and must not land on a live request."""
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     torch.manual_seed(0)
+     estimator = _make_estimator(device)
+     num_reqs, num_padded = 3, 6
+@@ -159,7 +162,7 @@ def test_refit_recovers_a_shared_slope_and_per_position_intercepts():
+     so the arrowhead solve is only correct if it recovers both from data whose
+     positions differ in level but not in slope.
+     """
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     torch.manual_seed(0)
+     true_slope = 0.6
+     true_bias = torch.tensor([1.4, 0.9, 0.4, -0.1], device=device)
+@@ -191,7 +194,7 @@ def test_refit_survives_a_position_with_no_observations():
+     Its statistics stay zero while the others accumulate, which is the degenerate
+     case the arrowhead denominator has to tolerate.
+     """
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     torch.manual_seed(0)
+     estimator = OnlineAcceptanceEstimator(REFIT_NUM_REQS, NUM_STEPS, device)
+     estimator.REFIT_INTERVAL = 5
+@@ -222,7 +225,7 @@ def test_step_damping_scales_with_the_evidence():
+     isolates the damping factor n / (n + DAMPING_OBSERVATIONS). The slope/
+     intercept coupling is zeroed so the two parameters can be checked apart.
+     """
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     damping = OnlineAcceptanceEstimator.DAMPING_OBSERVATIONS
+     per_position_n = 20.0
+ 
+@@ -270,7 +273,7 @@ def test_feature_ignores_which_token_was_drawn():
+     takes no token argument, and this pins that -- two rows with identical
+     logits must score identically no matter what was sampled from them.
+     """
+-    device = torch.device("cuda")
++    device = current_platform.device_type
+     torch.manual_seed(0)
+     estimator = _make_estimator(device)
+ 
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 85acdabf00..f3db539c9a 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -613,7 +613,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+     #  https://github.com/vllm-project/vllm/issues/22945
+     _cudagraph_support = (
+         AttentionCGSupport.ALWAYS
+-        if get_flash_attn_version() == 3
++        if get_flash_attn_version() == 3 or current_platform.is_xpu()
+         else AttentionCGSupport.UNIFORM_BATCH
+     )
+     supports_update_block_table: bool = True

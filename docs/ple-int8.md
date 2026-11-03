@@ -1,9 +1,14 @@
-# The PLE n-gram table in INT8 (patch 0008)
+# The PLE n-gram table in INT8 (patch 0008, and `vllm-v6` 0034, 0039)
 
 Qwen3.8-Flash-Next carries a per-layer-embedding (PLE) n-gram table: 320 M rows × 160 values, looked up 16 times per
 token (orders 2 and 3 × 8 heads). In BF16 it is 95.4 GiB. wu1ff's patch 0002 keeps it in pinned host RAM, split per TP
 rank into two slabs, and gathers the rows over UVA inside the captured graphs. 0006 fills those slabs without the
 pageable intermediate copy; 0007 (FP8) and 0008 (INT8) shrink them.
+
+On the 0.32 line the same table also runs natively in pinned host RAM (`B70_PLE_INT8=1`, `vllm-v6` 0034, no UVA slabs), with
+the row gather on the device inside the graph (`B70_PLE_DEVICE_GATHER=1`, 0039; the first step compares its bytes with the host
+path) and the n-gram ids hashed on the host (`B70_PLE_HOST_IDS=1`). The 4-card presets run that form; the 2-card presets serve the
+table from NVMe ([ple-nvme.md](ple-nvme.md)). The format and the measurements below are the same.
 
 ## Format
 
@@ -43,8 +48,7 @@ with zero top-1 changes and zero answer changes (MMLU, TruthfulQA, needles, docu
 ## Use
 
 ```
-B70_PLE_DIRECT_PINNED=1
-B70_PLE_INT8=1
+B70_PLE_INT8=1                       # 0.30 series: also B70_PLE_DIRECT_PINNED=1
 B70_PLE_INT8_PATH=/models/qwen3.8-flash-next/int8-ple/ple_ngram_int8_rowscale.safetensors
 PLE_TABLE_PATH=/models/qwen3.8-flash-next/W4A16/ple_table_qwen4exp.pt   # optional: boot cross-check
 ```

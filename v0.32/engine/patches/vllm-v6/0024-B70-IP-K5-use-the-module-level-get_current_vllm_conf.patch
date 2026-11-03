@@ -1,0 +1,24 @@
+From 06ec86f43bdd3f24bfdf556a6a5c8ec1c0a7b9cb Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 23:05:52 +0000
+Subject: [PATCH 24/51] B70-IP-K5: use the module-level
+ get_current_vllm_config_or_none (local import shadowed it: UnboundLocalError
+ on non-XPU)
+
+---
+ vllm/v1/attention/backends/flash_attn.py | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index a2b591987e..34b99132a0 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -1108,8 +1108,6 @@ class FlashAttentionImpl(AttentionImpl):
+         # current here, not at forward).
+         self._b70_max_model_len = None
+         if current_platform.is_xpu():
+-            from vllm.config import get_current_vllm_config_or_none
+-
+             _cfg = get_current_vllm_config_or_none()
+             if _cfg is not None and _cfg.model_config is not None:
+                 self._b70_max_model_len = _cfg.model_config.max_model_len

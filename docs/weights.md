@@ -1,13 +1,14 @@
 # Weights: Intel AutoRound, AWQ or devan W4A16
 
-Three 4-bit checkpoints of Qwen3.8-Flash-Next run on the 0.30 series. We serve and recommend Intel's AutoRound build:
-on the 0.30 line 2026-10-02 to 04 and 2026-10-07 to 23 (about 15 days of serving, the longest engine 8 days 6 hours),
-and on the 0.32 line since 2026-10-24 (the only build measured there, [its model page](../v0.32/models/qwen38-flash-next/meta.md)).
-This page is about Qwen3.8-Flash-Next; the 0.32 line's other models pin their weights on their own pages
+Three 4-bit checkpoints of Qwen3.8-Flash-Next run on the engine. We serve and recommend Intel's AutoRound build: it is the
+only one the 0.32 presets pin ([model page](../v0.32/models/qwen38-flash-next/meta.md#weights), which also lists the INT8 PLE table and the
+drafters), and on the 0.30 line it served 2026-10-02 to 04 and 2026-10-07 to 23 (about 15 days, the longest engine 8 days 6 hours).
+The AWQ and devan comparison below, and the serve configs it names under `v0.30/`, are from the 0.30 series.
+The 0.32 line's other models pin their weights on their own pages
 ([Qwen3.8-27B](../v0.32/models/qwen38-27b/meta.md), [Qwen3.6-35B-A3B](../v0.32/models/qwen36-35b-a3b/meta.md)). The
 AWQ build (served 2026-09-30 to 2026-10-07; 3 days 16 hours in one engine with MTP and kernels b70.3) is validated too
 and is the alternative; devan's W4A16 (from 2026-09-28) is the reference. Minachist's recalibrated experts, repacked
-into Intel's checkpoint (`tools/minachist_repack.py`), are a supported variant ([README, Models](../README.md#models)). [v0.30/README.md](../v0.30/README.md#models) ranks them
+into Intel's checkpoint (`tools/minachist_repack.py`), are a supported variant. [v0.30/README.md](../v0.30/README.md#models) ranks them
 and says why; the numbers are in [v0.30/docs/measurements/b70.2.md](../v0.30/docs/measurements/b70.2.md).
 
 ## Intel AutoRound (`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` @ `4c67bf68`)
@@ -21,7 +22,7 @@ and says why; the numbers are in [v0.30/docs/measurements/b70.2.md](../v0.30/doc
 | QSA indexer weights | shipped; unused on the dense-QSA config (0019/0020 skip them, the snapshot drops them) |
 | MTP head | BF16, in `model_extra_tensors.safetensors` |
 | license | qwen-community-1.0 (card) |
-| what the series needs | patch 0028 (the PLE embedding accepts the INC config), a snapshot made with `tools/intel_snapshot.py`, `v0.30/engines/serve-config-intel-autoround.json` |
+| what the series needs | patch 0028 (the PLE embedding accepts the INC config), a snapshot made with `tools/intel_snapshot.py`, `v0.32/models/qwen38-flash-next/serve-config-dense.json` or `serve-config-qsa.json` (the 0.30 form: `v0.30/engines/serve-config-intel-autoround.json`) |
 
 **How it loads.** vLLM maps `auto-round` to its INC config. The 48 routed-expert layers go through the GPTQ MoE path to
 the XPU WNA16 backend (`XPUExpertsWNA16`), the same int4 kernel and weight key as the AWQ build; the repack drops the

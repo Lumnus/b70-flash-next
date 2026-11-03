@@ -1,0 +1,463 @@
+From ba5bdf9b9f384509a1c75118e2744170b6dcbfea Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 10:35:06 +0000
+Subject: [PATCH 42/51] B70-V2-MOE: EP sentinel + rows_per_expert zero in one
+ Triton kernel, dead padding mask dropped (B70_MOE_KCUT=1)
+
+After the EP sentinel rewrite every topk id is >= 0, so the (ids<0).all(1) + masked_fill in
+XpuFusedMoe._apply_kernel and the W4A8 cutlass apply is the identity. One launch replaces
+compare/fill/where + compare/reduce/D2D/masked_fill + zeros: 7 kernels per MoE layer, 336 per
+c=1 step. Replicas of the wheel bodies arm only on a matching AST fingerprint (v6).
+Default off; bitwise-identical (CPU tests, NaN padding rows included).
+---
+ .../layers/fused_moe/b70_moe_kcut.py          | 351 ++++++++++++++++++
+ .../layers/fused_moe/b70_moe_w4a8.py          |  18 +-
+ .../layers/fused_moe/experts/xpu_moe.py       |  24 +-
+ 3 files changed, 388 insertions(+), 5 deletions(-)
+ create mode 100644 vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
+
+diff --git a/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py b/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
+new file mode 100644
+index 0000000000..f6d738106d
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/b70_moe_kcut.py
+@@ -0,0 +1,351 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-V2-MOE: fewer small kernels around the XPU EP MoE (B70_MOE_KCUT=1, default off).
++
++Per MoE layer the stock EP path launches, around the routing:
++
++1. ``torch.where(topk_ids < 0, sentinel, topk_ids)`` (xpu_moe.py): compare, scalar
++   fill, where = 3 kernels;
++2. ``(topk_ids < 0).all(1)`` + out-of-place ``masked_fill`` (XpuFusedMoe._apply_kernel
++   and both W4A8 applies): compare, reduce, D2D copy, masked fill = 4 kernels;
++3. ``torch.zeros(rows_per_expert)``: 1 fill.
++
++With B70_MOE_KCUT=1 one Triton kernel writes the sentinel-mapped ids AND zeroes a
++fresh ``rows_per_expert``. Step 2 is dropped only where it is provably dead: after
++the sentinel rewrite every id is >= 0 (the sentinel is 0 or E-1), so
++``(ids < 0).all(1)`` is False on every row and the masked_fill is the identity. Rows
++that a FULL-graph replay pads (any hidden content, NaN included) are routed exactly
++as on the stock path: the ids are the same integers, the remap skips the sentinel
++expert on this rank. 8 kernels -> 1 per layer, bitwise-identical output.
++
++The stock bodies live in the vllm_xpu_kernels wheel. The replicas below are stock
++minus steps 2 and 3. Each one is armed only if the AST fingerprint of the wheel
++function it replaces equals the one it was copied from (``_FP``); a different wheel
++(e.g. a new W4A8 apply) logs once and keeps the wheel's own function.
++"""
++
++import ast
++import hashlib
++import inspect
++import os
++import textwrap
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++
++# AST fingerprints of the wheel functions the replicas were copied from
++# (the v6 vllm_xpu_kernels wheel).
++_FP = {
++    "XpuFusedMoe._apply_kernel": "32c13063d42ad5ae",
++    "b70_moe_w4a8.apply": "8e77c64b832b5251",
++}
++
++_ENABLED = os.environ.get("B70_MOE_KCUT", "0") == "1"
++_LOGGED: set[str] = set()
++
++
++def enabled() -> bool:
++    return _ENABLED
++
++
++def _log_once(key: str, msg: str, *args) -> None:
++    if key not in _LOGGED:
++        _LOGGED.add(key)
++        logger.info(msg, *args)
++
++
++def fingerprint_node(node: ast.AST) -> str:
++    return hashlib.sha256(ast.dump(node).encode()).hexdigest()[:16]
++
++
++def fingerprint(func) -> str:
++    """AST fingerprint of a function (line numbers and comments excluded)."""
++    src = textwrap.dedent(inspect.getsource(func))
++    tree = ast.parse(src)
++    return fingerprint_node(tree.body[0])
++
++
++_FP_OK: dict[str, bool] = {}
++
++
++def _armed(key: str, func) -> bool:
++    ok = _FP_OK.get(key)
++    if ok is None:
++        try:
++            got = fingerprint(func)
++        except (OSError, TypeError, SyntaxError) as e:
++            got = f"unreadable ({e})"
++        ok = got == _FP[key]
++        _FP_OK[key] = ok
++        if not ok:
++            logger.warning(
++                "B70-V2-MOE: %s fingerprint %s != %s (wheel changed); "
++                "the wheel's own function runs",
++                key,
++                got,
++                _FP[key],
++            )
++    return ok
++
++
++# n_ids is not specialised: one compiled variant serves every batch size.
++@triton.jit(do_not_specialize=["n_ids"])
++def _sentinel_zero_kernel(
++    ids_ptr, out_ptr, n_ids, sentinel, rpe_ptr, n_exp, BLOCK: tl.constexpr
++):
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    m = offs < n_ids
++    x = tl.load(ids_ptr + offs, mask=m, other=0)
++    tl.store(out_ptr + offs, tl.where(x < 0, sentinel, x).to(x.dtype), mask=m)
++    tl.store(rpe_ptr + offs, tl.zeros([BLOCK], dtype=tl.int32), mask=offs < n_exp)
++
++
++def sentinel_and_zero(topk_ids: torch.Tensor, sentinel: int, num_local_experts: int):
++    """where(ids < 0, sentinel, ids) and a zeroed int32 rows_per_expert, one launch."""
++    ids = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
++    out = torch.empty_like(ids)
++    rpe = torch.empty((num_local_experts,), dtype=torch.int32, device=ids.device)
++    n = ids.numel()
++    block = 256
++    grid = (max(triton.cdiv(n, block), triton.cdiv(num_local_experts, block), 1),)
++    _sentinel_zero_kernel[grid](
++        ids, out, n, sentinel, rpe, num_local_experts, BLOCK=block, num_warps=1
++    )
++    _log_once(
++        "on",
++        "B70-V2-MOE: EP sentinel + rows_per_expert zero in one kernel; "
++        "dead padding mask "
++        "skipped (B70_MOE_KCUT=1)",
++    )
++    return out.view(topk_ids.shape), rpe
++
++
++def stock_kernel_ok(impl, a1q_scale) -> bool:
++    """The replica of XpuFusedMoe._apply_kernel may run for this call."""
++    if getattr(impl, "_use_ref", True):
++        return False
++    return _armed("XpuFusedMoe._apply_kernel", type(impl)._apply_kernel)
++
++
++def apply_kernel(
++    impl,
++    output,
++    hidden_states,
++    topk_weights,
++    topk_ids,
++    rows_per_expert,
++    expert_map=None,
++    a1q_scale=None,
++):
++    """XpuFusedMoe._apply_kernel without the padding mask (dead after the sentinel
++    rewrite), with ``rows_per_expert`` zeroed by the caller. Otherwise the wheel's
++    body verbatim."""
++    from vllm_xpu_kernels import fused_moe_interface as fmi
++
++    self = impl
++    num_rows, hidden_size = hidden_states.shape
++    num_moe_inputs = self.n_experts_per_token * num_rows
++    act_quant = a1q_scale is not None
++
++    if expert_map is None and self.ep_size > 1:
++        expert_map = self.expert_map
++
++    if act_quant:
++        remapped_scales = torch.empty(
++            (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
++            dtype=a1q_scale.dtype,
++            device=a1q_scale.device,
++        )
++    else:
++        remapped_scales = None
++    remapped_hidden_states = torch.empty(
++        (num_rows * self.n_experts_per_token, hidden_size),
++        dtype=hidden_states.dtype,
++        device=hidden_states.device,
++    )
++
++    # [stock: invalid_padding_rows mask + masked_fill; dead, see module doc]
++    # [stock: rows_per_expert = torch.zeros(...); zeroed by sentinel_and_zero]
++    unpermuted_row_to_permuted_row = torch.empty(
++        (num_rows, self.n_experts_per_token),
++        dtype=torch.int32,
++        device=hidden_states.device,
++    )
++
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=hidden_states,
++        hidden_states_scales=a1q_scale,
++        remapped_hidden_states=remapped_hidden_states,
++        remapped_hidden_states_scales=remapped_scales,
++        expert_map=expert_map,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
++        topk_ids=topk_ids,
++        total_experts_num=self.total_experts_num,
++        local_experts_num=self.local_experts_num,
++    )
++
++    if remapped_scales is not None and self.is_mxfp8:
++        remapped_hidden_states = fmi.dequant_mxfp8(
++            remapped_hidden_states, remapped_scales
++        ).to(output.dtype)
++        remapped_scales = None
++    elif remapped_scales is not None and self.is_block_fp8:
++        remapped_hidden_states = fmi.dequant_fp8_block_act(
++            remapped_hidden_states, remapped_scales
++        ).to(output.dtype)
++        remapped_scales = None
++
++    gemm1_output = torch.empty(
++        (num_moe_inputs, 2 * self.inter_size), dtype=output.dtype, device=output.device
++    )
++    self._grouped_gemm(
++        remapped_hidden_states,
++        remapped_scales,
++        self.w13,
++        self.gemm1_wei_scales,
++        self.w13_bias,
++        gemm1_output,
++        rows_per_expert,
++        2 * self.inter_size,
++        hidden_size,
++    )
++
++    if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
++        gate = gemm1_output[:, : self.inter_size]
++        up = gemm1_output[:, self.inter_size :]
++        gate.clamp_(max=self.gemm1_clamp_limit)
++        up.clamp_(min=-self.gemm1_clamp_limit, max=self.gemm1_clamp_limit)
++
++    act_output = torch.empty(
++        (num_moe_inputs, self.inter_size * self.inter_size_scale),
++        dtype=gemm1_output.dtype,
++        device=gemm1_output.device,
++    )
++    if self.activation == "situ":
++        self.act_func(
++            act_output,
++            gemm1_output,
++            self.activation_situ_beta,
++            -1.0
++            if self.activation_situ_linear_beta is None
++            else self.activation_situ_linear_beta,
++        )
++    else:
++        self.act_func(act_output, gemm1_output)
++
++    gemm2_output = torch.empty(
++        (num_moe_inputs, hidden_size), dtype=output.dtype, device=output.device
++    )
++
++    if act_quant:
++        act_output, gemm2_act_scale = fmi.quant_act_xpu(act_output, self.recipe)
++        if self.is_mxfp8 and gemm2_act_scale is not None:
++            act_output = fmi.dequant_mxfp8(act_output, gemm2_act_scale).to(output.dtype)
++            gemm2_act_scale = None
++        elif self.is_block_fp8 and gemm2_act_scale is not None:
++            act_output = fmi.dequant_fp8_block_act(act_output, gemm2_act_scale).to(
++                output.dtype
++            )
++            gemm2_act_scale = None
++    else:
++        gemm2_act_scale = None
++    self._grouped_gemm(
++        act_output,
++        gemm2_act_scale,
++        self.w2,
++        self.gemm2_wei_scales,
++        self.w2_bias,
++        gemm2_output,
++        rows_per_expert,
++        hidden_size,
++        self.inter_size * self.inter_size_scale,
++    )
++
++    torch.ops._moe_C.moe_gather(
++        output,
++        gemm2_output,
++        topk_weights,
++        unpermuted_row_to_permuted_row,
++        self.num_experts,
++    )
++
++
++def w4a8_cutlass_ok(mod) -> bool:
++    return _armed("b70_moe_w4a8.apply", mod.apply)
++
++
++def apply_w4a8_cutlass(
++    mod,
++    impl,
++    output,
++    hidden_states,
++    topk_weights,
++    topk_ids,
++    rows_per_expert,
++    expert_map=None,
++) -> None:
++    """vllm_xpu_kernels.b70_moe_w4a8.apply without the dead padding mask and with
++    ``rows_per_expert`` zeroed by the caller. The GEMM, quant and gather calls are
++    the wheel's."""
++    op = mod.load_op()
++    num_rows, hidden = hidden_states.shape
++    topk = impl.n_experts_per_token
++    n_moe = num_rows * topk
++    inter = impl.inter_size
++    dev = hidden_states.device
++    if expert_map is None and impl.ep_size > 1:
++        expert_map = impl.expert_map
++    # [stock: invalid mask + masked_fill; dead, see module doc]
++    hq, hsc = mod.quant_rows(hidden_states)
++    remapped = torch.empty((n_moe, hidden), dtype=torch.float8_e4m3fn, device=dev)
++    remapped_sc = torch.empty((n_moe, 1), dtype=torch.float32, device=dev)
++    # [stock: rows_per_expert = torch.zeros(...); zeroed by sentinel_and_zero]
++    unp = torch.empty((num_rows, topk), dtype=torch.int32, device=dev)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=hq.view(torch.float8_e4m3fn),
++        hidden_states_scales=hsc,
++        remapped_hidden_states=remapped,
++        remapped_hidden_states_scales=remapped_sc,
++        expert_map=expert_map,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unp,
++        topk_ids=topk_ids,
++        total_experts_num=impl.total_experts_num,
++        local_experts_num=impl.local_experts_num,
++    )
++
++    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
++    op(
++        remapped.view(torch.int8),
++        remapped_sc,
++        impl.w13,
++        impl.gemm1_wei_scales,
++        impl.w13_bias,
++        g1,
++        rows_per_expert,
++        2 * inter,
++        hidden,
++        impl.num_experts,
++    )
++    act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
++    impl.act_func(act, g1)
++    aq, asc = mod.quant_rows(act)
++    g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
++    op(
++        aq,
++        asc,
++        impl.w2,
++        impl.gemm2_wei_scales,
++        impl.w2_bias,
++        g2,
++        rows_per_expert,
++        hidden,
++        inter,
++        impl.num_experts,
++    )
++    torch.ops._moe_C.moe_gather(output, g2, topk_weights, unp, impl.num_experts)
+diff --git a/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py b/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
+index a373464ffa..0bdbc457d4 100644
+--- a/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
++++ b/vllm/model_executor/layers/fused_moe/b70_moe_w4a8.py
+@@ -403,7 +403,8 @@ _LOGGED = False
+ _LOGGED_CUTLASS = False
+ 
+ 
+-def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
++def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids,
++                         rows_per_expert=None) -> bool:
+     global _LOGGED_CUTLASS
+     mod = _cutlass()
+     ok = getattr(impl, "_b70_w4a8_cutlass_ok", None)
+@@ -419,18 +420,29 @@ def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids) ->
+         _LOGGED_CUTLASS = True
+         logger.info("B70-IP-L: MoE W4A8 on (cutlass s8 x s4 DPAS): int4 g128 weights as stored, int8 "
+                     "per-token activations, batches >= %d tokens (B70_MOE_W4A8_MIN_TOKENS)", min_tokens())
++    if rows_per_expert is not None:
++        from vllm.model_executor.layers.fused_moe import b70_moe_kcut as _kcut
++
++        if _kcut.w4a8_cutlass_ok(mod):
++            # B70-V2-MOE: same GEMM/quant/gather calls; dead mask and zero fill dropped.
++            _kcut.apply_w4a8_cutlass(
++                mod, impl, output, hidden_states, topk_weights, topk_ids, rows_per_expert
++            )
++            return True
+     mod.apply(impl, output, hidden_states, topk_weights, topk_ids)
+     return True
+ 
+ 
+-def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
++def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids,
++                rows_per_expert=None) -> bool:
+     """W4A8 when B70_MOE_W4A8=1, the batch has >= B70_MOE_W4A8_MIN_TOKENS tokens and ``impl`` is a
+     plain int4 g128 SiLU XpuFusedMoe; False = caller runs the stock path."""
+     global _LOGGED
+     if not enabled() or hidden_states.shape[0] < min_tokens():
+         return False
+     if cutlass_mode():
+-        return _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids)
++        return _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids,
++                                    rows_per_expert)
+     ok = getattr(impl, "_b70_w4a8_ok", None)
+     if ok is None:
+         why = eligible(impl)
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index 7a54278a30..1916cacdeb 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -184,15 +184,35 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+             output, hidden_states, topk_weights, topk_ids, activation, expert_map
+         ):
+             return
++        from vllm.model_executor.layers.fused_moe import b70_moe_kcut as _kcut
++
++        # B70-V2-MOE: rows_per_expert zeroed by the sentinel kernel (None: stock).
++        rows_per_expert = None
+         if (self.moe_config.ep_size > 1
+                 and getattr(self.fused_moe_impl, "_astra_groups", None) is None):
+             # Avoid topk_ids = -1, remap them to an
+             # expert not owned by this rank so they are skipped.
+             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
+-            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
++            if _kcut.enabled():
++                topk_ids, rows_per_expert = _kcut.sentinel_and_zero(
++                    topk_ids, sentinel, self.fused_moe_impl.num_experts
++                )
++            else:
++                topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+         from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
+ 
+-        if _w4a8.maybe_apply(self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids):
++        if _w4a8.maybe_apply(
++            self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids,
++            rows_per_expert=rows_per_expert,
++        ):
++            return
++        if rows_per_expert is not None and _kcut.stock_kernel_ok(
++            self.fused_moe_impl, a1q_scale
++        ):
++            _kcut.apply_kernel(
++                self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids,
++                rows_per_expert, a1q_scale=a1q_scale,
++            )
+             return
+         self.fused_moe_impl.apply(
+             output=output,

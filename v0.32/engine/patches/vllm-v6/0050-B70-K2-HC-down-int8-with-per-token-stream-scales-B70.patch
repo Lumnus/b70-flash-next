@@ -1,0 +1,926 @@
+From 01d33060a846db1fe124b5931b968fc5bf2b3dde Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sun, 1 Nov 2026 14:50:59 +0000
+Subject: [PATCH 50/51] B70-K2: HC down int8 with per-(token, stream) scales
+ (B70_HC_DOWN_INT8_STREAM_SCALE, default off)
+
+With B70_HC_DOWN_INT8=1: the combine/norm producers emit int8 + [M,4] scales per
+(token, stream); weights int8 per (row, stream); vLLM Triton split-K (exact int32
+per split, fixed-order fp32 sum, batch-invariant) feeding the V2 finish+silu (and
+the K2 HC up quant). Also B70_K2_HC_CAPTURE_DIR diagnostics dump of HC-down inputs.
+K2 producer kernels/tests: ruff format. CPU tests: 63 passed.
+---
+ tests/kernels/test_b70_k2_hc_stream.py        | 212 +++++++++++
+ tests/kernels/test_b70_k2_hc_wiring.py        |  16 +-
+ vllm/model_executor/layers/b70_i8_producer.py |  22 ++
+ .../qwen4_exp/nvidia/b70_hyperconnection.py   | 176 ++++++++-
+ vllm/models/qwen4_exp/nvidia/ops/hc_i8.py     | 354 +++++++++++++++++-
+ 5 files changed, 759 insertions(+), 21 deletions(-)
+ create mode 100644 tests/kernels/test_b70_k2_hc_stream.py
+
+diff --git a/tests/kernels/test_b70_k2_hc_stream.py b/tests/kernels/test_b70_k2_hc_stream.py
+new file mode 100644
+index 0000000000..469935948b
+--- /dev/null
++++ b/tests/kernels/test_b70_k2_hc_stream.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-K2 HC down int8 with per-(token, stream) scales: CPU tests (TRITON_INTERPRET=1).
++
++1. The quantizing norm producers equal hc_combine_norm / grouped_gemma_rmsnorm bitwise,
++   and their int8 rows / [M, 4] scales equal the XPU scaled_int8_quant reference per
++   (token, stream).
++2. The split-K GEMM equals an exact torch model of it (int64 dot per split, the same
++   fp32 scaling and fixed-order fp32 sum), bitwise; and is batch-invariant.
++3. GatedResidual with B70_HC_DOWN_INT8=1 + B70_HC_DOWN_INT8_STREAM_SCALE=1 runs it,
++   is batch-invariant, and stays close to the BF16 path.
++"""
++
++import importlib.util
++import os
++
++os.environ.setdefault("TRITON_INTERPRET", "1")
++os.environ["B70_I8_PRODUCER_QUANT"] = "1"
++os.environ["B70_HC_SILU_FUSE"] = "1"
++os.environ["B70_HC_ORDERED_MAX_ROWS"] = "32"
++os.environ["B70_HC_DOWN_INT8"] = "1"
++os.environ["B70_HC_DOWN_INT8_STREAM_SCALE"] = "1"
++
++import pytest  # noqa: E402
++import torch  # noqa: E402
++
++_spec = importlib.util.spec_from_file_location(
++    "k2_pq_base",
++    os.path.join(os.path.dirname(__file__), "test_b70_k2_producer_quant.py"),
++)
++base = importlib.util.module_from_spec(_spec)  # the bf16 interpreter patch + ref quant
++_spec.loader.exec_module(base)
++
++from vllm.model_executor.layers import b70_i8_producer as pq  # noqa: E402
++from vllm.models.qwen4_exp.nvidia.ops import hc, hc_i8  # noqa: E402
++
++HC, HS = 4, 2560
++
++
++def _gen(s):
++    return torch.Generator().manual_seed(s)
++
++
++def ref_group_quant(y, groups):
++    m, k = y.shape
++    q, s = base.ref_quant(y.reshape(m * groups, k // groups))
++    return q.reshape(m, k), s.reshape(m, groups)
++
++
++def stream_gains(g):
++    """Per-branch (1 + w) with stream gains ~0.4x .. 2.5x, like the deployed checkpoint."""
++    gains = torch.tensor([0.45, 0.6, 2.5, 0.5]).repeat_interleave(HS)
++    return ((gains - 1) + 0.05 * torch.randn(HC * HS, generator=g)).to(torch.bfloat16)
++
++
++@pytest.mark.parametrize("rows", [1, 8, 33])
++@pytest.mark.parametrize("with_inj", [True, False])
++def test_hc_combine_norm_quant(rows, with_inj):
++    g = _gen(rows + 10 * with_inj)
++    res = torch.randn(rows, HC * HS, generator=g).to(torch.bfloat16)
++    blk = torch.randn(rows, HS, generator=g).to(torch.bfloat16)
++    inj = torch.randn(rows, HC, generator=g).to(torch.bfloat16) if with_inj else None
++    w = stream_gains(g)
++    out, y, xq, xs = hc_i8.hc_combine_norm_quant(res, blk, inj, w, 1e-6, HC)
++    r_out, r_y = hc._hc_combine_norm(res, blk, inj, w, 1e-6, HC)
++    assert torch.equal(base.bits(out), base.bits(r_out))
++    assert torch.equal(base.bits(y), base.bits(r_y))
++    rq, rs = ref_group_quant(y, HC)
++    assert torch.equal(xs, rs) and torch.equal(xq, rq)
++
++
++@pytest.mark.parametrize("rows", [1, 8, 33])
++def test_grouped_gemma_rmsnorm_quant(rows):
++    g = _gen(50 + rows)
++    x = torch.randn(rows, HC * HS, generator=g).to(torch.bfloat16)
++    w = stream_gains(g)
++    y, xq, xs = hc_i8.grouped_gemma_rmsnorm_quant(x, w, 1e-6, HC)
++    assert torch.equal(
++        base.bits(y), base.bits(hc._grouped_gemma_rmsnorm(x, w, 1e-6, HC))
++    )
++    rq, rs = ref_group_quant(y, HC)
++    assert torch.equal(xs, rs) and torch.equal(xq, rq)
++    gq, gs = hc_i8.group_quant(y, HC)
++    assert torch.equal(gq, rq) and torch.equal(gs, rs)
++
++
++def exact_model(xq, xs, wq, ws, sps):
++    """The kernel's arithmetic in torch: int64 dot per split -> fp32 * xs * ws, fp32
++    sum over splits in order, bf16 store."""
++    m, k = xq.shape
++    g = xs.shape[1]
++    ks = k // (g * sps)
++    acc = torch.zeros(m, wq.shape[0], dtype=torch.float32)
++    for s in range(g * sps):
++        sl = slice(s * ks, (s + 1) * ks)
++        dot = (xq[:, sl].long() @ wq[:, sl].long().t()).to(torch.float32)
++        acc = acc + dot * xs[:, s // sps, None] * ws[None, :, s // sps]
++    return acc.to(torch.bfloat16)
++
++
++@pytest.mark.parametrize("rows", [1, 8, 32, 64])
++@pytest.mark.parametrize("sps", [1, 4])
++def test_hc_down_i8s_exact_and_batch_invariant(rows, sps):
++    g = _gen(100 + rows + sps)
++    x = (torch.randn(rows, HC * HS, generator=g) * (1 + stream_gains(g).float())).to(
++        torch.bfloat16
++    )
++    w = (torch.randn(336, HC * HS, generator=g) * 0.02).to(torch.bfloat16)
++    w[324:] = 0  # merged-weight padding rows
++    xq, xs = hc_i8.group_quant(x, HC)
++    wq, ws = hc_i8.quantize_weight_int8_grouped(w, HC)
++    out = hc_i8.hc_down_i8s(xq, xs, wq, ws, sps)
++    assert torch.equal(base.bits(out), base.bits(exact_model(xq, xs, wq, ws, sps)))
++    one = hc_i8.hc_down_i8s(xq[-1:].contiguous(), xs[-1:].contiguous(), wq, ws, sps)
++    assert torch.equal(base.bits(one), base.bits(out[-1:]))
++    d, lora, lq, ls = hc_i8.hc_down_i8s_silu(xq, xs, wq, ws, 320, HC, True, sps)
++    assert torch.equal(base.bits(d), base.bits(out))
++    r_lora = hc._hc_silu(out[:, :320].contiguous(), HC)
++    assert torch.equal(base.bits(lora), base.bits(r_lora))
++    rq, rs = base.ref_quant(lora)
++    assert torch.equal(lq, rq) and torch.equal(ls, rs)
++    # precision: per-stream int8 vs the fp32 product of the bf16 operands
++    ref = x.float() @ w.float().t()
++    rel = ((out.float() - ref).norm() / ref.norm()).item()
++    assert rel < 0.08, rel
++
++
++@pytest.fixture(scope="module")
++def module():
++    import types
++
++    from vllm import _custom_ops as ops
++    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
++    from vllm.distributed import parallel_state as ps
++    from vllm.model_executor.layers import b70_dense_int8 as D
++    from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
++    from vllm.models.qwen4_exp.nvidia import b70_hyperconnection as bhc
++
++    ops.scaled_int8_quant = lambda x, s=None, a=None, sym=True: (
++        *base.ref_quant(x),
++        None,
++    )
++    bhc.get_current_vllm_config = lambda: types.SimpleNamespace(speculative_config=None)
++    cfg = HyperConnectionConfig(
++        hc_count=HC,
++        hidden_size=HS,
++        params_dtype=torch.bfloat16,
++        hc_lowrank=320,
++        rms_norm_eps=1e-6,
++        hc_per_branch_norm=True,
++    )
++    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
++        if not ps.model_parallel_is_initialized():
++            ps.init_distributed_environment(
++                world_size=1,
++                rank=0,
++                distributed_init_method="tcp://127.0.0.1:29518",
++                local_rank=0,
++                backend="gloo",
++            )
++            ps.initialize_model_parallel(1, 1, backend="gloo")
++        gr = bhc.GatedResidual(cfg, prefix="model.layers.0.attn_hyper_connection")
++    g = _gen(9)
++    with torch.no_grad():
++        gr.hc_norm.weight.copy_(stream_gains(g))
++        down = gr.input_mix_weight_down_block_inject.weight
++        down.copy_((torch.randn(down.shape, generator=g) * 0.02).to(down.dtype))
++        down[324:] = 0
++        up = gr.input_mix_weight_up
++        wup = (torch.randn(up.weight.shape, generator=g) * 0.05).to(torch.bfloat16)
++    q, s = D.quantize_weight_int8(wup)
++    up.weight = torch.nn.Parameter(q, requires_grad=False)
++    up.b70_int8_scale = s
++    up.quant_method = D.B70Int8DenseMethod(64, False)
++    gr._ordered_hc = True
++    gr._astra_hc_up_prepared = True
++    gr._b70_i8_block = True
++    gr._prepare_kdown_ksplit()  # load-time hook: makes the per-(row, stream) int8 copy
++    assert gr._kdown_q is not None and tuple(gr._kdown_qs.shape) == (336, HC)
++    return gr
++
++
++def test_gated_residual_stream_path(module):
++    rows = 8
++    g = _gen(77)
++    h = torch.randn(rows, HC * HS, generator=g).to(torch.bfloat16)
++    prev = torch.randn(rows, HS, generator=g).to(torch.bfloat16)
++    inj = torch.randn(rows, HC, generator=g).to(torch.bfloat16)
++    pq._logged_sites.clear()
++    out = module._combine_and_mix_eager(h, prev, inj)
++    assert pq._logged_sites == {"hc_up", "hc_block"}
++    # batch invariance: row 3 alone gives the same bits
++    one = module._combine_and_mix_eager(h[3:4], prev[3:4], inj[3:4])
++    for a, b in zip(out, one):
++        assert torch.equal(base.bits(a[3:4]), base.bits(b))
++    # against the fp32 product of the bf16 operands (torch). Not against the BF16
++    # Triton HC down: the interpreter has no bf16 tl.dot (it multiplies the uint16
++    # storage), so that path is meaningless on CPU.
++    xn = hc._hc_combine_norm(h, prev, inj, module.hc_norm.weight, 1e-6, HC)[1]
++    lora, injection = module._down_and_silu(xn)
++    w = module.input_mix_weight_down_block_inject.weight.float()
++    d = xn.float() @ w.t()
++    v = d[:, :320] / HC
++    rels = {
++        "lora_silu": (
++            (lora.float() - v * torch.sigmoid(v)).norm() / (v * torch.sigmoid(v)).norm()
++        ).item(),
++        "injection": (
++            (injection.float() - d[:, 320:324]).norm() / d[:, 320:324].norm()
++        ).item(),
++    }
++    print("K2_STREAM_REL", rels)
++    assert all(r < 0.06 for r in rels.values()), rels
+diff --git a/tests/kernels/test_b70_k2_hc_wiring.py b/tests/kernels/test_b70_k2_hc_wiring.py
+index e9f4877728..cf6abc4176 100644
+--- a/tests/kernels/test_b70_k2_hc_wiring.py
++++ b/tests/kernels/test_b70_k2_hc_wiring.py
+@@ -16,13 +16,14 @@ os.environ["B70_I8_PRODUCER_QUANT"] = "1"
+ os.environ["B70_HC_SILU_FUSE"] = "1"
+ os.environ["B70_HC_ORDERED_MAX_ROWS"] = "32"
+ 
++import importlib.util  # noqa: E402
++
+ import pytest  # noqa: E402
+ import torch  # noqa: E402
+ 
+-import importlib.util  # noqa: E402
+-
+ _spec = importlib.util.spec_from_file_location(
+-    "k2_pq_base", os.path.join(os.path.dirname(__file__), "test_b70_k2_producer_quant.py")
++    "k2_pq_base",
++    os.path.join(os.path.dirname(__file__), "test_b70_k2_producer_quant.py"),
+ )
+ base = importlib.util.module_from_spec(_spec)  # the bf16 interpreter patch + ref quant
+ _spec.loader.exec_module(base)
+@@ -31,16 +32,19 @@ from vllm.model_executor.layers import b70_i8_producer as pq  # noqa: E402
+ 
+ @pytest.fixture(scope="module")
+ def module():
+-    from vllm import _custom_ops as ops
+     import types
+ 
+-    from vllm.models.qwen4_exp.nvidia import b70_hyperconnection as bhc
++    from vllm import _custom_ops as ops
+     from vllm.model_executor.layers import b70_dense_int8 as D
+     from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
++    from vllm.models.qwen4_exp.nvidia import b70_hyperconnection as bhc
+     from vllm.models.qwen4_exp.nvidia.b70_hyperconnection import GatedResidual
+ 
+     # W1's quant on CPU: the XPU reference (same bits as the native op).
+-    ops.scaled_int8_quant = lambda x, s=None, a=None, sym=True: (*base.ref_quant(x), None)
++    ops.scaled_int8_quant = lambda x, s=None, a=None, sym=True: (
++        *base.ref_quant(x),
++        None,
++    )
+     cfg = HyperConnectionConfig(
+         hc_count=4,
+         hidden_size=2560,
+diff --git a/vllm/model_executor/layers/b70_i8_producer.py b/vllm/model_executor/layers/b70_i8_producer.py
+index 66fdfe39dd..eb440a0fc1 100644
+--- a/vllm/model_executor/layers/b70_i8_producer.py
++++ b/vllm/model_executor/layers/b70_i8_producer.py
+@@ -50,6 +50,7 @@ import os
+ import re
+ 
+ import torch
++
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import direct_register_custom_op
+@@ -396,3 +397,24 @@ direct_register_custom_op(
+     _b70_int8_dense_mm_q,
+     fake_impl=_b70_int8_dense_mm_q_fake,
+ )
++
++
++_ATTR_G = "_b70_i8g"
++
++
++def attach_grouped(x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
++    """Hang (int8 rows, fp32 [M, G] per-(token, group) scales) of ``x`` on it."""
++    setattr(x, _ATTR_G, (xq, xs))
++    return x
++
++
++def take_grouped(
++    x: torch.Tensor, groups: int
++) -> tuple[torch.Tensor, torch.Tensor] | None:
++    pq = x.__dict__.get(_ATTR_G) if hasattr(x, "__dict__") else None
++    if pq is None:
++        return None
++    xq, xs = pq
++    if x.dim() != 2 or xq.shape != tuple(x.shape) or xs.shape != (x.shape[0], groups):
++        return None
++    return xq, xs
+diff --git a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+index a393da4783..09ebaa7421 100644
+--- a/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/b70_hyperconnection.py
+@@ -51,9 +51,15 @@ from .ops.hc import (
+     hc_silu,
+ )
+ from .ops.hc_i8 import (
++    group_quant,
++    grouped_gemma_rmsnorm_quant,
++    hc_combine_norm_quant,
++    hc_down_i8s,
++    hc_down_i8s_silu,
+     hc_gate_mix_quant,
+     hc_silu_quant,
+     parallel_hc_gemm_silu_quant,
++    quantize_weight_int8_grouped,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -75,6 +81,23 @@ _B70_HC_SILU_FUSE_LOGGED = False
+ _B70_HC_DOWN_INT8 = os.environ.get("B70_HC_DOWN_INT8", "0") == "1"
+ _B70_HC_DOWN_INT8_MAX_ROWS = int(os.environ.get("B70_HC_DOWN_INT8_MAX_ROWS", str(1 << 30)))
+ _B70_HC_DOWN_INT8_LOGGED = False
++# B70-K2: with B70_HC_DOWN_INT8=1, per-(token, stream) activation scales and per-(row,
++# stream) weight scales instead of one scale over the 4 x 2560 HC streams. The norm
++# producer emits the int8 rows; the GEMM is a vLLM Triton split-K (exact int32 per
++# split, fixed-order fp32 sum: deterministic, batch-invariant). No wheel needed.
++_B70_HC_DOWN_INT8_STREAM = (
++    _B70_HC_DOWN_INT8
++    and os.environ.get("B70_HC_DOWN_INT8_STREAM_SCALE", "0") == "1"
++)
++_B70_HC_DOWN_INT8_SPS = int(os.environ.get("B70_HC_DOWN_INT8_SPS", "4"))
++# B70-K2 capture (diagnostics only, eager engines): dump HC-down inputs xn on TP rank 0,
++# up to B70_K2_HC_CAPTURE_DECODE rows of decode calls (<= 64 rows) per module and the
++# first B70_K2_HC_CAPTURE_PREFILL rows of one prefill call (>= 512 rows) for every
++# B70_K2_HC_CAPTURE_EVERY-th layer (+ the final mixer). Unset = no code runs.
++_B70_K2_CAP_DIR = os.environ.get("B70_K2_HC_CAPTURE_DIR", "")
++_B70_K2_CAP_DECODE = int(os.environ.get("B70_K2_HC_CAPTURE_DECODE", "256"))
++_B70_K2_CAP_PREFILL = int(os.environ.get("B70_K2_HC_CAPTURE_PREFILL", "2048"))
++_B70_K2_CAP_EVERY = int(os.environ.get("B70_K2_HC_CAPTURE_EVERY", "8"))
+ 
+ 
+ def _is_xpu() -> bool:
+@@ -276,6 +299,17 @@ class GatedResidual(nn.Module):
+                 None if weight is None else (tuple(weight.shape), weight.dtype),
+             )
+             return
++        if _B70_HC_DOWN_INT8_STREAM:
++            if weight.shape[1] % (self.hc_count * _B70_HC_DOWN_INT8_SPS * 64):
++                logger.warning(
++                    "B70-K2 HC down int8 stream scales: K=%d does not split; BF16 path",
++                    weight.shape[1],
++                )
++                return
++            self._kdown_q, self._kdown_qs = quantize_weight_int8_grouped(
++                weight.data, self.hc_count
++            )
++            return
+         try:
+             from vllm_xpu_kernels import b70_int8_dense as k1
+         except ImportError:
+@@ -293,8 +327,80 @@ class GatedResidual(nn.Module):
+             and xn.shape[0] <= _B70_HC_DOWN_INT8_MAX_ROWS
+         )
+ 
++    def _log_stream_int8(self) -> None:
++        global _B70_HC_DOWN_INT8_LOGGED
++        if not _B70_HC_DOWN_INT8_LOGGED:
++            _B70_HC_DOWN_INT8_LOGGED = True
++            logger.info(
++                "B70-K2: HC down int8 with per-(token, stream) and per-(row, stream) "
++                "scales on (Triton split-K, %d splits per stream, batch-invariant; "
++                "rows <= %d; N=%d K=%d)",
++                _B70_HC_DOWN_INT8_SPS,
++                _B70_HC_DOWN_INT8_MAX_ROWS,
++                self._kdown_q.shape[0],
++                self._kdown_q.shape[1],
++            )
++
++    def _k2_capture(self, xn: torch.Tensor) -> None:
++        """B70-K2 diagnostics: save HC-down inputs (eager only, TP rank 0)."""
++        import re
++
++        if hasattr(torch, "xpu") and torch.xpu.is_current_stream_capturing():
++            return
++        from vllm.distributed import get_tensor_model_parallel_rank
++
++        if get_tensor_model_parallel_rank() != 0:
++            return
++        st = self.__dict__.setdefault("_k2_cap", {"dec": [], "n": 0, "pre": False})
++        name = self._b70_layer_name or "hc"
++        m = re.search(r"layers\.(\d+)\.", name)
++        rows = xn.shape[0]
++        os.makedirs(_B70_K2_CAP_DIR, exist_ok=True)
++        tag = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
++        if rows <= 64 and st["n"] < _B70_K2_CAP_DECODE:
++            st["dec"].append(xn.detach().reshape(rows, -1).to("cpu"))
++            st["n"] += rows
++            if st["n"] >= _B70_K2_CAP_DECODE:
++                torch.save(
++                    {"xn": torch.cat(st["dec"])[:_B70_K2_CAP_DECODE], "module": name,
++                     "kind": "decode"},
++                    os.path.join(_B70_K2_CAP_DIR, f"{tag}__decode.pt"),
++                )
++                st["dec"] = []
++        sampled = m is None or int(m.group(1)) % _B70_K2_CAP_EVERY == 0
++        if rows >= 512 and sampled and not st["pre"]:
++            st["pre"] = True
++            torch.save(
++                {"xn": xn.detach().reshape(rows, -1)[:_B70_K2_CAP_PREFILL].to("cpu"),
++                 "module": name, "kind": "prefill"},
++                os.path.join(_B70_K2_CAP_DIR, f"{tag}__prefill.pt"),
++            )
++
++    def _stream_quant(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """The producer's per-(token, stream) int8 rows, or quantize here."""
++        pq = b70_pq.take_grouped(xn, self.hc_count)
++        if pq is None:
++            pq = group_quant(xn.contiguous(), self.hc_count)
++        return pq
++
++    def _stream_takes(self, rows: int) -> bool:
++        return (
++            _B70_HC_DOWN_INT8_STREAM
++            and self._kdown_q is not None
++            and 0 < rows <= _B70_HC_DOWN_INT8_MAX_ROWS
++            and not torch.compiler.is_compiling()
++        )
++
+     def _down_int8(self, xn: torch.Tensor) -> torch.Tensor:
+         global _B70_HC_DOWN_INT8_LOGGED
++        if _B70_HC_DOWN_INT8_STREAM:
++            self._log_stream_int8()
++            shape = xn.shape
++            xq, xs = self._stream_quant(xn.reshape(-1, shape[-1]))
++            out = hc_down_i8s(
++                xq, xs, self._kdown_q, self._kdown_qs, _B70_HC_DOWN_INT8_SPS
++            )
++            return out.view(*shape[:-1], out.shape[-1])
+         from vllm_xpu_kernels import b70_int8_dense as k1
+ 
+         if not _B70_HC_DOWN_INT8_LOGGED:
+@@ -388,6 +494,28 @@ class GatedResidual(nn.Module):
+         B70-V2-HC fuses the silu when the ordered projection takes the parallel
+         route; otherwise the stock sequence runs."""
+         global _B70_HC_SILU_FUSE_LOGGED
++        if _B70_K2_CAP_DIR:
++            self._k2_capture(xn)
++        if self._stream_takes(xn.shape[0]) and xn.dim() == 2:
++            # B70-K2: per-stream int8 down + silu (+ HC up int8 rows) in the finish.
++            self._log_stream_int8()
++            xq, xs = self._stream_quant(xn)
++            quant_lora = self._i8_lora_emits(xn)
++            down, lora, lq, ls = hc_down_i8s_silu(
++                xq,
++                xs,
++                self._kdown_q,
++                self._kdown_qs,
++                self.lora_rank,
++                self.hc_count,
++                quant_lora,
++                _B70_HC_DOWN_INT8_SPS,
++            )
++            if lq is not None:
++                b70_pq.attach(lora, lq, ls, "hc_up")
++            if self.use_combine:
++                return lora, down[:, self.lora_rank : self.lora_rank + self.hc_count]
++            return lora, None
+         if (
+             _B70_HC_SILU_FUSE
+             and self._ordered_hc
+@@ -456,12 +584,21 @@ class GatedResidual(nn.Module):
+     def _mix_eager(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+-        xn = grouped_gemma_rmsnorm(
+-            hidden_states,
+-            self.hc_norm.weight,
+-            self.config.rms_norm_eps,
+-            self.hc_count,
+-        )
++        if self._stream_takes(hidden_states.shape[0]) and hidden_states.dim() == 2:
++            xn, xq, xs = grouped_gemma_rmsnorm_quant(
++                hidden_states,
++                self.hc_norm.weight,
++                self.config.rms_norm_eps,
++                self.hc_count,
++            )
++            b70_pq.attach_grouped(xn, xq, xs)
++        else:
++            xn = grouped_gemma_rmsnorm(
++                hidden_states,
++                self.hc_norm.weight,
++                self.config.rms_norm_eps,
++                self.hc_count,
++            )
+ 
+         lora, injection = self._down_and_silu(xn)
+         block_input = self._mix_up(lora, xn)
+@@ -505,14 +642,25 @@ class GatedResidual(nn.Module):
+         module's input RMSNorm. A missing injection applies the block output
+         to every stream with unit weight.
+         """
+-        hidden_states, xn = hc_combine_norm(
+-            hidden_states,
+-            prev_block_output,
+-            prev_injection,
+-            self.hc_norm.weight,
+-            self.config.rms_norm_eps,
+-            self.hc_count,
+-        )
++        if self._stream_takes(hidden_states.shape[0]):
++            hidden_states, xn, xq, xs = hc_combine_norm_quant(
++                hidden_states,
++                prev_block_output,
++                prev_injection,
++                self.hc_norm.weight,
++                self.config.rms_norm_eps,
++                self.hc_count,
++            )
++            b70_pq.attach_grouped(xn, xq, xs)
++        else:
++            hidden_states, xn = hc_combine_norm(
++                hidden_states,
++                prev_block_output,
++                prev_injection,
++                self.hc_norm.weight,
++                self.config.rms_norm_eps,
++                self.hc_count,
++            )
+ 
+         lora, injection = self._down_and_silu(xn)
+         block_input = self._mix_up(lora, xn)
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/hc_i8.py b/vllm/models/qwen4_exp/nvidia/ops/hc_i8.py
+index d58ce44167..9e4b9c5b37 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/hc_i8.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/hc_i8.py
+@@ -15,10 +15,10 @@ because the per-token scale needs the whole row.
+ """
+ 
+ import torch
+-from vllm.triton_utils import tl, triton
+ 
+ from vllm.model_executor.layers import b70_i8_producer as _pq
+ from vllm.model_executor.layers.b70_i8_producer import i8_quant, i8_scale
++from vllm.triton_utils import tl, triton
+ 
+ 
+ @triton.jit
+@@ -209,3 +209,355 @@ def parallel_hc_gemm_silu_quant(x, weight, valid_columns, lora_rank, hc_count):
+         num_warps=_pq.NUM_WARPS,
+     )
+     return output, lora, xq, xs
++
++
++# ---------------------------------------------------------------------------
++# B70-K2 HC down int8 with per-(token, stream) activation scales
++# (B70_HC_DOWN_INT8=1 + B70_HC_DOWN_INT8_STREAM_SCALE=1).
++#
++# The HC down input xn [R, HC*HS] is HC independently RMS-normalised streams, each
++# with its own (1 + w) affine; the stream gains differ by up to ~5.7x in the deployed
++# checkpoint. One per-token scale over all HC*HS columns gives the small streams
++# few int8 levels. Here every (token, stream) gets its own scale, and the weight
++# every (row, stream). The producer (combine+norm) owns exactly one (token, stream)
++# per program, so the amax is local. The GEMM splits K at stream boundaries (and
++# SPS times inside each stream): exact int32 per split, scaled to fp32 by that
++# split's (token, stream) x (row, stream) scales, summed in a fixed split order by
++# the finish kernel. A row's bits depend only on that row: deterministic and
++# batch-invariant, as the ordered DFlash2 HC path requires.
++# ---------------------------------------------------------------------------
++@triton.jit
++def _hc_combine_norm_q_kernel(
++    block_ptr,
++    res_ptr,
++    inj_ptr,
++    w_ptr,
++    out_ptr,
++    y_ptr,
++    q_ptr,
++    s_ptr,
++    stride_block,
++    stride_res,
++    stride_inj,
++    stride_out,
++    stride_y,
++    HC_DIM: tl.constexpr,
++    HC: tl.constexpr,
++    W_SHARED: tl.constexpr,
++    EPS: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """ops/hc.py _hc_combine_norm_kernel, plus the int8 rows of this (row, stream)."""
++    HC_PAD: tl.constexpr = triton.next_power_of_2(HC)
++    NUM_TILES: tl.constexpr = triton.cdiv(HC_DIM, BLOCK_SIZE)
++    NUM_TILES_PAD: tl.constexpr = triton.next_power_of_2(NUM_TILES)
++
++    pid = tl.program_id(0)
++    row = pid // HC
++    stream = pid % HC
++    offs_hc = tl.arange(0, HC_PAD)
++    mask_hc = offs_hc < HC
++    tile_ids = tl.arange(0, NUM_TILES_PAD)
++    offs_inner = tile_ids[:, None] * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
++    mask_inner = offs_inner < HC_DIM
++    offs = stream * HC_DIM + offs_inner
++    w_offs = offs_inner if W_SHARED else offs
++
++    res = tl.load(res_ptr + row * stride_res + offs, mask_inner, other=0.0)
++    if inj_ptr is not None:
++        inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
++    block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
++    if inj_ptr is not None:
++        inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
++        block = block.to(tl.float32) * tl.sum(tl.where(offs_hc == stream, inj, 0.0))
++    out = (res.to(tl.float32) + block.to(tl.float32)).to(out_ptr.dtype.element_ty)
++    if inj_ptr is None:
++        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
++    tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
++
++    out = out.to(tl.float32)
++    sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
++    rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
++    if inj_ptr is not None:
++        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
++    y = out * rrms
++    y += y * w.to(tl.float32)
++    yb = y.to(y_ptr.dtype.element_ty)
++    tl.store(y_ptr + row * stride_y + offs, yb, mask_inner)
++    yf = yb.to(tl.float32)
++    amax = tl.max(tl.max(tl.where(mask_inner, tl.abs(yf), 0.0), axis=1), axis=0)
++    s = i8_scale(amax)
++    tl.store(
++        q_ptr + row.to(tl.int64) * (HC * HC_DIM) + offs, i8_quant(yf, s), mask_inner
++    )
++    tl.store(s_ptr + row * HC + stream, s)
++
++
++def hc_combine_norm_quant(
++    residual, block_output, injection_logits, norm_weight, eps, hc_count
++):
++    """hc_combine_norm + int8 rows [N, DIM] of y and fp32 scales [N, hc_count]."""
++    n, dim = residual.shape
++    assert dim % hc_count == 0 and residual.dtype == torch.bfloat16
++    hc_dim = dim // hc_count
++    assert block_output.shape == (n, hc_dim)
++    assert residual.stride(1) == 1 and block_output.stride(1) == 1
++    if injection_logits is not None:
++        assert injection_logits.shape == (n, hc_count)
++        assert injection_logits.stride(1) == 1
++    assert norm_weight.is_contiguous() and norm_weight.numel() in (hc_dim, dim)
++    stride_injection = injection_logits.stride(0) if injection_logits is not None else 0
++    out = residual.new_empty(residual.shape)
++    y = residual.new_empty(residual.shape)
++    xq = torch.empty((n, dim), dtype=torch.int8, device=residual.device)
++    xs = torch.empty((n, hc_count), dtype=torch.float32, device=residual.device)
++    if n:
++        _hc_combine_norm_q_kernel[(n * hc_count,)](
++            block_output,
++            residual,
++            injection_logits,
++            norm_weight,
++            out,
++            y,
++            xq,
++            xs,
++            block_output.stride(0),
++            residual.stride(0),
++            stride_injection,
++            out.stride(0),
++            y.stride(0),
++            hc_dim,
++            hc_count,
++            W_SHARED=norm_weight.numel() == hc_dim,
++            EPS=eps,
++            BLOCK_SIZE=512,
++        )
++    return out, y, xq, xs
++
++
++@triton.jit
++def _grouped_gemma_rmsnorm_q_kernel(
++    x_ptr,
++    w_ptr,
++    y_ptr,
++    q_ptr,
++    s_ptr,
++    stride_x,
++    stride_y,
++    DIM: tl.constexpr,
++    NUM_GROUPS: tl.constexpr,
++    W_SHARED: tl.constexpr,
++    EPS: tl.constexpr,
++):
++    """ops/hc.py _grouped_gemma_rmsnorm_kernel, plus the int8 rows of this group."""
++    GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
++    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(GROUP_DIM)
++    pid = tl.program_id(0)
++    group_id = pid % NUM_GROUPS
++    row = pid // NUM_GROUPS
++    offs_g = tl.arange(0, BLOCK_SIZE)
++    offsets = group_id * GROUP_DIM + offs_g
++    mask = offs_g < GROUP_DIM
++    w_offs = offs_g if W_SHARED else offsets
++    x = tl.load(x_ptr + row * stride_x + offsets, mask, other=0.0).to(tl.float32)
++    w = tl.load(w_ptr + w_offs, mask, other=0.0)
++    rrms = tl.rsqrt(tl.sum(x * x) / GROUP_DIM + EPS)
++    y = x * rrms
++    y += y * w.to(tl.float32)
++    yb = y.to(y_ptr.dtype.element_ty)
++    tl.store(y_ptr + row * stride_y + offsets, yb, mask)
++    yf = yb.to(tl.float32)
++    amax = tl.max(tl.where(mask, tl.abs(yf), 0.0), axis=0)
++    s = i8_scale(amax)
++    tl.store(q_ptr + row.to(tl.int64) * DIM + offsets, i8_quant(yf, s), mask)
++    tl.store(s_ptr + row * NUM_GROUPS + group_id, s)
++
++
++def grouped_gemma_rmsnorm_quant(x, weight, eps, num_groups):
++    """grouped_gemma_rmsnorm + int8 rows and fp32 scales [N, num_groups]."""
++    n, dim = x.shape
++    assert x.stride(1) == 1 and weight.is_contiguous() and dim % num_groups == 0
++    assert x.dtype == torch.bfloat16
++    group_dim = dim // num_groups
++    assert weight.numel() in (group_dim, dim)
++    y = x.new_empty(x.shape)
++    xq = torch.empty((n, dim), dtype=torch.int8, device=x.device)
++    xs = torch.empty((n, num_groups), dtype=torch.float32, device=x.device)
++    if n:
++        _grouped_gemma_rmsnorm_q_kernel[(n * num_groups,)](
++            x,
++            weight,
++            y,
++            xq,
++            xs,
++            x.stride(0),
++            y.stride(0),
++            dim,
++            num_groups,
++            W_SHARED=weight.numel() == group_dim,
++            EPS=eps,
++        )
++    return y, xq, xs
++
++
++@triton.jit
++def _group_quant_kernel(
++    x_ptr, q_ptr, s_ptr, stride_x, DIM: tl.constexpr, G: tl.constexpr
++):
++    """Per-(row, group) int8 quant of bf16 [N, DIM] (when no producer did it)."""
++    GD: tl.constexpr = DIM // G
++    BLOCK: tl.constexpr = triton.next_power_of_2(GD)
++    pid = tl.program_id(0)
++    row = pid // G
++    grp = pid % G
++    offs = tl.arange(0, BLOCK)
++    mask = offs < GD
++    yf = tl.load(x_ptr + row * stride_x + grp * GD + offs, mask, other=0.0).to(
++        tl.float32
++    )
++    s = i8_scale(tl.max(tl.where(mask, tl.abs(yf), 0.0), axis=0))
++    tl.store(q_ptr + row.to(tl.int64) * DIM + grp * GD + offs, i8_quant(yf, s), mask)
++    tl.store(s_ptr + row * G + grp, s)
++
++
++def group_quant(x: torch.Tensor, groups: int):
++    n, dim = x.shape
++    assert x.stride(1) == 1 and dim % groups == 0
++    xq = torch.empty((n, dim), dtype=torch.int8, device=x.device)
++    xs = torch.empty((n, groups), dtype=torch.float32, device=x.device)
++    if n:
++        _group_quant_kernel[(n * groups,)](x, xq, xs, x.stride(0), dim, groups)
++    return xq, xs
++
++
++def quantize_weight_int8_grouped(w: torch.Tensor, groups: int):
++    """[N, K] float -> (int8 [N, K], fp32 [N, groups]): RTN per (row, group)."""
++    n, k = w.shape
++    wg = w.float().view(n, groups, k // groups)
++    s = (wg.abs().amax(dim=-1) / 127.0).clamp(min=1e-8)
++    q = torch.round(wg / s[..., None]).clamp(-127, 127).to(torch.int8)
++    return q.view(n, k).contiguous(), s.contiguous()
++
++
++@triton.jit(do_not_specialize=["M"])
++def _hc_i8s_partials(
++    xq,
++    xs,
++    wq,
++    ws,
++    partials,
++    M,
++    N: tl.constexpr,
++    K: tl.constexpr,
++    G: tl.constexpr,
++    SPS: tl.constexpr,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++):
++    """Program (split, n tile, m tile): exact int32 over this split's K range, then
++    fp32 x (token, stream) x (row, stream) scales -> partials[split, M, N]."""
++    split = tl.program_id(0)
++    stream = split // SPS
++    KS: tl.constexpr = K // (G * SPS)
++    rows = tl.program_id(2) * BM + tl.arange(0, BM)
++    cols = tl.program_id(1) * BN + tl.arange(0, BN)
++    rmask = rows < M
++    cmask = cols < N
++    k0 = split * KS
++    acc = tl.zeros((BM, BN), dtype=tl.int32)
++    for step in range(KS // BK):
++        kk = k0 + step * BK + tl.arange(0, BK)
++        a = tl.load(
++            xq + rows[:, None].to(tl.int64) * K + kk[None, :], rmask[:, None], other=0
++        )
++        b = tl.load(
++            wq + cols[None, :].to(tl.int64) * K + kk[:, None], cmask[None, :], other=0
++        )
++        acc += tl.dot(a, b, out_dtype=tl.int32)
++    sa = tl.load(xs + rows * G + stream, rmask, other=0.0)
++    sb = tl.load(ws + cols * G + stream, cmask, other=0.0)
++    v = acc.to(tl.float32) * sa[:, None] * sb[None, :]
++    tl.store(
++        partials + split * M * N + rows[:, None] * N + cols[None, :],
++        v,
++        rmask[:, None] & cmask[None, :],
++    )
++
++
++def hc_down_i8s_partials(xq, xs, wq, ws, sps: int = 4):
++    """fp32 partials [G*SPS, M, N] of the per-stream-scaled int8 HC down GEMM."""
++    m, k = xq.shape
++    n = wq.shape[0]
++    g = xs.shape[1]
++    assert ws.shape == (n, g) and k % (g * sps) == 0
++    ks = k // (g * sps)
++    bk = 128 if ks % 128 == 0 else 64
++    assert ks % bk == 0
++    bm = 16 if m <= 16 else (32 if m <= 32 else 64)
++    bn = 32
++    tiles = g * sps
++    partials = torch.empty((tiles, m, n), dtype=torch.float32, device=xq.device)
++    if m:
++        _hc_i8s_partials[(tiles, triton.cdiv(n, bn), triton.cdiv(m, bm))](
++            xq, xs, wq, ws, partials, m, n, k, g, sps, bm, bn, bk, num_warps=4
++        )
++    return partials, tiles
++
++
++def hc_down_i8s_silu(xq, xs, wq, ws, lora_rank, hc_count, quant_lora, sps=4):
++    """(down [M, N] bf16, silu(lora) [M, lora_rank], xq_lora | None, xs_lora | None)."""
++    from ..b70_hc_gemm import _hc_finish_silu
++
++    rows = xq.shape[0]
++    columns = wq.shape[0]
++    partials, tiles = hc_down_i8s_partials(xq, xs, wq, ws, sps)
++    output = torch.empty((rows, columns), dtype=torch.bfloat16, device=xq.device)
++    lora = torch.empty((rows, lora_rank), dtype=torch.bfloat16, device=xq.device)
++    if quant_lora:
++        lq = torch.empty((rows, lora_rank), dtype=torch.int8, device=xq.device)
++        ls = torch.empty((rows, 1), dtype=torch.float32, device=xq.device)
++        if rows:
++            _hc_finish_silu_q_kernel[(rows,)](
++                partials,
++                output,
++                lora,
++                lq,
++                ls,
++                rows,
++                columns,
++                tiles,
++                lora_rank,
++                hc_count,
++                triton.next_power_of_2(columns),
++                num_warps=_pq.NUM_WARPS,
++            )
++        return output, lora, lq, ls
++    if rows:
++        _hc_finish_silu[(triton.cdiv(rows * columns, 256),)](
++            partials,
++            output,
++            lora,
++            rows,
++            columns,
++            tiles,
++            lora_rank,
++            hc_count,
++            num_warps=4,
++        )
++    return output, lora, None, None
++
++
++def hc_down_i8s(xq, xs, wq, ws, sps=4):
++    """Down [M, N] bf16 only (no silu): the same partials and fixed-order sum."""
++    from ..b70_hc_gemm import _hc_finish
++
++    rows = xq.shape[0]
++    columns = wq.shape[0]
++    partials, tiles = hc_down_i8s_partials(xq, xs, wq, ws, sps)
++    output = torch.empty((rows, columns), dtype=torch.bfloat16, device=xq.device)
++    if rows:
++        _hc_finish[(triton.cdiv(rows * columns, 256),)](
++            partials, output, rows, columns, tiles, num_warps=4
++        )
++    return output

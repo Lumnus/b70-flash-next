@@ -1,0 +1,216 @@
+From 9e00c2ecd7cee81b049bccacf86db76d8c2d119c Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Sat, 31 Oct 2026 16:48:11 +0000
+Subject: [PATCH 08/51] B70-IP-K4b/K5: scratch sized at impl init; FA-bf16
+ prefill over fp8 KV
+
+K4b: the one-layer bf16 prefill scratch is sized to max_model_len captured
+in the attention impl __init__ (the vLLM config is not current at forward;
+the old lookup fell back to 131072 and split >139K prompts onto Triton).
+Measured: QFN dense int8 KV boots with 82 x 3264 blocks (full 262,144).
+
+K5: on XPU the FA kernel fp8-KV path is ~2.2x slower than its bf16 path for
+prefill chunks (B70 hs=256: 63.1 vs 28.9 ms, 4096 q over 32K). FLASH_ATTN
+with fp8 KV now dequantizes the referenced blocks into the same bf16 scratch
+and runs FA bf16 for batches with max q > B70_PTH_FA_MIN_Q; decode and
+spec-verify stay on the fp8 kernel and graphs. Fires in QFN dense warmup
+(log line seen); gates pending a full boot. B70_PTH_FA_PREFILL=0 disables.
+---
+ vllm/v1/attention/backends/b70_pth_fa.py  | 51 ++++++++++++++++-------
+ vllm/v1/attention/backends/flash_attn.py  | 34 +++++++++++++++
+ vllm/v1/attention/backends/triton_attn.py |  9 ++++
+ 3 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index 52b540b607..191757c2e3 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -36,14 +36,10 @@ def _enabled() -> bool:
+     return current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "1") != "0"
+ 
+ 
+-def _get_scratch(block_size, nkv, hs, dtype, device):
+-    from vllm.config import get_current_vllm_config_or_none
+-
++def _get_scratch(block_size, nkv, hs, dtype, device, max_len):
+     key = (block_size, nkv, hs, dtype, str(device))
+     s = _scratch.get(key)
+     if s is None:
+-        cfg = get_current_vllm_config_or_none()
+-        max_len = cfg.model_config.max_model_len if cfg is not None else 131072
+         nblk = -(-max_len // block_size) + 1
+         k = torch.empty((nblk, block_size, nkv, hs), dtype=dtype, device=device)
+         v = torch.empty_like(k)
+@@ -59,13 +55,19 @@ def _get_scratch(block_size, nkv, hs, dtype, device):
+     return s
+ 
+ 
++def _max_len(impl) -> int:
++    # Captured in TritonAttentionImpl.__init__ (the config is not current at forward).
++    v = getattr(impl, "_b70_max_model_len", None)
++    return int(v) if v else 131072
++
++
+ def ensure_scratch(impl, kv_cache: torch.Tensor, dtype) -> None:
+     """Allocate at the first forward (profile run) so KV sizing sees it."""
+     if not _enabled():
+         return
+     num_blocks, nkv, block_size, content = kv_cache.shape
+     hs = impl.head_size
+-    _get_scratch(block_size, nkv, hs, dtype, kv_cache.device)
++    _get_scratch(block_size, nkv, hs, dtype, kv_cache.device, _max_len(impl))
+ 
+ 
+ def _dequant_blocks(src_data, src_scale, ids, dst, hs, chunk=4):
+@@ -78,6 +80,15 @@ def _dequant_blocks(src_data, src_scale, ids, dst, hs, chunk=4):
+         dst[i : i + sel.numel()] = d * s
+ 
+ 
++def _dequant_fp8_blocks(src, scale, ids, dst, chunk=4):
++    # src: (nb, bs, nkv, hs) fp8 view; scale: per-tensor fp32 scalar tensor
++    sc = scale.reshape(-1)[0].to(dst.dtype)
++    n = ids.numel()
++    for i in range(0, n, chunk):
++        sel = ids[i : i + chunk]
++        dst[i : i + sel.numel()] = src[sel].to(dst.dtype) * sc
++
++
+ def maybe_fa_prefill(
+     impl,
+     query: torch.Tensor,
+@@ -86,7 +97,10 @@ def maybe_fa_prefill(
+     output: torch.Tensor,
+     attn_metadata,
+     num_actual_tokens: int,
++    fp8_scales: tuple | None = None,
+ ) -> bool:
++    """int8 per-token-head (default) or, with fp8_scales=(k_scale, v_scale),
++    an fp8 per-tensor cache (B70-IP-K5, FLASH_ATTN backend)."""
+     global _logged
+     if not _enabled():
+         return False
+@@ -94,11 +108,12 @@ def maybe_fa_prefill(
+         return False
+     if (
+         impl.alibi_slopes is not None
+-        or impl.sinks is not None
+-        or (impl.logits_soft_cap or 0) != 0
+-        or tuple(impl.sliding_window) != (-1, -1)
+-        or attn_metadata.mm_prefix_range_tensor is not None
+-        or attn_metadata.rswa_prefix_lens is not None
++        or getattr(impl, "sinks", None) is not None
++        or (getattr(impl, "logits_soft_cap", 0) or 0) != 0
++        or tuple(impl.sliding_window or (-1, -1)) != (-1, -1)
++        or getattr(attn_metadata, "mm_prefix_range_tensor", None) is not None
++        or getattr(attn_metadata, "mm_prefix_query_range_tensor", None) is not None
++        or getattr(attn_metadata, "rswa_prefix_lens", None) is not None
+         or not isinstance(attn_metadata.causal, bool)
+         or not attn_metadata.causal
+     ):
+@@ -107,7 +122,7 @@ def maybe_fa_prefill(
+ 
+     nb, bs, nkv, _ = key_cache.shape
+     hs = impl.head_size
+-    ks, vs = _get_scratch(bs, nkv, hs, query.dtype, query.device)
++    ks, vs = _get_scratch(bs, nkv, hs, query.dtype, query.device, _max_len(impl))
+     cap = ks.shape[0]
+     seq_lens = attn_metadata.seq_lens.tolist()
+     qsl = attn_metadata.query_start_loc.tolist()
+@@ -123,8 +138,12 @@ def maybe_fa_prefill(
+         if j == i:  # one sequence longer than the scratch: cannot happen (max_model_len)
+             return False
+         ids = torch.cat([bt[r, : nblks[r]] for r in range(i, j)]).to(torch.long)
+-        _dequant_blocks(key_cache, impl._k_scale_cache, ids, ks, hs)
+-        _dequant_blocks(value_cache, impl._v_scale_cache, ids, vs, hs)
++        if fp8_scales is None:
++            _dequant_blocks(key_cache, impl._k_scale_cache, ids, ks, hs)
++            _dequant_blocks(value_cache, impl._v_scale_cache, ids, vs, hs)
++        else:
++            _dequant_fp8_blocks(key_cache, fp8_scales[0], ids, ks)
++            _dequant_fp8_blocks(value_cache, fp8_scales[1], ids, vs)
+         width = max(nblks[i:j])
+         new_bt = torch.zeros((j - i, width), dtype=torch.int32, device=query.device)
+         off = 0
+@@ -155,7 +174,9 @@ def maybe_fa_prefill(
+     if not _logged:
+         _logged = True
+         logger.info(
+-            "B70-IP-K4 int8 KV prefill via FA: first batch %d seqs, max q %d, max ctx %d",
++            "B70-IP-K4/K5 %s KV prefill via FA bf16: first batch %d seqs, max q %d, "
++            "max ctx %d",
++            "int8" if fp8_scales is None else "fp8",
+             nseq,
+             attn_metadata.max_query_len,
+             max(seq_lens),
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 6e906bc520..85acdabf00 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -1081,6 +1081,15 @@ class FlashAttentionImpl(AttentionImpl):
+         else:
+             self.sliding_window = (sliding_window - 1, 0)
+         self.kv_cache_dtype = kv_cache_dtype
++        # B70-IP-K5: prefill scratch is sized to max_model_len (config is
++        # current here, not at forward).
++        self._b70_max_model_len = None
++        if current_platform.is_xpu():
++            from vllm.config import get_current_vllm_config_or_none
++
++            _cfg = get_current_vllm_config_or_none()
++            if _cfg is not None and _cfg.model_config is not None:
++                self._b70_max_model_len = _cfg.model_config.max_model_len
+         if logits_soft_cap is None:
+             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
+             logits_soft_cap = 0
+@@ -1290,6 +1299,31 @@ class FlashAttentionImpl(AttentionImpl):
+         k_descale = layer._k_scale.expand(descale_shape)
+         v_descale = layer._v_scale.expand(descale_shape)
+ 
++        # B70-IP-K5: on XPU the FA kernel's fp8-KV path is ~2.2x slower than
++        # its bf16 path for prefill chunks; dequantize the referenced fp8
++        # blocks into a bf16 scratch and run FA bf16 (decode and spec-verify
++        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=0 turns it off.
++        if (
++            current_platform.is_xpu()
++            and is_quantized_kv_cache(self.kv_cache_dtype)
++            and self.dcp_world_size <= 1
++            and getattr(self, "_b70_k5_ok", True)
++        ):
++            from vllm.v1.attention.backends import b70_pth_fa
++
++            b70_pth_fa.ensure_scratch(self, kv_cache, query.dtype)
++            if b70_pth_fa.maybe_fa_prefill(
++                self,
++                query[:num_actual_tokens],
++                key_cache,
++                value_cache,
++                output[:num_actual_tokens],
++                attn_metadata,
++                num_actual_tokens,
++                fp8_scales=(layer._k_scale, layer._v_scale),
++            ):
++                return output
++
+         if self.dcp_world_size > 1:
+             self._forward_with_dcp(
+                 query[:num_actual_tokens],
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index f5da34abd6..f1f9b8a137 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -528,6 +528,15 @@ class TritonAttentionImpl(AttentionImpl):
+ 
+         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
++        # B70-IP-K4: the int8 prefill scratch is sized to max_model_len; the
++        # config is current here (model construction), not at forward.
++        self._b70_max_model_len = None
++        if self._is_per_token_head_quant and current_platform.is_xpu():
++            from vllm.config import get_current_vllm_config_or_none
++
++            _cfg = get_current_vllm_config_or_none()
++            if _cfg is not None and _cfg.model_config is not None:
++                self._b70_max_model_len = _cfg.model_config.max_model_len
+ 
+         # Enable tensor descriptors for Q/K/V load/store on platforms that
+         # benefit from HW 2D block reads (Intel XPU).  The dead branch

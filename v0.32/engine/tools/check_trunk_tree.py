@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tree-level check: kit series (dense + sparse + hot/cold + models) applied to vanilla vLLM == scrubbed trunk (with
+"""Tree-level check: kit series (dense + sparse + hot/cold + models + v6) applied to vanilla vLLM == scrubbed trunk (with
 --hotcold-count N > 0: except the trunk's hot/cold commits).  Called by v0.32/engine/tools/check-trunk-tree.sh; see its header for the arguments.
 
 Everything runs on git objects with a temporary index: no checkout, no worktree, no branch is touched.

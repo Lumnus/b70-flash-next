@@ -1,8 +1,9 @@
-# Runtime switches (`B70_*`) of the 0.30 series
+# Runtime switches (`B70_*`)
 
-This page covers the 0.30 series in `v0.30/patches/`. The 0.32 line carries most of these switches as ports, plus its own;
-its engine files ([v0.32/models/qwen38-flash-next/preset-4card.env](../v0.32/models/qwen38-flash-next/preset-4card.env)) explain each one inline, and
-[v0.32/README.md](../v0.32/README.md#the-series) lists the series.
+The first sections cover the 0.30 series in `v0.30/patches/`, which the 0.32 line carries as ports; the last two cover the 0.32 line's own
+switches, those of the b70.5 models layer and of the b70.6 `vllm-v6/` series. The preset files
+([e.g. preset-d8-6-4card.env](../v0.32/models/qwen38-flash-next/preset-d8-6-4card.env)) explain each key they set inline, and
+[the engine page](../v0.32/README.md#the-series) lists the series.
 
 Every feature the b70 series adds is behind an environment variable and **off by default**. With none of them set,
 the image behaves as vLLM v0.30.0 plus wu1ff's patch set (0001–0005), apart from the ungated parts listed at
@@ -21,13 +22,13 @@ names are no longer read, so a deployment that still sets them runs with the fea
 | `B70_PLE_FP8_CROSSCHECK` | `1` | 0007 | `0` skips the boot cross-check against the BF16 table (only runs when `PLE_TABLE_PATH` is set). |
 | `B70_PLE_FP8_MAX_REL_ERR` | `0.25` | 0007 | refuse to start above this relative L2 error on 4,096 random rows. |
 | `B70_PLE_FP8_DEQUANT` | `lut` | 0007 | `cast` uses the stock cast-and-multiply instead of the 256-entry lookup table (bitwise equal). |
-| `B70_PLE_INT8` | unset (off) | 0008 | `1`: keep the table as INT8, one fp32 scale per row (164 B/row, 48.9 GiB over 4 ranks instead of 95.4 GiB BF16); needs `B70_PLE_INT8_PATH`. Build the table with `tools/build_int8_ple.py` (docs/ple-int8.md). |
+| `B70_PLE_INT8` | unset (off) | 0008 | `1`: keep the table as INT8, one fp32 scale per row (164 B/row, 48.9 GiB over 4 ranks instead of 95.4 GiB BF16); needs `B70_PLE_INT8_PATH`. Build the table with `tools/build_int8_ple.py` ([ple-int8.md](ple-int8.md)). |
 | `B70_PLE_INT8_PATH` | — | 0008 | the INT8 table `.safetensors`. Its metadata must carry the format tag `lumnus-ple-int8-rowscale/v1` (see below). |
 | `B70_PLE_INT8_CROSSCHECK` | `1` | 0008 | `0` skips the boot cross-check against the BF16 table. |
 | `B70_PLE_INT8_MAX_REL_ERR` | `0.02` | 0008 | refuse to start above this relative L2 error (expected ~0.0066). |
-| `B70_PLE_INT8_NVME` | unset (off) | 0013 | `1` (with `B70_PLE_INT8=1`): serve the INT8 table from NVMe through a small pinned row cache instead of pinning all of it (docs/ple-nvme.md). |
+| `B70_PLE_INT8_NVME` | unset (off) | 0013 | `1`: serve the INT8 table from NVMe through a small pinned row cache instead of pinning all of it ([ple-nvme.md](ple-nvme.md)). On the 0.32 line it replaces `B70_PLE_INT8` (setting both raises at init). |
 | `B70_PLE_INT8_NVME_PATH` | `B70_PLE_INT8_PATH` | 0013 | the table file to read with `O_DIRECT`. |
-| `B70_PLE_INT8_NVME_CACHE_GIB` | `8` | 0013 | pinned row cache, GiB **in total over all TP ranks**. We run `8` (2 GiB per rank on 4 ranks); the hit rate on agent traffic was 97–98 %. |
+| `B70_PLE_INT8_NVME_CACHE_GIB` | `8` | 0013 | pinned row cache, GiB **in total over all TP ranks**. The 2-card presets run `4` (2 GiB per rank); the hit rate on agent traffic was 97–98 %. |
 | `B70_PLE_INT8_NVME_IO_THREADS` | `16` | 0013 | read threads per rank (also the io_uring queue depth with `READER=uring`). |
 | `B70_PLE_INT8_NVME_STATS` | `0` | 0013 | `1`: per-rank stats line (hits, misses, reads, host bubble). |
 | `B70_PLE_INT8_NVME_STATS_S` | `60` | 0013 | stats period, seconds. |
@@ -117,3 +118,52 @@ so a deployment can confirm what is active.
 | `B70_XPU_INT8_ONEDNN` | unset (off) | 0007 | `1`: W8A8 int8 GEMMs (compressed-tensors) on oneDNN `int8_scaled_mm` ahead of Triton, symmetric activations only. `B70_INT8_GEMM_SCALE_MODE=postop` moves the per-token scale into a post-op |
 | `B70_GDN_BACKSTEP_ALIGN_GUARD` | on | 0008 | `0`: let `B70_OFFLOAD_GDN_BACKSTEP` act under `mamba_cache_mode=align` again (not recommended) |
 
+## Switches added in 0.32.0-b70.6 (`v0.32/engine/patches/vllm-v6/`)
+
+Every one is off unless a preset sets it, except the four marked "on". The preset columns: D8 and S8 are the INT8-execution presets, D16e and S16e the BF16-execution ones; the 2-card presets are D8 and S8.
+
+**Set by the presets**
+
+| variable | default | D8 / S8 / D16e / S16e | effect |
+|---|---|---|---|
+| `B70_DENSE_INT8` | `0` | 1 / 1 / 0 / 0 | BF16 dense linears converted at load to int8 per channel, run W8A8 with per-token int8 activations (Triton up to 64 rows, oneDNN above) |
+| `B70_HEAD_INT8` | `0` | 1 / 1 / 0 / 0 | the lm_head as INT8 W8A8 on native int8 DPAS; wins over `B70_HEAD_FP8`, and a drafter sharing the head uses it |
+| `B70_XPU_INT8_ONEDNN` | `0` | 1 / 1 / 0 / 0 | the oneDNN W8A8 GEMM ahead of Triton (b70.5 key) |
+| `B70_MOE_W4A8` | `0` | 2 / 2 / 0 / 0 | routed experts as W4A8: `1` Triton kernels, `2` the native cutlass grouped GEMM in the kernels wheel. `B70_W4A8_LIB_DIR` is not read in mode 2 |
+| `B70_MOE_W4A8_MIN_TOKENS` | `64` | 1 / 1 / unset / unset | batches with fewer tokens stay on W4A16 |
+| `B70_DFLASH_KV_INT8` | `0` | 1 / 1 / unset / unset | drafter context K/V through one KV-only int8 GEMM (bit-identical K/V) |
+| `B70_PTH_FA_DECODE` | `0` | 1 / unset / 1 / unset | FlashAttention on XPU takes `int8_per_token_head` KV with a native INT8 paged decode; without it that KV type raises on FlashAttention |
+| `B70_PTH_FA_PREFILL_FAST` | `0` | 1 / unset / 1 / unset | INT8 KV prefill dequantises with one Triton launch per group, no host reads |
+| `B70_QSA_I8DOT` | `0` | unset / 2 / unset / 0 | int8 Q.K (`1`) and P.V (`2`) DPAS in the QSA kernels over `int8_per_token_head` KV |
+| `B70_PLE_INT8` | `0` | 1 / 1 / 1 / 1 on 4 cards | the INT8 PLE table native in pinned host RAM, about 49 GiB (the 2-card presets use `B70_PLE_INT8_NVME` instead) |
+| `B70_PLE_DEVICE_GATHER` | `0` | 1 on all | the RAM-native PLE producer on the device, inside the graph; the first step compares its bytes with the host path |
+| `B70_SAMPLER_FAST` | `0` | 1 on all | top-k-first temperature sampling and speculative verification; falls back to the stock path for min_p, processed logprobs, k above 32, grammar and similar |
+| `B70_MOE_KCUT` | `0` | 1 on all | the expert-parallel sentinel and the rows-per-expert zero in one Triton kernel (7 kernels fewer per MoE layer) |
+| `B70_AR_INPLACE` | `0` | 1 on all | all-reduce caller-owned outputs in place, no clone |
+| `B70_HC_SILU_FUSE` | `0` | 1 on all | `hc_silu` folded into the parallel hyper-connection down finish kernel |
+| `B70_DFLASH2_AUX_REUSE` | `0` | 1 on all | the DFlash2 aux features reuse the next layer's hyper-connection combine |
+| `CCL_SYCL_ALLREDUCE_ARC` | unset | 1 on all | not an engine switch: oneCCL's core reads it for its Arc all-reduce path; the engine and the legacy plugin do not |
+
+**Other switches of the series**
+
+| variable | default | effect |
+|---|---|---|
+| `B70_PTH_PAD16` | `1` (on) | per-token-head KV halves padded to 16 bytes (544 B at head size 256) so Triton vectorises loads; `0` = tight. Int8 and fp8 per-token-head KV only |
+| `B70_PTH_TD_GUARD` | `1` (on) | per-token-head KV loads K/V by pointer, not by tensor descriptor |
+| `B70_KV_UNIFY_MULTIPLE` | `1` (on) | page unify takes block x floor(ratio) when the draft page is at least twice the target page and not divisible; `0` = plain padding |
+| `B70_PTH_FA_PREFILL`, `B70_PTH_FA_MIN_Q` | `1` (on), `64` | batches with max q above `MIN_Q` dequantise int8 or fp8 KV blocks to a bf16 scratch and run bf16 FlashAttention |
+| `B70_DENSE_INT8_INCLUDE`, `_EXCLUDE`, `_MIN_PARAMS`, `_TRITON_MAX_M` | all / router, GDN a/b, indexer, heads, embeddings and HC regex / `1<<20` / `64` | which linears convert, and the Triton-to-oneDNN row threshold |
+| `B70_DENSE_INT8_FUSED` (+ `_FUSED_MAX_M` 64, `_W8A16_MAX_M` 8) | `0` | small-M dense linears on the fused W8A16 and W8A8 ops of the kernels wheel |
+| `B70_MOE_W4A8_CFG1`, `_CFG2`, `_WLOAD`, `_FUSED_ACT`, `_UVA` | `32,256,8,0,2` / same / `2` / `0` / `0` | W4A8 tile configurations "BM,BN,warps,grf[,wload]", the weight-load scheme, the fused SiLU epilogue, cold experts over UVA |
+| `B70_HC_DOWN_INT8` (+ `_MAX_ROWS`, `_SPS` 4, `_STREAM_SCALE` 0) | `0` | the HC down projection as a deterministic int8 split-K GEMM |
+| `B70_I8_PRODUCER_QUANT` (+ `B70_I8_PQ_SITES`, `_MAX_M`, `_GEMM`, `_K1_MAX_M` 64, `_K1_INCLUDE`, `_NUM_WARPS` 4, `B70_I8D_TILE`) | `0` | per-token int8 activation quantisation folded into the producers (hyper-connection, gated RMSNorm, attention gate) |
+| `B70_K2_HC_CAPTURE_DIR` (+ `_DECODE`, `_PREFILL`, `_EVERY`) | unset | diagnostic dump of HC-down inputs |
+| `B70_DRAFT_FA_INT8` | `0` | the DFlash drafter's attention on the INT8 FlashAttention decode (needs `B70_PTH_FA_DECODE=1` and int8 draft KV) |
+| `B70_PLE_INT8_NVME_PRELOAD` (+ `_THREADS` 4, `_CHUNK_MIB` 64) | `0` | preload the rank's rows into the pinned NVMe row cache |
+| `B70_PLE_INT8_LOAD_THREADS`, `_LOAD_CHUNK_MIB`, `_BOOT_SAMPLE` | `4`, `64`, `4096` | the RAM table's boot read |
+| `B70_SPEC_GREEDY_WARMUP` | `0` | an extra greedy warm-up round for speculative decoding |
+| `B70_TORCH_COMPILE` | `0` | torch.compile for XPU Qwen4Exp with opaque custom ops (experiment) |
+| `B70_GDN_MIXED_NO_SYNC` | `0` | device row indices for mixed speculative and prefill GDN steps, one asynchronous H2D copy |
+| `B70_MTP_BF16_DRAFT`, `B70_DRAFT_LMHEAD_INT4`, `B70_DRAFT_MTP_INT4`, `B70_DRAFT_VOCAB` | off | riceharvest's MTP draft lanes (BF16 MTP layers, int4 draft head, int4 MTP linears, vocab subset) |
+
+Kernel-side: `VLLM_XPU_FUSED_MOE_INT4_GEMV=0` turns off the int4 GEMV the whole-wheel kernels take by default for decode-sized int4 grouped GEMMs ([kernels](kernels.md)).

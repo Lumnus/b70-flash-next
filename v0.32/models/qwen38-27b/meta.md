@@ -5,6 +5,8 @@ AutoRound checkpoint run as W4A8 (oneDNN int4 × int8 on XMX for GEMMs of 512 ro
 decoding (7 draft tokens) and a shortlist draft head. Two presets: one card (147,456-token context) and two cards (the full
 262,144).
 
+Last measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`, which remain the reference for these numbers. On the current whole-wheel kernels decode takes a different path (int4 GEMV, spec-decode changes, per [kernels](../../../docs/kernels.md)), and has not been re-measured.
+
 | | |
 |---|---|
 | weights | `devan-carlin/Qwen3.8-27B-int4-AutoRound` @ `5efb20f2396e8223c2832183c29db23998d7a147` (Apache-2.0; auto-round → INC, int4, group 128, symmetric); file list with object ids: [`weights.oid`](weights.oid) |
