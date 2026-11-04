@@ -10,14 +10,18 @@
 6. **Six presets:** D8-6, D16e-6, S8-6 and S16e-6 on 4 cards, D8-6 and S8-6 on 2 cards; D is dense and S sparse attention, 8 is INT8 and 16e is BF16 execution with 8-bit KV.
 7. **A new engine series,** `v0.32/engine/patches/vllm-v6/` (51 commits), fork tag `v0.32.0-b70.6`.
 
-| preset | cards | decode, 1 stream: prose / code | prefill 32K / 128K (tok/s) |
+Thinking off, temperature 0.7, short prompt; 4 cards at 16 slots, 2 cards at 4.
+
+| preset | cards | decode 1 / 12 / 16 streams | prefill 32K / 128K (tok/s) |
 |---|---|---|---|
-| D8-6 | 4 | 124 / 303 | 6,758 / 4,972 |
-| D16e-6 | 4 | 109 / 258 | 6,309 / 4,732 |
-| S8-6 | 4 | 113 / 288 | 5,944 / 5,586 |
-| S16e-6 | 4 | 102 / 246 | 5,308 / 5,057 |
-| D8-6 | 2 | 72 / 107 | 2,865 / 2,412 |
-| S8-6 | 2 | 68 / 92 | 2,820 / 2,893 |
+| D8-6 | 4 | 124 / 678 / 777 | 6,671 / 5,016 |
+| D16e-6 | 4 | 109 / 640 / 699 | 6,309 / 4,732 |
+| S8-6 | 4 | 117 / 644 / 738 | 5,947 / 5,586 |
+| S16e-6 | 4 | 102 / 606 / 801 | 5,308 / 5,057 |
+| D8-6 | 2 | 72 / — / — | 2,865 / 2,412 |
+| S8-6 | 2 | 68 / — / — | 2,820 / 2,893 |
+
+The 8-bit presets bleed more Chinese tokens into answers to non-English prompts.
 
 The final PLE and fidelity validation ran on the TP4 dense engines (D8-6, D16e-6). The TP2 and sparse variants carry the same levers; they had a short sanity pass.
 

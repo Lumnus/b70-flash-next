@@ -13,9 +13,9 @@
 # prefill chunk
 --max-num-batched-tokens 4096
 # keep the capture list a multiple of 1+K = 8 up to slots x 8
---max-num-seqs 12
+--max-num-seqs 16
 --limit-mm-per-prompt {"image":2,"video":0}
---compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,72,80,88,96,256,512,1024]}
+--compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,256,512,1024]}
 --cudagraph-metrics
 --enable-auto-tool-choice
 --tool-call-parser qwen3_xml
