@@ -29,6 +29,8 @@ Nothing yet.
   credits and upstream status to [docs/credits.md](docs/credits.md) and [docs/upstream.md](docs/upstream.md).
 - Release notes: [RELEASE-NOTES-b70.6.md](RELEASE-NOTES-b70.6.md).
 
+- **After the tag, on main:** D16e-6 and S16e-6 on 4 cards at 16 slots; `preset-d8-6s16-4card`; the 27B and 35B 1-card presets booted on these kernels (the 27B with `B70_PTH_FA_PREFILL=0`); S8-6 on 2 cards re-read on cards 0+3.
+
 ## 0.32.0-b70.5 — 2026-10-31: sparse attention on B70 for Qwen3.8-Flash-Next, three models on one engine; the GDN backstep off in every preset
 
 - **Fix: `B70_OFFLOAD_GDN_BACKSTEP=0` in every preset.** b70.4's two presets (and the 0.30 engine files `s16-kv128-mtp3`,
