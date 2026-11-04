@@ -18,6 +18,7 @@ Nothing yet.
 - **Qwen3.8-27B and Qwen3.6-35B-A3B:** the 1-card presets were booted and measured on these kernels (the 27B with
   `B70_PTH_FA_PREFILL=0`); the 2-card presets and the tables keep their b70.5 numbers.
 - Release notes: [RELEASE-NOTES-b70.7.md](RELEASE-NOTES-b70.7.md).
+- **After the tag, on main:** D16-7 and S16-7, the BF16 KV reference presets, 4 cards at 16 slots, measured on the same tree.
 
 ## 0.32.0-b70.6 — 2026-11-03: INT8 execution and INT8 KV on Qwen3.8-Flash-Next, six presets
 

@@ -13,12 +13,14 @@ temperature 0.7, total tok/s, best of two runs. 4 cards at 16 slots, 2 cards at 
 |---|---|---|---|---|---|---|
 | **D8-7** | 4 · 16 | dense · INT8 · INT8 | 120 / 333 / 667 / 769 | 795 / **855** | **6,772** / 5,004 | 678,259 |
 | **D16e-7** | 4 · 16 | dense · BF16 · INT8 | 112 / 299 / 625 / 682 | 747 / 770 | 6,366 / 4,726 | 606,145 |
+| **D16-7** | 4 · 16 | dense · BF16 · BF16 | 114 / 306 / 628 / 698 | 748 / 775 | 6,358 / 4,718 | 386,060 |
 | **S8-7** | 4 · 16 | sparse · INT8 · INT8 | 115 / 320 / 650 / 741 | 726 / 784 | 6,000 / **5,583** | 631,240 |
 | **S16e-7** | 4 · 16 | sparse · BF16 · INT8 | 105 / 284 / 600 / 739 | 654 / 607 | 5,395 / 5,050 | 566,177 |
+| **S16-7** | 4 · 16 | sparse · BF16 · BF16 | 101 / 292 / 610 / 676 | 701 / 651 | 5,664 / 5,051 | 340,469 |
 | **D8-7** | 2 · 4 | dense · INT8 · INT8 | 69 / 136 / — / — | — | 2,860 / 2,418 | 474,109 |
 | **S8-7** | 2 · 4 | sparse · INT8 · INT8 | 69 / 133 / — / — | — | 2,834 / 2,892 | 559,191 |
 
-The names: D is dense and S sparse attention; 8 and 16 are the execution precision, INT8 or BF16; the `e` marks BF16 execution over an 8-bit KV cache. All these presets keep the KV cache in INT8.
+The names: D is dense and S sparse attention; 8 and 16 are the execution precision, INT8 or BF16; the `e` marks BF16 execution over an 8-bit KV cache. **D16-7 and S16-7 are the reference:** BF16 all the way, the straightforward choice if you don't want to experiment, with about 40 % less KV than their 8-bit-KV siblings.
 
 Non-English prompts can draw stray Chinese characters from this model. Every preset masks them at serving time, unless a system or user turn contains Chinese ([details](v0.32/models/qwen38-flash-next/meta.md#chinese-characters-on-non-english-prompts)).
 

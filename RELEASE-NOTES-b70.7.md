@@ -22,3 +22,5 @@ Engine `v0.32.0-b70.7` (53 commits in `vllm-v6/`); kernels unchanged, `b70/v0.1.
 Fidelity and quality validation ran on the 4-card dense engines. Every preset passed the gates on this tree; S16e-7's limits are on the model page.
 
 [Changelog](CHANGELOG.md), [provenance](PROVENANCE.md), [switches](docs/switches.md).
+
+Added on main after this tag: D16-7 and S16-7, the BF16 KV reference presets.
