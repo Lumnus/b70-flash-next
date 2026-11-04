@@ -17,7 +17,7 @@
 | S8-6 | 4 | 113 / 288 | 5,944 / 5,586 |
 | S16e-6 | 4 | 100 / 236 | 5,280 / 5,061 |
 | D8-6 | 2 | 72 / 107 | 2,865 / 2,412 |
-| S8-6 | 2 | 67 / 92 | 2,404 / 2,505 |
+| S8-6 | 2 | 68 / 92 | 2,820 / 2,893 |
 
 The final PLE and fidelity validation ran on the TP4 dense engines (D8-6, D16e-6). The TP2 and sparse variants carry the same levers; they had a short sanity pass.
 

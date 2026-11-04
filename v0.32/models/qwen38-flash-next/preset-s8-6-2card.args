@@ -23,7 +23,7 @@
 # generic template, relative to the kit root
 --chat-template v0.32/models/qwen38-flash-next/chat_template.jinja
 # CPU KV tier, GiB of pinned host RAM split evenly over the ranks; a power of two per rank.
-# This preset holds about 90 GiB of host RAM at 32. A 64 GiB tier adds 32 and suits a 128 GB host only with little else running.
+# This preset holds about 90 GiB of host RAM at 32.
 --kv-offloading-size 32
 --kv-offloading-backend native
 # DFlash2 block-diffusion drafter, 7 draft tokens, W8A8 weights

@@ -110,4 +110,4 @@ Pinned memory does not count against a container limit, so watch the host's MemA
 | 2 cards, 32 GiB KV tier | about 90 GiB per engine (two engines on our 251 GiB host left 61 GiB) |
 | 4 cards, 128 GiB KV tier | about 200 GiB (MemAvailable 40 GiB on our 251 GiB host) |
 
-A 64 GiB tier on 2 cards adds 32 GiB, about 122 GiB in all, so it fits a 128 GB host only with little else running.
+Each GiB of KV tier is one GiB of pinned host RAM.
