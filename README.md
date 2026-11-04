@@ -6,7 +6,7 @@ you can take the presets as they are or compose your own combination from the sa
 
 ## Presets
 
-Flash-Next, Intel AutoRound W4A16 weights, DFlash2 speculative decoding, 262,144-token context. Decode is total tok/s.
+Flash-Next, Intel AutoRound W4A16 weights, DFlash2 speculative decoding, 262,144-token context. Decode is total tok/s, thinking off, prose at temperature 0.7, code at 0.
 
 | preset | cards · slots | attention · execution | decode, 1 stream: prose / code | peak decode: prose / code (streams) | prefill 32K / 128K (tok/s) | GPU KV (tokens) |
 |---|---|---|---|---|---|---|

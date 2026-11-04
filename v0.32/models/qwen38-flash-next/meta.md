@@ -31,7 +31,7 @@ Each preset is a list of switches on one tree. D, S, 8, 16 and the card count ar
 
 ## Numbers
 
-Measured on our host (AMD EPYC 7402, 256 GB, 4× B70). Decode is total tok/s, `ignore_eos`, 512 tokens, best of two runs: prose at temperature 0.7, code greedy.
+Measured on our host (AMD EPYC 7402, 256 GB, 4× B70). Decode is total tok/s, thinking off, `ignore_eos`, 512 tokens, best of two runs: prose at temperature 0.7, code at 0. Needle: thinking off, temperature 0. Quality: thinking on (medium), temperature 0.
 Prefill is uncached, mean of two.
 
 | | D8-6, 4 cards | D16e-6, 4 cards | S8-6, 4 cards | S16e-6, 4 cards | D8-6, 2 cards | S8-6, 2 cards |
