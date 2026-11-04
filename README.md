@@ -17,7 +17,7 @@ Flash-Next, Intel AutoRound W4A16 weights, DFlash2 speculative decoding, 262,144
 | **D8-6** | 2 · 4 | dense · INT8 | 72 / 107 | 132 / 205 (4) | 2,865 / 2,412 | 426,060 |
 | **S8-6** | 2 · 4 | sparse · INT8 | 68 / 92 | 128 / 195 (4) | 2,820 / 2,893 | 504,608 |
 
-D8-6 also comes with 16 slots (`preset-d8-6s16-4card`), which carries more parallel clients for about 4 % less GPU KV. The 4-card presets keep the n-gram table in host RAM and use a 128 GiB KV tier. The 2-card presets read the table from NVMe
+D8-6 also comes with 16 slots (`preset-d8-6s16-4card`), which carries more parallel clients for about 4 % less GPU KV. Peaks here are short prompts; [with a 2K prompt](v0.32/models/qwen38-flash-next/meta.md#numbers) D8-6 keeps climbing to 16 streams and the others peak at 12. The 4-card presets keep the n-gram table in host RAM and use a 128 GiB KV tier. The 2-card presets read the table from NVMe
 and use a 32 GiB KV tier per engine, so two of them run side by side on four cards. Dense is faster on short prompts, and
 sparse overtakes it as the prompt grows (128K row above). How each number was measured: [model page](v0.32/models/qwen38-flash-next/meta.md).
 

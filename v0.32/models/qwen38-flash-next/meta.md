@@ -47,8 +47,17 @@ Prefill is uncached, mean of two.
 1. **Testing depth.** D8-6 and D16e-6 on 4 cards carry the full validation (gates, fidelity, quality, agentic); on D16e-6 that ran at 12 slots, and its speed row is read at 16. The 2-card presets had a short pass on this tree (gates, a short speed read, a needle); the 4-card sparse presets had a boot, a speed read and a needle. Other combinations carry the same switches and were not run.
 2. **Fidelity.** Against D16e, INT8 execution moves token agreement (top-1 against a BF16 reference 86–88 % vs about 94 %). MMLU and TruthfulQA do not separate them (McNemar p 0.45 and 1.0), nor does the agentic test (36/50 vs 38/50, Fisher p 0.82). 8-bit KV against BF16 KV is at the repeat floor past 8K tokens, and visible below that, mostly on prose.
 3. **2-card pairs.** Both 2-card columns are cards 0+3. The card pair matters on our host: S8-6 on cards 1+2 prefills 2,404 / 2,505 and decodes 67 / 92 (1 stream), 136 / 181 (4). Its gates and needle ran on 1+2, with D8-6 up and idle on 0+3.
-4. **16 slots on D8-6:** 2K prompt, 512 tokens, total tok/s, two runs: 16 clients 848 / 851 at 16 slots against 698 / 687 at 12 with four queued; 12 clients 783 / 825 against 790 / 787. GPU KV 645,001 against 672,772.
-5. Sparse against dense with earlier builds: [measurements](../../../docs/measurements/v0.32-qsa.md). Older presets and numbers: [earlier builds](../../../docs/measurements/flash-next-earlier-builds.md).
+4. **16 slots on D8-6:** 2K prompt, 512 tokens, temperature 0.7, total tok/s, two runs: 16 clients 848 / 851 at 16 slots against 698 / 687 at 12 with four queued; 12 clients 783 / 825 against 790 / 787. GPU KV 645,001 against 672,772.
+5. **Parallel load, all at 16 slots:** 2K prompt, 512 tokens, temperature 0.7, thinking off, total decode tok/s, two runs. On a short prompt the 16-stream rows above read higher; with this prefill load three of the four peak at 12.
+
+   | | 8 | 12 | 16 | prefill at 16 |
+   |---|---|---|---|---|
+   | D8-6 | 666 / 681 | 767 / 778 | 880 / 847 | 6,760 / 6,868 |
+   | S8-6 | 606 / 629 | 757 / 735 | 715 / 674 | 3,356 / 3,028 |
+   | D16e-6 | 620 / 630 | 724 / 742 | 685 / 662 | 3,138 / 3,207 |
+   | S16e-6 | 549 / 578 | 670 / 678 | 598 / 607 | 2,892 / 2,846 |
+
+6. Sparse against dense with earlier builds: [measurements](../../../docs/measurements/v0.32-qsa.md). Older presets and numbers: [earlier builds](../../../docs/measurements/flash-next-earlier-builds.md).
 
 ## Weights
 
