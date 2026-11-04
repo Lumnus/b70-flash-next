@@ -1,10 +1,10 @@
-# PROVENANCE — b70-flash-next 0.30.0-b70.1, 0.30.0-b70.2 and 0.32.0-b70.1 to 0.32.0-b70.6
+# PROVENANCE — b70-flash-next 0.30.0-b70.1, 0.30.0-b70.2 and 0.32.0-b70.1 to 0.32.0-b70.7
 
 Where every piece of the image comes from, and the hashes that prove it. Grades: **[M]** measured by us ·
 **[W]** third-party claim, not reproduced · **UNVERIFIED**. The source of the vLLM patches is the fork branch
 `b70/v0.30.0` of github.com/Lumnus/vllm (one commit per patch on v0.30.0 `ced6857afa`); `v0.30/patches/` is exported from
 it by `v0.30/scripts/export-series.sh` and checked by `v0.30/scripts/check-series.sh`. From 0.30.0-b70.2 the branch is
-`b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7). The 0.32 line (`v0.32/`) is pinned in §8 (0.32.0-b70.1 and the b70.4 addendum), §9 (0.32.0-b70.5) and §10 (0.32.0-b70.6, the current release).
+`b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (§7). The 0.32 line (`v0.32/`) is pinned in §8 (0.32.0-b70.1 and the b70.4 addendum), §9 (0.32.0-b70.5), §10 (0.32.0-b70.6) and §11 (0.32.0-b70.7, the current release).
 
 ## 1. Bases
 
@@ -360,3 +360,14 @@ tree.
 7. **The K3 equivalent of vllm-project/vllm#63347** (the KV page unify takes the integer block multiple when the draft page is at least twice the target page): `vllm-v6/` 0004, `B70_KV_UNIFY_MULTIPLE` (default on).
 8. **IP-D** (native INT8 per-token-head KV decode on FlashAttention): the engine side `vllm-v6/` 0022; the kernel side `vllm-xpu-kernels/` 0009 (wiesion's commit).
 9. **vllm-project/vllm-xpu-kernels#605** (grouped GEMM scale-prefetch pitch guard): `vllm-xpu-kernels/` 0005. **#196** (the symmetric path, ported into the native int8 ops): `vllm-xpu-kernels/` 0003. **The strict fallback** (a missing kernel configuration raises during graph capture instead of falling back to the reference attention): `vllm-xpu-kernels/` 0015.
+
+## 11. Release 0.32.0-b70.7 (2026-11-04)
+
+| piece | pin |
+|---|---|
+| fork, engine | github.com/Lumnus/vllm tag `v0.32.0-b70.7` (tag object `02dddefb043b68bfa00b3fb019e4a958da6793d7`) → commit `252441f609505fe2b4b83ad14d7428ea448466dc`, tree `24299f35f855cdd0cd36e5565f1149d5efbb2e94` = tag `v0.32.0-b70.6` + 2 commits, 162 commits on v0.32.0, five directories (`vllm-v6/` now 53) |
+| the 2 commits | `vllm-v6/` 0052 B70-CJK: serving-side Han mask with a per-request auto gate (`B70_CJK_MASK`, default 0); 0053 B70-IP-K4/K5: `B70_PTH_FA_PREFILL` default off. Both authored and committed `Lumnus` |
+| trunk | the maintainers' trunk `5026e7a` (`b70/v0.32-trunk`); `check-trunk-tree.sh` and `check-series.sh --all` cover the five directories as in §10 |
+| kernels, compiled | unchanged from §10: the same 15 commits (tree `d87547a135efb1fb2f1a5d4388af82dfeb708c79`), branch `b70/v0.1.16-b70.6`, the same whole wheel recipe; sycl-tla patches unchanged |
+| presets | `v0.32/models/qwen38-flash-next/preset-{d8-7,d16e-7,s8-7,s16e-7}-4card` (16 slots) and `preset-{d8-7,s8-7}-2card` (4 slots). Numbers: the model page, measured on this tag; the 4-card dense presets carry the fidelity and quality validation |
+| Qwen3.8-27B, Qwen3.6-35B-A3B | pins as in §9; the 1-card presets measured on this tag and the §10 kernels, the 2-card presets and the tables on `v0.32.0-b70.5` with kernels `b70/v0.1.16` |

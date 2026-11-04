@@ -1,16 +1,15 @@
-# preset-d8-6-4card.args — `vllm serve` flags of Qwen3.8-Flash-Next D8-6, dense FlashAttention, INT8 execution, INT8 KV, 4 cards. One flag and its value per line.
-# Run: v0.32/engine/serve.sh qwen38-flash-next preset-d8-6-4card
+# preset-s16e-7-4card.args — `vllm serve` flags of Qwen3.8-Flash-Next S16e-7, sparse QSA, BF16 execution, INT8 KV, 4 cards. One flag and its value per line.
+# Run: v0.32/engine/serve.sh qwen38-flash-next preset-s16e-7-4card
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
 --dtype bfloat16
+# 8-bit KV, per-token-head scale
+--kv-cache-dtype int8_per_token_head
 --tensor-parallel-size 4
 --enable-expert-parallel
 --trust-remote-code
 --max-model-len 262144
---attention-backend FLASH_ATTN
-# 8-bit KV, per-token-head scale
---kv-cache-dtype int8_per_token_head
 # prefill chunk
 --max-num-batched-tokens 4096
 # keep the capture list a multiple of 1+K = 8 up to slots x 8
@@ -26,8 +25,8 @@
 # CPU KV tier, GiB of pinned host RAM split evenly over the ranks; a power of two per rank.
 --kv-offloading-size 128
 --kv-offloading-backend native
-# DFlash2 block-diffusion drafter, 7 draft tokens, W8A8 weights
---speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2-w8a8","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
+# DFlash2 block-diffusion drafter, 7 draft tokens
+--speculative-config {"method":"dflash","model":"/models/qwen3.8-flash-next/DFlash2","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"draft_sample_method":"probabilistic","rejection_sample_method":"standard","attention_backend":"TRITON_ATTN"}
 --enable-prompt-tokens-details
 # server default temperature; a request's own value wins
 --override-generation-config {"temperature": 0.7}

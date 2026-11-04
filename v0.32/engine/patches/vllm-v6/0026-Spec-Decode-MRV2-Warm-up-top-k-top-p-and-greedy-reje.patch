@@ -1,7 +1,7 @@
 From 9303e5d368d9c809830b33cf11b634b9cdb05e3f Mon Sep 17 00:00:00 2001
 From: qizixi <22851944+zixi-qi@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:59:22 +0000
-Subject: [PATCH 26/51] [Spec Decode][MRV2] Warm up top-k/top-p and greedy
+Subject: [PATCH 26/53] [Spec Decode][MRV2] Warm up top-k/top-p and greedy
  rejection kernels for speculative decoding (#59260)
 
 Upstream c1407a7e86a8666cb9223e8e2b818ef4b81e53c0 (merged 2026-10-14), with

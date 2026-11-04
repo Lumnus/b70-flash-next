@@ -1,7 +1,7 @@
 From faffecd37997162d95dadd91bd0ac9309911c614 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:20 +0000
-Subject: [PATCH 40/51] B70-V7: CPU tests for KV8, DFA, K4F, AUX, PLEG
+Subject: [PATCH 40/53] B70-V7: CPU tests for KV8, DFA, K4F, AUX, PLEG
 
 TRITON_INTERPRET=1 CUDA_VISIBLE_DEVICES= pytest -q --noconftest tests/v1/core/test_b70_v7.py
 (30 passed on CPU, torch 2.14.0+xpu, Triton 3.8 interpreter).

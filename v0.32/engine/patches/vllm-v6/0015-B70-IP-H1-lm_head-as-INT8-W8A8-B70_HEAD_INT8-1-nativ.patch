@@ -1,7 +1,7 @@
 From c68b32f91805174c9d5cb823b379e3ca7f78b2ee Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 17:48:19 +0000
-Subject: [PATCH 15/51] B70-IP-H1: lm_head as INT8 W8A8 (B70_HEAD_INT8=1),
+Subject: [PATCH 15/53] B70-IP-H1: lm_head as INT8 W8A8 (B70_HEAD_INT8=1),
  native int8 DPAS
 
 The FP8 W8A16 head upcasts e4m3 to bf16 (storage only). Per-row int8

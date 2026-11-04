@@ -1,7 +1,7 @@
 From 277fa0d88f2003d0a3c49cbc4f4a1c66cb7f73c5 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:04:11 +0000
-Subject: [PATCH 23/51] B70-IP-D2: CPU tests (spec gate, split views, writer,
+Subject: [PATCH 23/53] B70-IP-D2: CPU tests (spec gate, split views, writer,
  K4 parity, routing)
 
 tests/v1/core/test_b70_ip_d2.py, no GPU:

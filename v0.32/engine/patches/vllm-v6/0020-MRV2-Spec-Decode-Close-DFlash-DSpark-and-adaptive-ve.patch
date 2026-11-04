@@ -1,7 +1,7 @@
 From ea9b24e3dc9ceba2e74599f85667fc0e4a337011 Mon Sep 17 00:00:00 2001
 From: Misha Goin <mgoin64@gmail.com>
 Date: Tue, 27 Oct 2026 21:15:00 -0400
-Subject: [PATCH 20/51] [MRV2][Spec Decode] Close DFlash/DSpark and
+Subject: [PATCH 20/53] [MRV2][Spec Decode] Close DFlash/DSpark and
  adaptive-verification JIT warmup gaps (#63819)
 
 Signed-off-by: mgoin <mgoin64@gmail.com>

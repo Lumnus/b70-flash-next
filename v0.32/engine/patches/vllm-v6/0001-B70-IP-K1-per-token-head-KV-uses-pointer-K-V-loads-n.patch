@@ -1,7 +1,7 @@
 From b12e778094f5b972a3744110bf396ffe62f46932 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 13:52:01 +0000
-Subject: [PATCH 01/51] B70-IP-K1: per-token-head KV uses pointer K/V loads,
+Subject: [PATCH 01/53] B70-IP-K1: per-token-head KV uses pointer K/V loads,
  not tensor descriptors
 
 Per-token-head KV packs one fp32 scale after each head ([K|s|V|s] per slot),

@@ -1,7 +1,7 @@
 From 692ea66e748937e510bade95d1c9b10e5354001a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 19:32:02 +0000
-Subject: [PATCH 18/51] B70-IP-W4A8c: MoE experts via the native cutlass W4A8
+Subject: [PATCH 18/53] B70-IP-W4A8c: MoE experts via the native cutlass W4A8
  grouped GEMM (B70_MOE_W4A8=2)
 
 Applies the IP-L patch: for prefill-sized batches (>= B70_MOE_W4A8_MIN_TOKENS,

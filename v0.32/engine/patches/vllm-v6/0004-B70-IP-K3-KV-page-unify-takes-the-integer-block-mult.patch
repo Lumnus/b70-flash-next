@@ -1,7 +1,7 @@
 From 1f05857a8f8c2bb3ddd0de581affc3d329c7d764 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 14:24:13 +0000
-Subject: [PATCH 04/51] B70-IP-K3: KV page unify takes the integer block
+Subject: [PATCH 04/53] B70-IP-K3: KV page unify takes the integer block
  multiple before padding
 
 A draft model page 2.03x the target page (int8 per-token-head KV with inline

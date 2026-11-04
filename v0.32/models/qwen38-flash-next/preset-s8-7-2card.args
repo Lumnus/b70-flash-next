@@ -1,5 +1,5 @@
-# preset-s8-6-2card.args — `vllm serve` flags of Qwen3.8-Flash-Next S8-6, sparse QSA, INT8 execution, INT8 KV, 2 cards. One flag and its value per line.
-# Run: v0.32/engine/serve.sh qwen38-flash-next preset-s8-6-2card
+# preset-s8-7-2card.args — `vllm serve` flags of Qwen3.8-Flash-Next S8-7, sparse QSA, INT8 execution, INT8 KV, 2 cards. One flag and its value per line.
+# Run: v0.32/engine/serve.sh qwen38-flash-next preset-s8-7-2card
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000

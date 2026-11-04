@@ -1,7 +1,7 @@
 From 9e00c2ecd7cee81b049bccacf86db76d8c2d119c Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 16:48:11 +0000
-Subject: [PATCH 08/51] B70-IP-K4b/K5: scratch sized at impl init; FA-bf16
+Subject: [PATCH 08/53] B70-IP-K4b/K5: scratch sized at impl init; FA-bf16
  prefill over fp8 KV
 
 K4b: the one-layer bf16 prefill scratch is sized to max_model_len captured

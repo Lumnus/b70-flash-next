@@ -1,7 +1,7 @@
 From 6001f71d7e3175dc0aece694d79333f792b9dcdd Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 14:24:13 +0000
-Subject: [PATCH 05/51] B70-IP-W1: BF16 dense linears as W8A8 int8 on XPU
+Subject: [PATCH 05/53] B70-IP-W1: BF16 dense linears as W8A8 int8 on XPU
  (B70_DENSE_INT8=1)
 
 Opt-in. After loading, unquantized linears passing include/exclude regexes are

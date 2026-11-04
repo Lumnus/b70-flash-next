@@ -1,7 +1,7 @@
 From 26f51dae6bcfc4aa872f8cbc8e646e9d4fffce5e Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:52:48 +0000
-Subject: [PATCH 32/51] B70-IP-PAD16: D2 split views and K4 dequant follow the
+Subject: [PATCH 32/53] B70-IP-PAD16: D2 split views and K4 dequant follow the
  16-B padded per-token-head slot
 
 FLASH_ATTN's D2 spec already delegates to TritonAttentionBackend.customize_spec,

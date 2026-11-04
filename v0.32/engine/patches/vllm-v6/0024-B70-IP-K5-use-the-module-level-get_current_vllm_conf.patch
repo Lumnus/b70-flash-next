@@ -1,7 +1,7 @@
 From 06ec86f43bdd3f24bfdf556a6a5c8ec1c0a7b9cb Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:05:52 +0000
-Subject: [PATCH 24/51] B70-IP-K5: use the module-level
+Subject: [PATCH 24/53] B70-IP-K5: use the module-level
  get_current_vllm_config_or_none (local import shadowed it: UnboundLocalError
  on non-XPU)
 

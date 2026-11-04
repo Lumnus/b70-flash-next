@@ -1,7 +1,7 @@
 From 8dc0ea8c99300a43b9f46655da5c8c3adf08255f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:01:58 +0000
-Subject: [PATCH 41/51] B70-TC: torch.compile for XPU Qwen4Exp behind
+Subject: [PATCH 41/53] B70-TC: torch.compile for XPU Qwen4Exp behind
  B70_TORCH_COMPILE=1 (carried unchanged)
 
 Re-decorates Qwen4ExpModel with support_torch_compile (enable_if B70_TORCH_COMPILE=1),

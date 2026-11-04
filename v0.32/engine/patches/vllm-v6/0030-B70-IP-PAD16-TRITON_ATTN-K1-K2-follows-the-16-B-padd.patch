@@ -1,7 +1,7 @@
 From f5e8721607e93a5ea0f2ab54051732c2d94ebebe Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:52:35 +0000
-Subject: [PATCH 30/51] B70-IP-PAD16: TRITON_ATTN (K1/K2) follows the 16-B
+Subject: [PATCH 30/53] B70-IP-PAD16: TRITON_ATTN (K1/K2) follows the 16-B
  padded per-token-head slot
 
 One definition of the per-token-head slot half in triton_attn

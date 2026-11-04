@@ -1,7 +1,7 @@
 From ddedb6b7b61671de9c666190341eb5f731cb8f40 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:20 +0000
-Subject: [PATCH 38/51] B70-V7-AUX: DFlash2 aux features reuse the next layer's
+Subject: [PATCH 38/53] B70-V7-AUX: DFlash2 aux features reuse the next layer's
  HC combine (B70_DFLASH2_AUX_REUSE=1)
 
 At the five aux boundaries capture_completed_layer ran a separate hc_combine

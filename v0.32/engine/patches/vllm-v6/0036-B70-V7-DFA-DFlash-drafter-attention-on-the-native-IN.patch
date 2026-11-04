@@ -1,7 +1,7 @@
 From 4193f51142ffe4dc4b985bb7c2ec6bfeac854902 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:20 +0000
-Subject: [PATCH 36/51] B70-V7-DFA: DFlash drafter attention on the native INT8
+Subject: [PATCH 36/53] B70-V7-DFA: DFlash drafter attention on the native INT8
  FA decode (B70_DRAFT_FA_INT8=1)
 
 With B70_PTH_FA_DECODE=1 and an int8_per_token_head draft KV,

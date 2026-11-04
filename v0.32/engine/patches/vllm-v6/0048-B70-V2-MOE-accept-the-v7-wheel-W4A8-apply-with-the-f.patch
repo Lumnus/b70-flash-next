@@ -1,7 +1,7 @@
 From 042dcebd1a07379e29857985ddb3adc155ed6b18 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 11:58:14 +0000
-Subject: [PATCH 48/51] B70-V2-MOE: accept the v7 wheel (W4A8 apply with the
+Subject: [PATCH 48/53] B70-V2-MOE: accept the v7 wheel (W4A8 apply with the
  fused gemm1 epilogue branch)
 
 v7 wheel: XpuFusedMoe._apply_kernel unchanged (32c13063d42ad5ae);

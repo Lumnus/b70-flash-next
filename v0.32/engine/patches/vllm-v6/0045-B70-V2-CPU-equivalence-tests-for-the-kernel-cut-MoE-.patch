@@ -1,7 +1,7 @@
 From ccb0d32ad3930fe6f3a9166f53514e767043e346 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:06 +0000
-Subject: [PATCH 45/51] B70-V2: CPU equivalence tests for the kernel cut (MoE
+Subject: [PATCH 45/53] B70-V2: CPU equivalence tests for the kernel cut (MoE
  replicas vs wheel bodies, HC finish+silu, in-place all-reduce)
 
 ---

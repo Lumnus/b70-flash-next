@@ -1,7 +1,7 @@
 From ba5bdf9b9f384509a1c75118e2744170b6dcbfea Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:06 +0000
-Subject: [PATCH 42/51] B70-V2-MOE: EP sentinel + rows_per_expert zero in one
+Subject: [PATCH 42/53] B70-V2-MOE: EP sentinel + rows_per_expert zero in one
  Triton kernel, dead padding mask dropped (B70_MOE_KCUT=1)
 
 After the EP sentinel rewrite every topk id is >= 0, so the (ids<0).all(1) + masked_fill in

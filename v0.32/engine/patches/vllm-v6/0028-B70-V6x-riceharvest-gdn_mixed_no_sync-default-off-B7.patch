@@ -1,7 +1,7 @@
 From b4d0e19cdb02884d711a08b08d01e109ab091d4c Mon Sep 17 00:00:00 2001
 From: riceharvest <myappleiddarimaan@gmail.com>
 Date: Sat, 31 Oct 2026 22:58:20 +0000
-Subject: [PATCH 28/51] B70-V6x: riceharvest gdn_mixed_no_sync (default off,
+Subject: [PATCH 28/53] B70-V6x: riceharvest gdn_mixed_no_sync (default off,
  B70_GDN_MIXED_NO_SYNC)
 
 riceharvest/vllm b70/v0.32 4cc29dd3ef patch_gdn_mixed_no_sync: in a mixed

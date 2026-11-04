@@ -6,6 +6,19 @@ Versions are `<vLLM base>-b70.<N>`; N increases whenever the patch series change
 
 Nothing yet.
 
+## 0.32.0-b70.7 — 2026-11-04: Han mask, prefill scratch off, 16 slots, the `-7` presets
+
+- **Engine: fork tag `v0.32.0-b70.7`** (`252441f609`, tree `24299f35f8`), b70.6's engine + 2 commits, 53 in `vllm-v6/`:
+  0052 the serving-side Han mask (`B70_CJK_MASK`, default 0, set to 1 in every preset; it switches itself off when a system or
+  user turn contains Chinese, and `cjk_mask: false` per request overrides), 0053 `B70_PTH_FA_PREFILL` default 0 (the bf16 prefill
+  scratch halved prefill at 16 streams and cost KV). Kernels unchanged: branch `b70/v0.1.16-b70.6`.
+- **Presets:** D8-7, D16e-7, S8-7 and S16e-7 on 4 cards at 16 slots, D8-7 and S8-7 on 2 cards at 4 slots, replacing the `-6` presets.
+  D8-7 on 4 cards: 120 / 333 / 667 / 769 tok/s at 1 / 4 / 12 / 16 streams on a short prompt ([model page](v0.32/models/qwen38-flash-next/meta.md)).
+  S8-7 on 2 cards runs on cards 0+3, like D8-7.
+- **Qwen3.8-27B and Qwen3.6-35B-A3B:** the 1-card presets were booted and measured on these kernels (the 27B with
+  `B70_PTH_FA_PREFILL=0`); the 2-card presets and the tables keep their b70.5 numbers.
+- Release notes: [RELEASE-NOTES-b70.7.md](RELEASE-NOTES-b70.7.md).
+
 ## 0.32.0-b70.6 — 2026-11-03: INT8 execution and INT8 KV on Qwen3.8-Flash-Next, six presets
 
 - **Engine: fork tag `v0.32.0-b70.6`**, b70.5's engine + 51 commits in the new `v0.32/engine/patches/vllm-v6/`: INT8 execution
@@ -27,9 +40,7 @@ Nothing yet.
 - **Layout.** The engine page moved to [docs/engine-details.md](docs/engine-details.md) (patch by patch), `v0.32/README.md` is now
   the short engine page with the build, `RELEASE-NOTES-b70.5.md` moved to [docs/releases/b70.5.md](docs/releases/b70.5.md),
   credits and upstream status to [docs/credits.md](docs/credits.md) and [docs/upstream.md](docs/upstream.md).
-- Release notes: [RELEASE-NOTES-b70.6.md](RELEASE-NOTES-b70.6.md).
-
-- **After the tag, on main:** all 4-card presets at 16 slots, numbers read at 16; the 27B and 35B 1-card presets booted on these kernels (the 27B with `B70_PTH_FA_PREFILL=0`); S8-6 on 2 cards re-read on cards 0+3.
+- Release notes: [docs/releases/b70.6.md](docs/releases/b70.6.md).
 
 ## 0.32.0-b70.5 — 2026-10-31: sparse attention on B70 for Qwen3.8-Flash-Next, three models on one engine; the GDN backstep off in every preset
 

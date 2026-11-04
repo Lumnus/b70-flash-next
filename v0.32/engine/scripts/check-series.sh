@@ -5,19 +5,19 @@
 #   v0.32/engine/scripts/check-series.sh --qsa [--git-dir DIR]      sparse:   patches/vllm-qsa     = v0.32.0-b70.4-dense..v0.32.0-b70.4-qsa
 #   v0.32/engine/scripts/check-series.sh --hotcold [--git-dir DIR]  hot/cold: patches/vllm-hotcold = v0.32.0-b70.4-qsa..v0.32.0-b70.4
 #   v0.32/engine/scripts/check-series.sh --models [--git-dir DIR]   models:   patches/vllm-models  = v0.32.0-b70.4..v0.32.0-b70.5
-#   v0.32/engine/scripts/check-series.sh --v6 [--git-dir DIR]       v6:       patches/vllm-v6      = v0.32.0-b70.5..v0.32.0-b70.6
+#   v0.32/engine/scripts/check-series.sh --v6 [--git-dir DIR]       v6:       patches/vllm-v6      = v0.32.0-b70.5..v0.32.0-b70.7
 #   v0.32/engine/scripts/check-series.sh --all [--no-v6] [--git-dir DIR]   all five (--no-v6: the first four, for the b70.5 engine)
 #
 #   --git-dir  a vLLM clone (default: ./vllm-src-032, cloned on demand from https://github.com/Lumnus/vllm.git)
 #
-# The engine is fork tag v0.32.0-b70.6 (160 commits on v0.32.0); the three b70.4 tags and
+# The engine is fork tag v0.32.0-b70.7 (162 commits on v0.32.0); the three b70.4 tags and
 # v0.32.0-b70.5 mark where the dense base, the sparse layer, the hot/cold layer and the models layer end.
 # The export is `git format-patch` of the range, one file per commit, abbrev 10, no signature.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 BASE=5df63a7203cdb9328d824a27b682e77c7b9928be
 REPO_URL=https://github.com/Lumnus/vllm.git
-DENSE=v0.32.0-b70.4-dense; QSA=v0.32.0-b70.4-qsa; HOTCOLD=v0.32.0-b70.4; ENGINE=v0.32.0-b70.5; V6=v0.32.0-b70.6
+DENSE=v0.32.0-b70.4-dense; QSA=v0.32.0-b70.4-qsa; HOTCOLD=v0.32.0-b70.4; ENGINE=v0.32.0-b70.5; V6=v0.32.0-b70.7
 gd="$PWD/vllm-src-032"; which=(dense); no6=0
 while [ $# -gt 0 ]; do
   case "$1" in

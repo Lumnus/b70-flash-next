@@ -1,7 +1,7 @@
 From 5d7834d4d954d89f113cd982f31b8e2dccafdc7d Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:06 +0000
-Subject: [PATCH 44/51] B70-V2-HC: fold hc_silu into the parallel HC down
+Subject: [PATCH 44/53] B70-V2-HC: fold hc_silu into the parallel HC down
  finish kernel (B70_HC_SILU_FUSE=1)
 
 _hc_finish_silu writes the down output and silu(down[:, :lora]/HC) from the stored BF16 value.

@@ -1,7 +1,7 @@
 From ef1f566ef8071b4da69c3a216da6bccac809694b Mon Sep 17 00:00:00 2001
 From: Misha Goin <mgoin64@gmail.com>
 Date: Mon, 26 Oct 2026 17:25:23 -0400
-Subject: [PATCH 19/51] [Spec Decode] Replace torch.compile'd AV draft-budget
+Subject: [PATCH 19/53] [Spec Decode] Replace torch.compile'd AV draft-budget
  selection with a Triton kernel (#63421)
 
 Signed-off-by: mgoin <mgoin64@gmail.com>

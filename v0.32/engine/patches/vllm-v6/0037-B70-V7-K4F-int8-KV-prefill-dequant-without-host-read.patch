@@ -1,7 +1,7 @@
 From 93b54344c4b85603322df74bc06416c0897c0375 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:20 +0000
-Subject: [PATCH 37/51] B70-V7-K4F: int8 KV prefill dequant without host reads
+Subject: [PATCH 37/53] B70-V7-K4F: int8 KV prefill dequant without host reads
  (B70_PTH_FA_PREFILL_FAST=1)
 
 K4 dequantised each sequence's blocks in a Python loop of 4-block slices per

@@ -1,7 +1,7 @@
 From cab92f8a226b02a5820a1287fd0cf46fa0b94557 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 15:53:39 +0000
-Subject: [PATCH 10/51] B70-IP-K6: --kv-cache-dtype int8_per_token_head for
+Subject: [PATCH 10/53] B70-IP-K6: --kv-cache-dtype int8_per_token_head for
  Qwen4Exp QSA
 
 What: the QSA backend, impl and owner accept int8_per_token_head. The backend

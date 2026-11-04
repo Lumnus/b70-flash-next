@@ -2,7 +2,7 @@
 
 vLLM v0.32.0 with wu1ff's 1.0.5 B70 chain and our B70 work on top, for Intel Arc Pro B70 (32 GB). One tree serves every
 preset: card count, attention, execution precision, drafter and offload are flags and environment switches. The engine is fork tag
-[`v0.32.0-b70.6`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.6). Tested host: AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe, 4× B70.
+[`v0.32.0-b70.7`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.7). Tested host: AMD EPYC 7402, 256 GB RAM, WD_BLACK SN850X 4 TB NVMe, 4× B70.
 
 ## The series
 
@@ -16,7 +16,7 @@ compares them with a trunk at tree level.
 | `vllm-qsa/` | 38 | sparse attention (QSA) |
 | `vllm-hotcold/` | 13 | hot/cold expert offload (Niluthon's patches and ours) |
 | `vllm-models/` | 8 | FP8 head, Triton W8A8 tiles, asynchronous swap, shortlist draft head, native int8 activation quantisation, backstep guard |
-| `vllm-v6/` | 51 | INT8 execution (dense linears, head, W4A8 experts, drafter), INT8 KV on FlashAttention and QSA, in-graph PLE gather, kernel cuts, fast sampler |
+| `vllm-v6/` | 53 | INT8 execution (dense linears, head, W4A8 experts, drafter), INT8 KV on FlashAttention and QSA, in-graph PLE gather, kernel cuts, fast sampler, Han mask |
 
 Also here: `vllm-xpu-kernels/` (15 commits on upstream `6b30c9b`), `vllm-xpu-kernels-py/` (the astra Python modules),
 `libgdn-index64/`, `sycl-tla/`. Patch by patch: [engine details](../docs/engine-details.md). Every switch: [switches](../docs/switches.md).
@@ -41,7 +41,7 @@ The commands behind our environment, with our paths as placeholders. They have b
 
 2. **vLLM and the Python environment.**
    ```bash
-   git clone -b v0.32.0-b70.6 https://github.com/Lumnus/vllm.git vllm-b70-0.32
+   git clone -b v0.32.0-b70.7 https://github.com/Lumnus/vllm.git vllm-b70-0.32
    uv venv --python 3.12 /opt/b70/venv
    uv pip install --python /opt/b70/venv/bin/python --index-strategy unsafe-best-match \
        --extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/xpu/ \
@@ -96,8 +96,8 @@ The commands behind our environment, with our paths as placeholders. They have b
 
 8. **Run.** Presets on disjoint cards run side by side: set `ZE_AFFINITY_MASK`, the port and the `/cache` paths per engine.
    ```bash
-   VENV=/opt/b70/venv v0.32/engine/serve.sh qwen38-flash-next preset-d8-6-4card
-   DRY=1 v0.32/engine/serve.sh qwen38-flash-next preset-s8-6-2card     # print the command only
+   VENV=/opt/b70/venv v0.32/engine/serve.sh qwen38-flash-next preset-d8-7-4card
+   DRY=1 v0.32/engine/serve.sh qwen38-flash-next preset-s8-7-2card     # print the command only
    ```
    `serve.sh` sources the preset's `.env`, reads its `.args`, links the weights with the preset's `config.json` into a serve dir, and puts `$VENV/lib` first on `LD_LIBRARY_PATH`.
 

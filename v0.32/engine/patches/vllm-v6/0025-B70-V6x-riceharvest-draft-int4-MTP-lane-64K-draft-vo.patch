@@ -1,7 +1,7 @@
 From a072a15272a9088c2f4e8ffa252a084bce28362e Mon Sep 17 00:00:00 2001
 From: riceharvest <myappleiddarimaan@gmail.com>
 Date: Sat, 31 Oct 2026 22:53:37 +0000
-Subject: [PATCH 25/51] B70-V6x: riceharvest draft int4 MTP lane + 64K draft
+Subject: [PATCH 25/53] B70-V6x: riceharvest draft int4 MTP lane + 64K draft
  vocab (default off, B70_DRAFT_LMHEAD_INT4 / B70_DRAFT_MTP_INT4 /
  B70_DRAFT_VOCAB)
 

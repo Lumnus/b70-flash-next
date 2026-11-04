@@ -1,7 +1,7 @@
 From 383fd20ccd9fe670e0fcb5af08c613859e1b9e3f Mon Sep 17 00:00:00 2001
 From: noon-at-cgn <75719527+noon-at-cgn@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 23:39:56 +0000
-Subject: [PATCH 29/51] Backport vllm-project/vllm#62113: 16-byte-align
+Subject: [PATCH 29/53] Backport vllm-project/vllm#62113: 16-byte-align
  per-token-head KV slots so Triton vectorizes loads
 
 [Perf][Attention] TRITON_ATTN packs per-token-head int8/fp8 KV as

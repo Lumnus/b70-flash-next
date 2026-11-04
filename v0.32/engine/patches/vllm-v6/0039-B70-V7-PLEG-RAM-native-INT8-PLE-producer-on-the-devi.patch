@@ -1,7 +1,7 @@
 From 4e8debfffc04fda5cb966e4a61375f98f25183b1 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:20 +0000
-Subject: [PATCH 39/51] B70-V7-PLEG: RAM-native INT8 PLE producer on the
+Subject: [PATCH 39/53] B70-V7-PLEG: RAM-native INT8 PLE producer on the
  device, in the graph (B70_PLE_DEVICE_GATHER=1)
 
 The host-prepared producer blocks on a D2H of the step's tokens (behind the

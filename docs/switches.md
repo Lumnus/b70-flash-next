@@ -1,8 +1,8 @@
 # Runtime switches (`B70_*`)
 
 The first sections cover the 0.30 series in `v0.30/patches/`, which the 0.32 line carries as ports; the last two cover the 0.32 line's own
-switches, those of the b70.5 models layer and of the b70.6 `vllm-v6/` series. The preset files
-([e.g. preset-d8-6-4card.env](../v0.32/models/qwen38-flash-next/preset-d8-6-4card.env)) explain each key they set inline, and
+switches, those of the b70.5 models layer and of the `vllm-v6/` series (b70.6, b70.7). The preset files
+([e.g. preset-d8-7-4card.env](../v0.32/models/qwen38-flash-next/preset-d8-7-4card.env)) explain each key they set inline, and
 [the engine page](../v0.32/README.md#the-series) lists the series.
 
 Every feature the b70 series adds is behind an environment variable and **off by default**. With none of them set,
@@ -118,9 +118,9 @@ so a deployment can confirm what is active.
 | `B70_XPU_INT8_ONEDNN` | unset (off) | 0007 | `1`: W8A8 int8 GEMMs (compressed-tensors) on oneDNN `int8_scaled_mm` ahead of Triton, symmetric activations only. `B70_INT8_GEMM_SCALE_MODE=postop` moves the per-token scale into a post-op |
 | `B70_GDN_BACKSTEP_ALIGN_GUARD` | on | 0008 | `0`: let `B70_OFFLOAD_GDN_BACKSTEP` act under `mamba_cache_mode=align` again (not recommended) |
 
-## Switches added in 0.32.0-b70.6 (`v0.32/engine/patches/vllm-v6/`)
+## Switches added in 0.32.0-b70.6 and b70.7 (`v0.32/engine/patches/vllm-v6/`)
 
-Every one is off unless a preset sets it, except the four marked "on". The preset columns: D8 and S8 are the INT8-execution presets, D16e and S16e the BF16-execution ones; the 2-card presets are D8 and S8.
+Every one is off unless a preset sets it, except the three marked "on". The preset columns: D8 and S8 are the INT8-execution presets, D16e and S16e the BF16-execution ones; the 2-card presets are D8 and S8.
 
 **Set by the presets**
 
@@ -137,6 +137,7 @@ Every one is off unless a preset sets it, except the four marked "on". The prese
 | `B70_QSA_I8DOT` | `0` | unset / 2 / unset / 0 | int8 Q.K (`1`) and P.V (`2`) DPAS in the QSA kernels over `int8_per_token_head` KV |
 | `B70_PLE_INT8` | `0` | 1 / 1 / 1 / 1 on 4 cards | the INT8 PLE table native in pinned host RAM, about 49 GiB (the 2-card presets use `B70_PLE_INT8_NVME` instead) |
 | `B70_PLE_DEVICE_GATHER` | `0` | 1 on all | the RAM-native PLE producer on the device, inside the graph; the first step compares its bytes with the host path |
+| `B70_CJK_MASK` | `0` | 1 on all | b70.7 (`vllm-v6` 0052): removes every Han token at sampling time, speculative verify rows included; switches itself off when a system or user turn contains Chinese, and `cjk_mask: false` per request (top level or `vllm_xargs`) overrides ([model page](../v0.32/models/qwen38-flash-next/meta.md#chinese-characters-on-non-english-prompts)) |
 | `B70_SAMPLER_FAST` | `0` | 1 on all | top-k-first temperature sampling and speculative verification; falls back to the stock path for min_p, processed logprobs, k above 32, grammar and similar |
 | `B70_MOE_KCUT` | `0` | 1 on all | the expert-parallel sentinel and the rows-per-expert zero in one Triton kernel (7 kernels fewer per MoE layer) |
 | `B70_AR_INPLACE` | `0` | 1 on all | all-reduce caller-owned outputs in place, no clone |
@@ -151,7 +152,7 @@ Every one is off unless a preset sets it, except the four marked "on". The prese
 | `B70_PTH_PAD16` | `1` (on) | per-token-head KV halves padded to 16 bytes (544 B at head size 256) so Triton vectorises loads; `0` = tight. Int8 and fp8 per-token-head KV only |
 | `B70_PTH_TD_GUARD` | `1` (on) | per-token-head KV loads K/V by pointer, not by tensor descriptor |
 | `B70_KV_UNIFY_MULTIPLE` | `1` (on) | page unify takes block x floor(ratio) when the draft page is at least twice the target page and not divisible; `0` = plain padding |
-| `B70_PTH_FA_PREFILL`, `B70_PTH_FA_MIN_Q` | `1` (on), `64` | batches with max q above `MIN_Q` dequantise int8 or fp8 KV blocks to a bf16 scratch and run bf16 FlashAttention |
+| `B70_PTH_FA_PREFILL`, `B70_PTH_FA_MIN_Q` | `0` (off since b70.7; it was on in b70.6), `64` | with `PREFILL=1`, batches with max q above `MIN_Q` dequantise int8 or fp8 KV blocks to a bf16 scratch and run bf16 FlashAttention. Off, prefill runs the native INT8 attention path: the scratch halved prefill at 16 streams and cost KV |
 | `B70_DENSE_INT8_INCLUDE`, `_EXCLUDE`, `_MIN_PARAMS`, `_TRITON_MAX_M` | all / router, GDN a/b, indexer, heads, embeddings and HC regex / `1<<20` / `64` | which linears convert, and the Triton-to-oneDNN row threshold |
 | `B70_DENSE_INT8_FUSED` (+ `_FUSED_MAX_M` 64, `_W8A16_MAX_M` 8) | `0` | small-M dense linears on the fused W8A16 and W8A8 ops of the kernels wheel |
 | `B70_MOE_W4A8_CFG1`, `_CFG2`, `_WLOAD`, `_FUSED_ACT`, `_UVA` | `32,256,8,0,2` / same / `2` / `0` / `0` | W4A8 tile configurations "BM,BN,warps,grf[,wload]", the weight-load scheme, the fused SiLU epilogue, cold experts over UVA |

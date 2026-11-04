@@ -1,7 +1,7 @@
 From 4cb6980e3462c458efc010c661a02b335eb3521a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:35:06 +0000
-Subject: [PATCH 43/51] B70-V2-AR: in-place XCCL all-reduce at caller-owned
+Subject: [PATCH 43/53] B70-V2-AR: in-place XCCL all-reduce at caller-owned
  sites (B70_AR_INPLACE=1)
 
 XpuCommunicator.all_reduce_inplace + GroupCoordinator.all_reduce_owned skip the input clone for

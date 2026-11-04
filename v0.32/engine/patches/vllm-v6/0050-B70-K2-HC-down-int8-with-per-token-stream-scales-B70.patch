@@ -1,7 +1,7 @@
 From 01d33060a846db1fe124b5931b968fc5bf2b3dde Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 14:50:59 +0000
-Subject: [PATCH 50/51] B70-K2: HC down int8 with per-(token, stream) scales
+Subject: [PATCH 50/53] B70-K2: HC down int8 with per-(token, stream) scales
  (B70_HC_DOWN_INT8_STREAM_SCALE, default off)
 
 With B70_HC_DOWN_INT8=1: the combine/norm producers emit int8 + [M,4] scales per

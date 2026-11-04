@@ -1,7 +1,7 @@
 From be216577412bf2a17a9c2a4c7ce5f2d60ecafc23 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 10:37:43 +0000
-Subject: [PATCH 46/51] B70-K1: fused small-M int8 dense (W8A16 / fused W8A8)
+Subject: [PATCH 46/53] B70-K1: fused small-M int8 dense (W8A16 / fused W8A8)
  glue for the vllm-xpu-kernels v7 wheel (B70_DENSE_INT8_FUSED=1)
 
 ---

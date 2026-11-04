@@ -1,7 +1,7 @@
 From 9e08caf8b3d2de7cdf9c39dacf92726a1df1c1c2 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 16:42:20 +0000
-Subject: [PATCH 13/51] B70-IP-K7: CPU tests (gate, int8-dot math emulation,
+Subject: [PATCH 13/53] B70-IP-K7: CPU tests (gate, int8-dot math emulation,
  interpreter kernels)
 
 ---

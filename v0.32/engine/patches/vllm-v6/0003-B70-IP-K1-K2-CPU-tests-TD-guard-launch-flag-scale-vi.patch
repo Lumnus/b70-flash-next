@@ -1,7 +1,7 @@
 From 3135234534a9425e8d4a8e6f18f1ca6545935ef6 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 13:54:29 +0000
-Subject: [PATCH 03/51] B70-IP-K1/K2: CPU tests (TD guard launch flag, scale
+Subject: [PATCH 03/53] B70-IP-K1/K2: CPU tests (TD guard launch flag, scale
  views leave cache bytes unchanged)
 
 ---

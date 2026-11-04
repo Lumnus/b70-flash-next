@@ -1,7 +1,7 @@
 From 34e029db70904dbc47ec871898601040de923794 Mon Sep 17 00:00:00 2001
 From: Yan Ma <yan.ma@intel.com>
 Date: Wed, 21 Oct 2026 22:19:15 +0800
-Subject: [PATCH 21/51] [XPU] Enable spec-decode adaptive verification without
+Subject: [PATCH 21/53] [XPU] Enable spec-decode adaptive verification without
  a confidence head (#62244)
 
 Signed-off-by: Yan Ma <yan.ma@intel.com>

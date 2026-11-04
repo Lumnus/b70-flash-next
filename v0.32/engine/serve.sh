@@ -2,8 +2,8 @@
 # serve.sh — start one preset of one model on the 0.32 engine.
 #
 #   v0.32/engine/serve.sh MODEL PRESET [extra vllm serve flags...]
-#   v0.32/engine/serve.sh qwen38-flash-next preset-d8-6-4card
-#   v0.32/engine/serve.sh qwen38-flash-next preset-s16e-6-2card --port 8001
+#   v0.32/engine/serve.sh qwen38-flash-next preset-d8-7-4card
+#   v0.32/engine/serve.sh qwen38-flash-next preset-s8-7-2card --port 8001
 #
 #   MODEL   a directory under v0.32/models/ (qwen38-flash-next, qwen38-27b, qwen36-35b-a3b)
 #   PRESET  a preset of that model: the .args/.env pair of that name in the model's directory

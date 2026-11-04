@@ -1,7 +1,7 @@
 From 699ea54353a3fe5acf7e5c4211626f0bf406d2f3 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 11:55:45 +0000
-Subject: [PATCH 47/51] B70-K1: HC down projection on the v7 W8A8 GEMM
+Subject: [PATCH 47/53] B70-K1: HC down projection on the v7 W8A8 GEMM
  (B70_HC_DOWN_INT8=1; deterministic int32 split-K; HCDET_ALL_OK)
 
 ---

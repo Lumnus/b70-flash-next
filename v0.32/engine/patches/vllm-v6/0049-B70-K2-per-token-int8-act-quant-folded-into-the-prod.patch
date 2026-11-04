@@ -1,7 +1,7 @@
 From 132723b00a63a2982bb53b1bd60972ea9ff8c06a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 14:17:43 +0000
-Subject: [PATCH 49/51] B70-K2: per-token int8 act quant folded into the
+Subject: [PATCH 49/53] B70-K2: per-token int8 act quant folded into the
  producers (B70_I8_PRODUCER_QUANT, default off)
 
 HC down finish/hc_silu -> HC up, HC gate mix -> in_proj_qkvz/qkv_proj, GDN gated

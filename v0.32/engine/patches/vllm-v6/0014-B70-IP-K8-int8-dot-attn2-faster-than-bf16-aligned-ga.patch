@@ -1,7 +1,7 @@
 From 44cdded94f582e40a0e1fa54f95379bd3435776d Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 18:28:52 +0000
-Subject: [PATCH 14/51] B70-IP-K8: int8-dot attn2 faster than bf16 (aligned
+Subject: [PATCH 14/53] B70-IP-K8: int8-dot attn2 faster than bf16 (aligned
  gathers, int8 launch regions)
 
 Root cause of round 1 (int8 Q.K slower than bf16): the inline int8 cell pitch

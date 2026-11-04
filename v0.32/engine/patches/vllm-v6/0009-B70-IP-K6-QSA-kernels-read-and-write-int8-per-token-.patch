@@ -1,7 +1,7 @@
 From 507a39b8b17fb06c6b99ea25b551ea208d4a4153 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 15:53:39 +0000
-Subject: [PATCH 09/51] B70-IP-K6: QSA kernels read and write int8
+Subject: [PATCH 09/53] B70-IP-K6: QSA kernels read and write int8
  per-token-head KV
 
 What: the QSA sparse attention kernels (attn2 tile kernel and the split-K

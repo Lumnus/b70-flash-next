@@ -1,7 +1,7 @@
 From b225c361406329212cc8410b07c6826def8b91ab Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:03:59 +0000
-Subject: [PATCH 22/51] B70-IP-D2: native INT8 per-token-head KV decode on XPU
+Subject: [PATCH 22/53] B70-IP-D2: native INT8 per-token-head KV decode on XPU
  FLASH_ATTN (B70_PTH_FA_DECODE=1)
 
 What: with B70_PTH_FA_DECODE=1 (default off) FLASH_ATTN on XPU accepts

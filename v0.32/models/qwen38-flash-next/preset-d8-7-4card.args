@@ -1,5 +1,5 @@
-# preset-s8-6-4card.args — `vllm serve` flags of Qwen3.8-Flash-Next S8-6, sparse QSA, INT8 execution, INT8 KV, 4 cards. One flag and its value per line.
-# Run: v0.32/engine/serve.sh qwen38-flash-next preset-s8-6-4card
+# preset-d8-7-4card.args — `vllm serve` flags of Qwen3.8-Flash-Next D8-7, dense FlashAttention, INT8 execution, INT8 KV, 4 cards. One flag and its value per line.
+# Run: v0.32/engine/serve.sh qwen38-flash-next preset-d8-7-4card
 --served-model-name qwen38-flash-next
 --host 0.0.0.0
 --port 8000
@@ -8,6 +8,7 @@
 --enable-expert-parallel
 --trust-remote-code
 --max-model-len 262144
+--attention-backend FLASH_ATTN
 # 8-bit KV, per-token-head scale
 --kv-cache-dtype int8_per_token_head
 # prefill chunk

@@ -1,0 +1,1103 @@
+From 074a021a4d1f92841575d3c18c84355af90e4cb1 Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Wed, 4 Nov 2026 09:08:03 +0000
+Subject: [PATCH 52/53] B70-CJK: serving-side Han mask with a per-request auto
+ gate (B70_CJK_MASK=1, default off)
+
+Boot builds one device bool mask [vocab] from the tokenizer: tokens whose
+byte-level text holds Han (U+3400-4DBF, U+4E00-9FFF, U+F900-FAFF) plus
+incomplete-UTF-8 byte tokens led by 0xE3-0xE9/0xEF whose range reaches Han
+and not kana (lone 0xE3 / 0xEF kept so kana stays emittable). QFN: 55,659 of
+248,320 ids (55,328 Han + 331 partial).
+
+The model runner applies it in place on the target logits after
+compute_logits, beside the grammar bitmask: one Triton launch over flagged
+rows, skipped on the host when no row is flagged. Covers the plain sampler,
+every spec-decode verification row (stock and B70_SAMPLER_FAST), and declines
+the astra greedy shortcut for flagged batches.
+
+Per request: on unless the system/developer/user turns hold Han; explicit
+vllm_xargs.cjk_mask (or top-level cjk_mask) wins. Chat resolves in the
+protocol; other endpoints fall back to a prompt-token scan in the input
+processor. Env unset: stock behaviour.
+---
+ tests/v1/worker/test_b70_cjk_mask.py          | 477 ++++++++++++++++++
+ .../openai/chat_completion/protocol.py        |   9 +
+ vllm/v1/engine/input_processor.py             |  25 +
+ vllm/v1/sample/b70_cjk.py                     | 246 +++++++++
+ vllm/v1/worker/gpu/astra_greedy.py            |   5 +
+ vllm/v1/worker/gpu/model_runner.py            |  10 +
+ vllm/v1/worker/gpu/sample/cjk_mask.py         | 175 +++++++
+ vllm/v1/worker/gpu/sample/sampler.py          |  12 +
+ 8 files changed, 959 insertions(+)
+ create mode 100644 tests/v1/worker/test_b70_cjk_mask.py
+ create mode 100644 vllm/v1/sample/b70_cjk.py
+ create mode 100644 vllm/v1/worker/gpu/sample/cjk_mask.py
+
+diff --git a/tests/v1/worker/test_b70_cjk_mask.py b/tests/v1/worker/test_b70_cjk_mask.py
+new file mode 100644
+index 0000000000..90b69e54cc
+--- /dev/null
++++ b/tests/v1/worker/test_b70_cjk_mask.py
+@@ -0,0 +1,477 @@
++# SPDX-License-Identifier: Apache-2.0
++"""B70-CJK: CPU tests (TRITON_INTERPRET=1) for the serving-side Han mask.
++
++1. mask builder on the served QFN tokenizer (B70_CJK_TOKENIZER=<tokenizer.json>):
++   counts, kana and Cyrillic stay emittable, Han reachable only through Ext-A;
++2. the per-request gate: flag parsing, system/user scan, explicit overrides,
++   ChatCompletionRequest.to_sampling_params with the env on and off;
++3. the device state: kernel == torch reference, flagged rows -inf on masked ids,
++   unflagged rows bit-identical, every speculative verification row masked;
++4. rejection sampling (stock and B70-SM fast) never emits a masked token when
++   the draft proposes masked ids with high probability.
++"""
++
++import json
++import os
++
++os.environ.setdefault("TRITON_INTERPRET", "1")
++os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
++
++import numpy as np  # noqa: E402
++import pytest  # noqa: E402
++import torch  # noqa: E402
++
++from vllm.triton_utils import tl, tldevice  # noqa: E402
++
++tldevice.log1p = lambda x: tl.log(1.0 + x)
++
++from vllm.v1.sample import b70_cjk  # noqa: E402
++from vllm.v1.worker.gpu.sample import cjk_mask as cm  # noqa: E402
++
++TOK = os.environ.get("B70_CJK_TOKENIZER")
++
++
++class _Uva:
++    """CPU stand-in for UvaBackedTensor (no pinned allocator on CPU)."""
++
++    def __init__(self, size, dtype):
++        self.cpu = torch.zeros(size, dtype=dtype)
++        self.np = self.cpu.numpy()
++        self.gpu = self.cpu
++
++    def copy_to_uva(self, n=None):
++        self.gpu = self.cpu.clone()
++        return self.gpu
++
++
++@pytest.fixture(scope="module")
++def tokenizer():
++    if not TOK or not os.path.exists(TOK):
++        pytest.skip("B70_CJK_TOKENIZER not set")
++    from transformers import PreTrainedTokenizerFast
++
++    return PreTrainedTokenizerFast(tokenizer_file=TOK)
++
++
++@pytest.fixture(scope="module")
++def built(tokenizer):
++    return b70_cjk.build_mask(tokenizer, 248_320)
++
++
++# ------------------------------------------------------------------ 1. builder
++
++
++def test_counts_on_qfn_tokenizer(built):
++    mask, c = built
++    assert c["vocab"] == 248_077  # 248,044 BPE + 33 added
++    assert c["han"] == 55_328
++    assert c["partial"] == 331  # 342 partial CJK-lead tokens - 11 kept 0xE3 ones
++    assert c["masked"] == 55_659 == int(mask.sum())
++    assert not mask[248_044:].any()  # padding ids
++
++
++def test_e3_partials_kept_and_lead_rule():
++    keep = [b"\xe3", b"\xe3\x80", b"\xe3\x81", b"\xe3\x82", b"\xe3\x83", b" \xe3\x82"]
++    for b in keep:
++        assert b70_cjk.classify(b) is None, b
++    assert b70_cjk.classify(b"\xe3\x90") == "partial"  # Ext-A U+3400..
++    assert b70_cjk.classify(b"\xe4") == "partial"
++    assert b70_cjk.classify(b"\xe4\xb8") == "partial"
++    assert b70_cjk.classify(b"\xe4\xb7") is None  # U+4DC0 hexagrams, not Han
++    assert b70_cjk.classify(b"\xe9") == "partial"
++    assert b70_cjk.classify(b"\xb8\xad") is None  # continuation only
++    assert b70_cjk.classify("中".encode()) == "han"
++    assert b70_cjk.classify("。".encode()) is None
++    assert b70_cjk.classify("да".encode()) is None
++
++
++def test_specials_never_masked(tokenizer, built):
++    mask, _ = built
++    for i in tokenizer.all_special_ids + list(tokenizer.get_added_vocab().values()):
++        assert not mask[i]
++
++
++def _ids(tok, s):
++    return tok.encode(s, add_special_tokens=False)
++
++
++def test_kana_cyrillic_latin_emittable(tokenizer, built):
++    mask, _ = built
++    kana = "".join(
++        chr(c) for c in list(range(0x3041, 0x3097)) + list(range(0x30A1, 0x30FB))
++    )
++    for ch in kana:
++        assert not mask[_ids(tokenizer, ch)].any(), hex(ord(ch))
++    for s in [
++        "Здравей, свят! Как си днес?",
++        "Hello world",
++        "ありがとうございます",
++        "ё ъ ѝ",
++    ]:
++        assert not mask[_ids(tokenizer, s)].any(), s
++
++
++def test_han_unreachable_except_ext_a(tokenizer, built):
++    """Every URO Han code point's canonical encoding contains a masked token;
++    the only escapes are Ext-A / compatibility ideographs without a full token,
++    spelled from the lone 0xE3 / 0xEF byte tokens (kept for kana)."""
++    mask, _ = built
++    reach = []
++    for lo, hi in b70_cjk.HAN_RANGES:
++        for c in range(lo, hi + 1):
++            if not mask[_ids(tokenizer, chr(c))].any():
++                reach.append(c)
++    assert all(0x3400 <= c <= 0x3FFF or 0xF900 <= c <= 0xFAFF for c in reach), [
++        hex(c) for c in reach[:10]
++    ]
++    assert not any(0x4E00 <= c <= 0x9FFF for c in reach)
++    print(f"Han code points reachable through unmasked byte tokens: {len(reach)}")
++
++
++# ------------------------------------------------------------------- 2. gate
++
++
++def test_parse_and_resolve():
++    p = b70_cjk.parse_flag
++    assert p(None) is None
++    assert p(True) is True and p(False) is False
++    assert p(0) is False and p(1) is True
++    assert p("off") is False and p("TRUE") is True and p(" no ") is False
++    with pytest.raises(ValueError):
++        p("maybe")
++    with pytest.raises(ValueError):
++        p(2)
++    assert b70_cjk.resolve(None, False) is True
++    assert b70_cjk.resolve(None, True) is False
++    assert b70_cjk.resolve(True, True) is True
++    assert b70_cjk.resolve(0, False) is False
++
++
++def test_messages_scan_roles_and_parts():
++    m = b70_cjk.messages_have_han
++    assert not m([{"role": "user", "content": "Здравей"}])
++    assert m([{"role": "user", "content": "請用中文回答"}])
++    assert m([{"role": "system", "content": "答"}, {"role": "user", "content": "x"}])
++    assert m([{"role": "developer", "content": "漢"}])
++    # a Han leak in an earlier assistant turn must not switch the mask off
++    assert not m(
++        [
++            {"role": "user", "content": "Какво е това?"},
++            {"role": "assistant", "content": "Това е 例如 пример"},
++            {"role": "user", "content": "Продължи"},
++        ]
++    )
++    assert m([{"role": "user", "content": [{"type": "text", "text": "看"}]}])
++    assert not m(
++        [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]
++    )
++    assert not m([{"role": "tool", "content": "中文"}])
++
++
++def test_trade_off_glosses_in_bulgarian_answer_are_masked():
++    """A Bulgarian conversation about Daoism and Buddhism: Bulgarian user turns, an answer
++    that legitimately glosses 无, 真人, 格義, 化胡經 next to one true bleed
++    ("терени,历史 на дебатите"). The auto-gate cannot tell the two apart: user
++    turns carry no Han, so the mask is on and the glosses go too (the model then
++    writes them in transliteration or drops them). The escape is explicit:
++    cjk_mask=false for the conversation, or Han in a user turn (e.g. the user
++    pastes 格義), which turns the mask off for that request."""
++    convo = [
++        {"role": "system", "content": "Отговаряй на български."},
++        {"role": "user", "content": "Как даоизмът влияе на ранния китайски будизъм?"},
++        {
++            "role": "assistant",
++            "content": "Чрез метода 格義 (geyi) и понятия като 无 и 真人; "
++            "спорът около 化胡經 ... терени,历史 на дебатите",
++        },
++        {"role": "user", "content": "Разкажи повече за geyi."},
++    ]
++    assert b70_cjk.chat_extra_args({}, convo, None) == {"cjk_mask": True}
++    assert b70_cjk.chat_extra_args({"cjk_mask": False}, convo, None) == {
++        "cjk_mask": False
++    }
++    pasted = convo + [{"role": "user", "content": "А 格義 точно какво значи?"}]
++    assert b70_cjk.chat_extra_args({}, pasted, None) == {"cjk_mask": False}
++
++
++def test_chat_extra_args():
++    f = b70_cjk.chat_extra_args
++    u = [{"role": "user", "content": "Здравей"}]
++    h = [{"role": "user", "content": "你好"}]
++    assert f({}, u, None) == {"cjk_mask": True}
++    assert f({}, h, None) == {"cjk_mask": False}
++    assert f({"cjk_mask": 0}, u, None) == {"cjk_mask": False}
++    assert f({"cjk_mask": "true"}, h, None) == {"cjk_mask": True}
++    assert f({}, u, {"cjk_mask": "off"}) == {"cjk_mask": False}
++    src = {"other": 1}
++    out = f(src, u, None)
++    assert src == {"other": 1} and out == {"other": 1, "cjk_mask": True}
++
++
++def _req(**kw):
++    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++
++    body = {"model": "m", "messages": [{"role": "user", "content": "Здравей"}], **kw}
++    return ChatCompletionRequest.model_validate_json(json.dumps(body))
++
++
++def test_protocol_env_off_is_stock(monkeypatch):
++    monkeypatch.delenv(b70_cjk.ENV, raising=False)
++    sp = _req().to_sampling_params(64, {})
++    assert sp.extra_args is None
++    sp = _req(vllm_xargs={"cjk_mask": False}).to_sampling_params(64, {})
++    assert sp.extra_args == {"cjk_mask": 0}  # passed through untouched
++
++
++def test_protocol_env_on(monkeypatch):
++    monkeypatch.setenv(b70_cjk.ENV, "1")
++    assert _req().to_sampling_params(64, {}).extra_args == {"cjk_mask": True}
++    zh = [{"role": "user", "content": "用中文解释"}]
++    assert _req(messages=zh).to_sampling_params(64, {}).extra_args == {
++        "cjk_mask": False
++    }
++    sp = _req(vllm_xargs={"cjk_mask": False}).to_sampling_params(64, {})
++    assert sp.extra_args == {"cjk_mask": False}
++    sp = _req(messages=zh, vllm_xargs={"cjk_mask": True}).to_sampling_params(64, {})
++    assert sp.extra_args == {"cjk_mask": True}
++    sp = _req(cjk_mask=False).to_sampling_params(64, {})
++    assert sp.extra_args == {"cjk_mask": False}
++    from vllm.exceptions import VLLMValidationError
++
++    with pytest.raises(VLLMValidationError):
++        _req(vllm_xargs={"cjk_mask": "sometimes"}).to_sampling_params(64, {})
++
++
++def test_prompt_token_fallback(tokenizer):
++    b70_cjk._PROMPT_MASK = None
++    assert not b70_cjk.prompt_has_han_tokens(tokenizer, _ids(tokenizer, "Здравей"))
++    assert not b70_cjk.prompt_has_han_tokens(tokenizer, _ids(tokenizer, "ありがとう。"))
++    assert b70_cjk.prompt_has_han_tokens(tokenizer, _ids(tokenizer, "Здравей 中国"))
++    assert not b70_cjk.prompt_has_han_tokens(tokenizer, None)
++
++
++# ----------------------------------------------------------- 3. device state
++
++
++class _SP:
++    def __init__(self, extra):
++        self.extra_args = extra
++
++
++class _FakeTok:
++    """Byte-level vocab: ids 0..9 ASCII, 10 '中', 11 lone 0xE4, 12 'д', 13 lone 0xE3."""
++
++    def __init__(self):
++        u = {b: c for c, b in b70_cjk._U2B.items()}
++        toks = [chr(ord("a") + i) for i in range(10)]
++        toks += ["".join(u[b] for b in "中".encode())]
++        toks += [u[0xE4]]
++        toks += ["".join(u[b] for b in "д".encode())]
++        toks += [u[0xE3]]
++        self._v = {t: i for i, t in enumerate(toks)}
++        self.all_special_ids = []
++
++    def get_vocab(self):
++        return dict(self._v)
++
++    def get_added_vocab(self):
++        return {}
++
++
++@pytest.fixture
++def state(monkeypatch):
++    monkeypatch.setattr(cm, "UvaBackedTensor", _Uva)
++    return cm.CjkMaskState(None, 4, 16, torch.device("cpu"), tokenizer=_FakeTok())
++
++
++def test_state_flags_and_mask(state):
++    assert state.counts["masked"] == 2
++    assert state.mask.nonzero().flatten().tolist() == [10, 11]
++    assert state.add_request(0, _SP(None)) is True  # engine-direct: masked
++    assert state.add_request(1, _SP({"cjk_mask": False})) is False
++    assert state.add_request(2, _SP({"cjk_mask": True})) is True
++    assert state.add_request(3, _SP({"cjk_mask": 0})) is False
++    state.apply_staged_writes()
++    assert state.flags.gpu.tolist() == [1, 0, 1, 0]
++    assert state.any_flagged(np.array([1, 2]))
++    assert not state.any_flagged(np.array([1, 3]))
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_kernel_matches_reference_and_rows(state, dtype):
++    for i, f in enumerate([1, 0, 1, 0]):
++        state.add_request(i, _SP({"cjk_mask": bool(f)}))
++    state.apply_staged_writes()
++    # spec decode: 3 requests x (7 drafts + bonus) rows, request slots 2, 1, 0
++    idx = torch.tensor([2, 1, 0], dtype=torch.int32)
++    eim = idx.repeat_interleave(8)
++    g = torch.Generator().manual_seed(0)
++    base = (torch.randn(24, 16, generator=g) * 3).to(dtype)
++    ref = base.clone()
++    cm.apply_cjk_mask_reference(ref, eim, state.flags.gpu, state.mask)
++    ker = base.clone()
++    cm.apply_cjk_mask(ker, eim, state.flags.gpu, state.mask_u8)
++    assert torch.equal(ref, ker)
++    flagged = state.flags.gpu[eim.long()] != 0
++    assert flagged.sum() == 16  # slots 2 and 0, all 8 rows each
++    assert torch.isneginf(ker[flagged][:, [10, 11]]).all()
++    keep = [i for i in range(16) if i not in (10, 11)]
++    assert torch.equal(ker[flagged][:, keep], base[flagged][:, keep])
++    assert torch.equal(ker[~flagged], base[~flagged])  # bit-identical
++
++
++def test_apply_skips_unflagged_batch_and_strided(state):
++    state.add_request(0, _SP({"cjk_mask": False}))
++    state.add_request(1, _SP({"cjk_mask": True}))
++    state.apply_staged_writes()
++    x = torch.randn(4, 16)
++    y = x.clone()
++    state.apply(y, torch.zeros(4, dtype=torch.int32), np.array([0]))
++    assert torch.equal(x, y)
++    # sharded path: logits[:, :vocab] of a wider (padded) row
++    wide = torch.randn(2, 20)
++    view = wide[:, :16]
++    orig = wide.clone()
++    cm.apply_cjk_mask(
++        view, torch.tensor([1, 0], dtype=torch.int32), state.flags.gpu, state.mask_u8
++    )
++    assert torch.isneginf(wide[0, [10, 11]]).all()
++    assert torch.equal(wide[0, 16:], orig[0, 16:]) and torch.equal(wide[1], orig[1])
++
++
++# ------------------------------------------------------- 4. spec-decode verify
++
++
++@pytest.mark.parametrize("verifier", ["stock", "fast"])
++def test_rejection_never_emits_masked(verifier):
++    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
++    from vllm.v1.worker.gpu.sample import b70_sampler_fast as sm
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
++
++    class _T:
++        def __init__(self, t):
++            self.gpu, self.np = t, t.numpy()
++
++    class _St:
++        def __init__(self, r, temp, k, p):
++            self.temperature = _T(torch.full((r,), temp))
++            self.top_k = _T(torch.full((r,), k, dtype=torch.int32))
++            self.top_p = _T(torch.full((r,), p))
++            self.seeds = _T(torch.arange(r, dtype=torch.int64) * 7 + 1)
++            self.min_p = _T(torch.zeros(r))
++
++    r, steps, v, kd, k, temp, p = 6, 7, 512, 16, 20, 0.7, 0.95
++    n = r * (steps + 1)
++    vmask = torch.zeros(v, dtype=torch.bool)
++    vmask[100:160] = True  # the "Han" ids
++    g = torch.Generator().manual_seed(1)
++    target = torch.randn(n, v, generator=g)
++    target[:, 100:110] += 6.0  # target prefers masked ids before the mask
++    cand = torch.stack(
++        [torch.randperm(v, generator=g)[:kd] for _ in range(r * steps)]
++    ).reshape(r, steps, kd)
++    cand[..., :4] = torch.tensor([100, 101, 102, 103])
++    dscore = torch.randn(r, steps, kd, generator=g)
++    dscore[..., :4] += 8.0  # drafter proposes masked ids with high probability
++    draft = torch.full((r, steps, v), -float("inf"))
++    draft.scatter_(2, cand, dscore)
++    q = torch.softmax(dscore / temp, dim=-1)
++    pick = torch.multinomial(q.reshape(-1, kd), 1, generator=g).reshape(r, steps)
++    dtok = cand.gather(2, pick.unsqueeze(-1)).squeeze(-1)
++    assert vmask[dtok].float().mean() > 0.9
++
++    cu = torch.arange(0, n + 1, steps + 1, dtype=torch.int32)
++    idx = torch.arange(r, dtype=torch.int32)
++    eim = idx.repeat_interleave(steps + 1)
++    local = torch.arange(steps + 1, dtype=torch.int32).repeat(r)
++    ds = torch.full((n,), -1, dtype=torch.int64)
++    ds.view(r, steps + 1)[:, 1:] = dtok
++    pos = (torch.arange(r).unsqueeze(1) * 1000 + torch.arange(steps + 1)).reshape(-1)
++    st = _St(r, temp, k, p)
++    flags = torch.ones(r, dtype=torch.int32)
++
++    def stock(logits):
++        proc = apply_top_k_top_p_pytorch(
++            logits.float() / temp, torch.full((n,), k), torch.full((n,), p)
++        )
++        return rejection_sample(
++            proc,
++            draft,
++            ds,
++            cu,
++            pos,
++            idx,
++            eim,
++            local,
++            st.temperature.gpu,
++            st.seeds.gpu,
++            steps,
++        )
++
++    def fast(logits):
++        return sm.fast_reject(
++            logits, draft, cand, ds, pos, cu, idx, eim, st, steps, k, block=128
++        )
++
++    def emitted(out):
++        s, num = out
++        return torch.cat([s[i, : int(num[i])] for i in range(r)])
++
++    run = stock if verifier == "stock" else fast
++    try:
++        control = emitted(run(target))
++    except Exception as e:  # some Triton interpreters cannot run the stock kernel
++        # interpreter limits (nested jit without TRITON_INTERPRET at import;
++        # scalar load masks in the B70-SM residual branch on some Triton builds)
++        if any(m in repr(e) for m in ("outside of the scope", "mask has unsupported")):
++            pytest.skip(f"Triton interpreter cannot run the {verifier} verifier")
++        raise
++    # control: without the mask the verifier emits masked ids
++    assert vmask[control].any()
++    masked = target.clone()
++    cm.apply_cjk_mask(masked, eim, flags, vmask.view(torch.uint8))
++    toks = emitted(run(masked))
++    assert toks.numel() >= r
++    assert not vmask[toks].any()
++
++
++def test_fast_support_excludes_masked():
++    """B70-SM verifies on the top-k support of the processed target logits; a
++    draft outside it has t_lp = -inf and is never accepted, and the resample
++    draws from the support. So masked ids must never enter the support."""
++    from vllm.v1.worker.gpu.sample import b70_sampler_fast as sm
++
++    class _T:
++        def __init__(self, t):
++            self.gpu, self.np = t, t.numpy()
++
++    class _St:
++        temperature = _T(torch.full((4,), 0.7))
++        top_k = _T(torch.full((4,), 20, dtype=torch.int32))
++        top_p = _T(torch.full((4,), 0.95))
++        min_p = _T(torch.zeros(4))
++
++    v = 1024
++    vmask = torch.zeros(v, dtype=torch.bool)
++    vmask[100:160] = True
++    g = torch.Generator().manual_seed(3)
++    logits = torch.randn(32, v, generator=g)
++    logits[:, 100:130] += 8.0  # masked ids dominate before the mask
++    eim = torch.arange(4, dtype=torch.int32).repeat_interleave(8)
++    ids, lm, _ = sm.topk_support(logits.clone(), eim, _St, 20, block=256)
++    assert vmask[ids.long().clamp(0, v - 1)][torch.isfinite(lm)].any()  # control
++    masked = logits.clone()
++    cm.apply_cjk_mask(
++        masked, eim, torch.ones(4, dtype=torch.int32), vmask.view(torch.uint8)
++    )
++    ids, lm, _ = sm.topk_support(masked, eim, _St, 20, block=256)
++    live = torch.isfinite(lm)
++    assert live.sum(1).min() >= 1
++    assert not vmask[ids.long()[live]].any()
++
++
++def test_env_default_off(monkeypatch):
++    monkeypatch.delenv(b70_cjk.ENV, raising=False)
++    assert not b70_cjk.enabled()
++    monkeypatch.setenv(b70_cjk.ENV, "1")
++    assert b70_cjk.enabled()
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 3df3f91bea..684fb6f256 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -820,6 +820,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         if self.ec_transfer_params:
+             # Pass in ec_transfer_params via extra_args
+             extra_args["ec_transfer_params"] = self.ec_transfer_params
++        from vllm.v1.sample import b70_cjk
++
++        if b70_cjk.enabled():  # B70-CJK: per-request Han-mask gate
++            try:
++                extra_args = b70_cjk.chat_extra_args(
++                    extra_args, self.messages, self.model_extra
++                )
++            except ValueError as e:
++                raise VLLMValidationError(str(e), parameter=b70_cjk.XARG) from e
+         if "presence_penalty" not in self.model_fields_set:  # B70-0009 (L32)
+             import os
+             if os.environ.get("B70_DEFAULT_PRESENCE_PENALTY"):
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 17e8af5cae..c9106a0a37 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -370,6 +370,30 @@ class InputProcessor:
+         else:
+             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+ 
++    def _b70_cjk_resolve(
++        self, sampling_params: SamplingParams, prompt_token_ids
++    ) -> None:
++        """B70-CJK: resolve the per-request Han-mask flag once, at admission.
++        Chat requests arrive resolved (system/user turns only); everything else
++        is decided here from the prompt tokens."""
++        from vllm.v1.sample import b70_cjk
++
++        if not b70_cjk.enabled():
++            return
++        extra = dict(sampling_params.extra_args or {})
++        explicit = extra.get(b70_cjk.XARG)
++        try:
++            if explicit is not None:
++                flag = b70_cjk.resolve(explicit, False)
++            else:
++                flag = not b70_cjk.prompt_has_han_tokens(
++                    self.tokenizer, prompt_token_ids
++                )
++        except ValueError as e:
++            raise VLLMValidationError(str(e), parameter=b70_cjk.XARG) from e
++        extra[b70_cjk.XARG] = flag
++        sampling_params.extra_args = extra
++
+     def process_inputs(
+         self,
+         request_id: str,
+@@ -492,6 +516,7 @@ class InputProcessor:
+             )
+             if self.tokenizer is not None:
+                 sampling_params.update_from_tokenizer(self.tokenizer)
++            self._b70_cjk_resolve(sampling_params, prompt_token_ids)
+             if sampling_params.trace_decode_token_ids:
+                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+         else:
+diff --git a/vllm/v1/sample/b70_cjk.py b/vllm/v1/sample/b70_cjk.py
+new file mode 100644
+index 0000000000..937613c8db
+--- /dev/null
++++ b/vllm/v1/sample/b70_cjk.py
+@@ -0,0 +1,246 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-CJK: serving-side Han mask, host-side helpers (env ``B70_CJK_MASK=1``).
++
++Import-light (no torch): the API server uses it to decide per request whether
++the mask applies, the worker uses it to build the vocabulary mask.
++
++Per-request gate. The mask is ON for a request unless
++  1. the request sets ``cjk_mask`` explicitly (``vllm_xargs`` or a top-level
++     extra body field; false / 0 / "off" turn it off, true forces it on), or
++  2. its prompt carries Han: for chat, the system / developer / user turns
++     (earlier assistant turns are not scanned, so a Han leak in the history
++     does not switch the mask off); for other endpoints, the prompt tokens.
++The decision lands in ``SamplingParams.extra_args["cjk_mask"]`` as a bool.
++
++Vocabulary mask. A token is masked when
++  1. its byte-level text contains a Han code point (U+3400-4DBF, U+4E00-9FFF,
++     U+F900-FAFF), or
++  2. it ends in an incomplete UTF-8 sequence with a lead byte 0xE3-0xE9 or
++     0xEF whose code-point range reaches Han and does not reach kana
++     (U+3040-30FF, U+31F0-31FF, halfwidth U+FF65-FF9F). That keeps the lone
++     0xE3 byte (it leads kana, CJK punctuation and Han Ext-A alike), every
++     0xE3 0x80-0x8F pair and the lone 0xEF byte; 15 kana (e.g. U+3062, U+30C5)
++     have no single token and are spelled through those byte tokens, so kana
++     stays emittable. The price: Ext-A (U+3400-3FFF) and the compatibility
++     ideographs (U+F900-FAFF) that have no full token stay reachable through
++     the lone 0xE3 / 0xEF byte tokens; both blocks are rare.
++Special and added tokens are never masked. Continuation-only byte tokens are
++never masked (they also spell Cyrillic and every other multi-byte script).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import re
++from collections.abc import Iterable, Mapping
++from typing import Any
++
++ENV = "B70_CJK_MASK"
++XARG = "cjk_mask"
++
++HAN_RANGES = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
++KANA_RANGES = ((0x3040, 0x30FF), (0x31F0, 0x31FF), (0xFF65, 0xFF9F))
++_HAN_RE = re.compile("[㐀-䶿一-鿿豈-﫿]")
++_LEADS = frozenset(range(0xE3, 0xEA)) | {0xEF}  # 3-byte leads reaching Han
++_PROMPT_ROLES = ("system", "developer", "user")
++
++_TRUE = {"1", "true", "on", "yes"}
++_FALSE = {"0", "false", "off", "no"}
++
++
++def enabled() -> bool:
++    return os.environ.get(ENV, "0") == "1"
++
++
++def has_han(text: str) -> bool:
++    return _HAN_RE.search(text) is not None
++
++
++def parse_flag(value: Any) -> bool | None:
++    """Explicit per-request value -> bool; None when absent.
++
++    Raises ValueError on a value that is neither."""
++    if value is None:
++        return None
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, (int, float)) and value in (0, 1):
++        return bool(value)
++    if isinstance(value, str) and value.strip().lower() in _TRUE | _FALSE:
++        return value.strip().lower() in _TRUE
++    raise ValueError(
++        f"{XARG} must be a boolean (true/false, 1/0, on/off); got {value!r}"
++    )
++
++
++def resolve(explicit: Any, prompt_has_han: bool) -> bool:
++    """Mask on unless the prompt has Han; an explicit value wins."""
++    flag = parse_flag(explicit)
++    return (not prompt_has_han) if flag is None else flag
++
++
++def _content_texts(content: Any) -> Iterable[str]:
++    if isinstance(content, str):
++        yield content
++    elif isinstance(content, Iterable) and not isinstance(content, (bytes, Mapping)):
++        for part in content:
++            if isinstance(part, str):
++                yield part
++            elif isinstance(part, Mapping):
++                text = part.get("text")
++                if isinstance(text, str):
++                    yield text
++            else:
++                text = getattr(part, "text", None)
++                if isinstance(text, str):
++                    yield text
++
++
++def messages_have_han(messages: Iterable[Any], roles=_PROMPT_ROLES) -> bool:
++    """Han in the text of the system / developer / user turns."""
++    for msg in messages:
++        if isinstance(msg, Mapping):
++            role, content = msg.get("role"), msg.get("content")
++        else:
++            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
++        if role not in roles:
++            continue
++        if any(has_han(t) for t in _content_texts(content)):
++            return True
++    return False
++
++
++def chat_extra_args(
++    extra_args: dict[str, Any], messages: Iterable[Any], model_extra: Any
++) -> dict[str, Any]:
++    """Resolve the chat request's flag into ``extra_args`` (a new dict)."""
++    explicit = extra_args.get(XARG)
++    if explicit is None and isinstance(model_extra, Mapping):
++        explicit = model_extra.get(XARG)
++    if explicit is not None:
++        flag = resolve(explicit, False)
++    else:
++        flag = not messages_have_han(messages)
++    out = dict(extra_args)
++    out[XARG] = flag
++    return out
++
++
++# ---------------------------------------------------------------- vocabulary
++
++
++def _bytes_to_unicode() -> dict[str, int]:
++    """GPT-2 byte-level alphabet, inverted: printable char -> byte."""
++    bs = (
++        list(range(ord("!"), ord("~") + 1))
++        + list(range(ord("¡"), ord("¬") + 1))
++        + list(range(ord("®"), ord("ÿ") + 1))
++    )
++    cs = bs[:]
++    n = 0
++    for b in range(256):
++        if b not in bs:
++            bs.append(b)
++            cs.append(256 + n)
++            n += 1
++    return {chr(c): b for b, c in zip(bs, cs)}
++
++
++_U2B = _bytes_to_unicode()
++_SP_BYTE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
++
++
++def token_bytes(token: str) -> bytes:
++    """Raw bytes of a vocabulary string (byte-level BPE or SentencePiece)."""
++    if all(c in _U2B for c in token):
++        return bytes(_U2B[c] for c in token)
++    m = _SP_BYTE.match(token)
++    if m:
++        return bytes([int(m.group(1), 16)])
++    return token.replace("▁", " ").encode("utf-8")
++
++
++def _overlaps(lo: int, hi: int, ranges) -> bool:
++    return any(lo <= r_hi and r_lo <= hi for r_lo, r_hi in ranges)
++
++
++def _trailing_lead_masked(b: bytes) -> bool:
++    """Incomplete trailing 3-byte sequence that can only finish as Han."""
++    n = len(b)
++    for k in (1, 2):  # lead at n-1 (lone) or n-2 (lead + one continuation)
++        i = n - k
++        if i < 0:
++            break
++        lead = b[i]
++        if lead in _LEADS and all(0x80 <= x <= 0xBF for x in b[i + 1 :]):
++            base = (lead & 0x0F) << 12
++            if k == 1:
++                lo, hi = base, base + 0xFFF
++            else:
++                lo = base | ((b[i + 1] & 0x3F) << 6)
++                hi = lo + 0x3F
++            return _overlaps(lo, hi, HAN_RANGES) and not _overlaps(lo, hi, KANA_RANGES)
++    return False
++
++
++def classify(b: bytes) -> str | None:
++    """'han', 'partial' or None (allowed)."""
++    try:
++        text = b.decode("utf-8")
++        return "han" if has_han(text) else None
++    except UnicodeDecodeError:
++        if has_han(b.decode("utf-8", "ignore")):
++            return "han"
++        return "partial" if _trailing_lead_masked(b) else None
++
++
++def build_mask(tokenizer: Any, vocab_size: int):
++    """Bool mask [vocab_size] (numpy) and counts, from the tokenizer vocabulary."""
++    import numpy as np
++
++    mask = np.zeros(vocab_size, dtype=bool)
++    vocab = tokenizer.get_vocab()
++    skip = set(getattr(tokenizer, "all_special_ids", None) or ())
++    with contextlib.suppress(Exception):
++        skip |= set(tokenizer.get_added_vocab().values())
++    counts = {"han": 0, "partial": 0, "vocab": len(vocab), "kana_only": 0}
++    for tok, idx in vocab.items():
++        if idx in skip or not 0 <= idx < vocab_size:
++            continue
++        b = token_bytes(tok)
++        kind = classify(b)
++        if kind is not None:
++            mask[idx] = True
++            counts[kind] += 1
++    counts["masked"] = int(mask.sum())
++    return mask, counts
++
++
++_PROMPT_MASK: Any = None
++
++
++def prompt_has_han_tokens(tokenizer: Any, token_ids: Any) -> bool:
++    """Fallback scan for non-chat prompts (the whole prompt, history included):
++    a token whose text has Han, or a byte token that is not valid UTF-8 alone
++    and holds a 0xE3-0xE9 byte (a character split across tokens may be Han)."""
++    global _PROMPT_MASK
++    import numpy as np
++
++    if token_ids is None or tokenizer is None:
++        return False
++    if _PROMPT_MASK is None:
++        vocab = tokenizer.get_vocab()
++        size = max(vocab.values()) + 1 if vocab else 0
++        m = np.zeros(size, dtype=bool)
++        for tok, idx in vocab.items():
++            b = token_bytes(tok)
++            try:
++                m[idx] = has_han(b.decode("utf-8"))
++            except UnicodeDecodeError:
++                m[idx] = classify(b) is not None or any(x in _LEADS for x in b)
++        _PROMPT_MASK = m
++    ids = np.asarray(token_ids, dtype=np.int64)
++    ids = ids[(ids >= 0) & (ids < _PROMPT_MASK.shape[0])]
++    return bool(_PROMPT_MASK[ids].any())
+diff --git a/vllm/v1/worker/gpu/astra_greedy.py b/vllm/v1/worker/gpu/astra_greedy.py
+index bffae47a3f..50c06961d1 100644
+--- a/vllm/v1/worker/gpu/astra_greedy.py
++++ b/vllm/v1/worker/gpu/astra_greedy.py
+@@ -115,6 +115,11 @@ def eligible(runner, batch, grammar):
+         return False
+     if np.any(sampler.needs_logits_processing[idx]):
+         return False
++    # B70-CJK: the greedy head bypasses the logits; masked rows take the
++    # ordinary path.
++    cjk_mask = getattr(sampler, "cjk_mask", None)
++    if cjk_mask is not None and cjk_mask.any_flagged(idx):
++        return False
+     if sampler.get_logprobs_dims(idx) is not None:
+         return False
+     lengths = np.diff(batch.cu_num_logits_np)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index beebf0bf2d..0ec58db9bd 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -994,6 +994,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # top_k, top_p, and logprobs, using less GPU memory than what is possible
+         # during actual execution.
+         assert self.sampler is not None
++        if getattr(self.sampler, "cjk_mask", None) is not None:
++            self.sampler.cjk_mask.warmup(logits)  # B70-CJK: JIT before serving
+         self.sampler(logits, dummy_input_batch)
+ 
+     @torch.inference_mode()
+@@ -1650,6 +1652,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.num_acceptable_drafts,
+             )
+ 
++        # B70-CJK: Han mask in place on the target logits, before plain
++        # sampling and before every verification row of spec decode.
++        cjk_mask = getattr(self.sampler, "cjk_mask", None)
++        if cjk_mask is not None and logits.shape[0] > 0:
++            cjk_mask.apply(
++                logits, input_batch.expanded_idx_mapping, input_batch.idx_mapping_np
++            )
++
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+             # This rank owns no requests this step. It contributes an
+diff --git a/vllm/v1/worker/gpu/sample/cjk_mask.py b/vllm/v1/worker/gpu/sample/cjk_mask.py
+new file mode 100644
+index 0000000000..d2ef35458b
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/cjk_mask.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""B70-CJK: serving-side Han mask, worker side (env ``B70_CJK_MASK=1``).
++
++One device bool mask [vocab] built at boot from the tokenizer, one per-request
++flag. The model runner applies it in place on the target logits right after
++``compute_logits``, next to the grammar bitmask, so it covers the plain
++sampler, every speculative verification row (drafted Han then has target
++probability 0 and is rejected, and the residual resample cannot pick it), and
++both the stock and the ``B70_SAMPLER_FAST`` sampling paths. The astra greedy
++shortcut builds its own head and is declined for batches with a flagged row.
++
++Cost: nothing when no row of the batch is flagged (host check on the numpy
++mirror); otherwise one launch, grid (rows, V / 4096), that reads the mask and
++stores -inf on masked ids of flagged rows only.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++from vllm.v1.sample import b70_cjk
++from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++    from vllm.sampling_params import SamplingParams
++
++logger = init_logger(__name__)
++
++BLOCK = 4096
++
++
++@triton.jit
++def _cjk_mask_kernel(
++    logits_ptr,
++    logits_stride,
++    vocab_size,
++    expanded_idx_mapping_ptr,
++    flags_ptr,
++    mask_ptr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    blk = tl.program_id(1)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + row)
++    flag = tl.load(flags_ptr + req_state_idx)
++    if flag != 0:
++        offset = blk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++        in_vocab = offset < vocab_size
++        m = tl.load(mask_ptr + offset, mask=in_vocab, other=0)
++        tl.store(
++            logits_ptr + row * logits_stride + offset,
++            -float("inf"),
++            mask=in_vocab & (m != 0),
++        )
++
++
++def apply_cjk_mask(
++    logits: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    flags: torch.Tensor,
++    mask_u8: torch.Tensor,
++) -> None:
++    """In place: logits[r, v] = -inf where flags[map[r]] and mask[v]."""
++    num_rows = logits.shape[0]
++    vocab_size = min(logits.shape[1], mask_u8.shape[0])
++    if num_rows == 0 or vocab_size == 0:
++        return
++    assert logits.stride(-1) == 1
++    grid = (num_rows, triton.cdiv(vocab_size, BLOCK))
++    _cjk_mask_kernel[grid](
++        logits,
++        logits.stride(0),
++        vocab_size,
++        expanded_idx_mapping,
++        flags,
++        mask_u8,
++        BLOCK_SIZE=BLOCK,
++    )
++
++
++def apply_cjk_mask_reference(
++    logits: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    flags: torch.Tensor,
++    mask: torch.Tensor,
++) -> None:
++    """Torch reference of the kernel (tests, CPU)."""
++    v = min(logits.shape[1], mask.shape[0])
++    rows = flags[expanded_idx_mapping.long()] != 0
++    if not bool(rows.any()):
++        return
++    region = logits[:, :v]
++    region.masked_fill_(rows[:, None] & mask[None, :v].bool(), float("-inf"))
++
++
++class CjkMaskState:
++    def __init__(
++        self,
++        vllm_config: VllmConfig | None,
++        max_num_reqs: int,
++        vocab_size: int,
++        device: torch.device,
++        tokenizer=None,
++    ):
++        if tokenizer is None:
++            assert vllm_config is not None
++            from vllm.tokenizers import cached_tokenizer_from_config
++
++            tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
++            if tokenizer is None:
++                raise RuntimeError(
++                    f"{b70_cjk.ENV}=1 needs the tokenizer (skip_tokenizer_init is set)"
++                )
++        mask_np, counts = b70_cjk.build_mask(tokenizer, vocab_size)
++        self.counts = counts
++        self.mask = torch.from_numpy(mask_np).to(device)
++        self.mask_u8 = self.mask.view(torch.uint8)
++        self.flags = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self.use_torch_reference = device.type == "cpu"
++        logger.info(
++            "B70-CJK: Han mask active: %d of %d vocabulary ids masked "
++            "(%d Han, %d partial UTF-8; kana and special tokens kept); "
++            "per request: vllm_xargs.%s, auto-off when the prompt has Han",
++            counts["masked"],
++            vocab_size,
++            counts["han"],
++            counts["partial"],
++            b70_cjk.XARG,
++        )
++
++    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
++        extra = sampling_params.extra_args or {}
++        # The API server resolves the flag; a missing key (an engine-direct
++        # request) defaults to masked.
++        flag = b70_cjk.parse_flag(extra.get(b70_cjk.XARG))
++        flag = True if flag is None else flag
++        self.flags.np[req_idx] = int(flag)
++        return flag
++
++    def apply_staged_writes(self) -> None:
++        self.flags.copy_to_uva()
++
++    def any_flagged(self, idx_mapping_np: np.ndarray) -> bool:
++        return bool(np.any(self.flags.np[idx_mapping_np]))
++
++    def apply(
++        self,
++        logits: torch.Tensor,
++        expanded_idx_mapping: torch.Tensor,
++        idx_mapping_np: np.ndarray,
++    ) -> None:
++        if logits.shape[0] == 0 or not self.any_flagged(idx_mapping_np):
++            return
++        if self.use_torch_reference:
++            apply_cjk_mask_reference(
++                logits, expanded_idx_mapping, self.flags.gpu, self.mask
++            )
++        else:
++            apply_cjk_mask(logits, expanded_idx_mapping, self.flags.gpu, self.mask_u8)
++
++    def warmup(self, logits: torch.Tensor) -> None:
++        """JIT the kernel for this logits dtype (writes into the dummy logits)."""
++        n = logits.shape[0]
++        if n == 0 or self.use_torch_reference:
++            return
++        rows = torch.zeros(n, dtype=torch.int32, device=logits.device)
++        ones = torch.ones(1, dtype=torch.int32, device=logits.device)
++        apply_cjk_mask(logits, rows, ones, self.mask_u8)
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 180ba361d4..6121273e7e 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -10,6 +10,7 @@ import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.sample import b70_cjk
+ from vllm.v1.sample.ops.topk_topp_sampler import (
+     apply_top_k_top_p,
+     flashinfer_sample,
+@@ -83,6 +84,13 @@ class Sampler:
+         self.trace_replay_state = (
+             TraceReplayState(req_states) if enable_trace_replay else None
+         )
++        # B70-CJK: Han mask, applied by the model runner on the raw target
++        # logits (not a logits processor: no fp32 copy, covers verification).
++        self.cjk_mask = None
++        if b70_cjk.enabled():
++            from vllm.v1.worker.gpu.sample.cjk_mask import CjkMaskState
++
++            self.cjk_mask = CjkMaskState(vllm_config, max_num_reqs, vocab_size, device)
+         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+         # B70-SM: requests that need more than temperature / top-k / top-p / min-p
+         # (bias, penalties, bad words, thinking budget, custom processors).
+@@ -106,6 +114,8 @@ class Sampler:
+         self.needs_logits_processing[req_idx] = needs_processing | needs_other
+ 
+         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
++        if self.cjk_mask is not None:
++            self.cjk_mask.add_request(req_idx, sampling_params)
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.add_request(req_idx, sampling_params)
+ 
+@@ -115,6 +125,8 @@ class Sampler:
+             processor.apply_staged_writes()
+         self.thinking_budget_state.apply_staged_writes()
+         self.logprob_token_ids_state.apply_staged_writes()
++        if self.cjk_mask is not None:
++            self.cjk_mask.apply_staged_writes()
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.apply_staged_writes()
+ 

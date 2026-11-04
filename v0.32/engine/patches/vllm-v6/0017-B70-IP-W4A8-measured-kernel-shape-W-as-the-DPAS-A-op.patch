@@ -1,7 +1,7 @@
 From d9ec7d1dd1406e78eb23461bcf331f2f53ba8e3b Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 18:57:31 +0000
-Subject: [PATCH 17/51] B70-IP-W4A8: measured kernel shape (W as the DPAS A
+Subject: [PATCH 17/53] B70-IP-W4A8: measured kernel shape (W as the DPAS A
  operand), x16 nibbles, one-kernel tile map
 
 On the B70 any elementwise op on an int8 B-operand tile (the nibble unpack of a

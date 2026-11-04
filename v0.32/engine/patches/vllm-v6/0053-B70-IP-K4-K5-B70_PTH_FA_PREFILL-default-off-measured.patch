@@ -1,0 +1,47 @@
+From 252441f609505fe2b4b83ad14d7428ea448466dc Mon Sep 17 00:00:00 2001
+From: Lumnus <lumnus.org@gmail.com>
+Date: Wed, 4 Nov 2026 12:07:29 +0000
+Subject: [PATCH 53/53] B70-IP-K4/K5: B70_PTH_FA_PREFILL default off (measured:
+ 2K x16 prefill 3.1K -> 6.3K tok/s, +0.29 GiB KV per card on Flash-Next; -2.1
+ GiB on a single-card 27B, boot failure when on)
+
+---
+ vllm/v1/attention/backends/b70_pth_fa.py | 4 ++--
+ vllm/v1/attention/backends/flash_attn.py | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/b70_pth_fa.py b/vllm/v1/attention/backends/b70_pth_fa.py
+index 7027ceb121..594cc8d8a2 100644
+--- a/vllm/v1/attention/backends/b70_pth_fa.py
++++ b/vllm/v1/attention/backends/b70_pth_fa.py
+@@ -16,7 +16,7 @@ all layers (they run in sequence), allocated in the first eager forward (the
+ memory-profile run) so the KV pool is sized around it. Sequences whose total
+ context exceeds it are processed in groups.
+ 
+-Env: B70_PTH_FA_PREFILL=0 turns it off; B70_PTH_FA_MIN_Q (default 64).
++Env: B70_PTH_FA_PREFILL=1 turns it on (default off: it halved 16-parallel prefill throughput on the Flash-Next engine and cost KV memory per card; on a single-card 27B it cost ~2.1 GiB and could block boot); B70_PTH_FA_MIN_Q (default 64).
+ 
+ B70-IP-D2 (``B70_PTH_FA_DECODE=1``, default off): FLASH_ATTN on XPU accepts
+ ``int8_per_token_head`` and decodes natively with the vllm-xpu-kernels INT8
+@@ -48,7 +48,7 @@ _logged = False
+ 
+ def _enabled() -> bool:
+     return (
+-        current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "1") != "0"
++        current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "0") == "1"
+     )
+ 
+ 
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 6b8bdac084..9cd6d1f91d 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -1368,7 +1368,7 @@ class FlashAttentionImpl(AttentionImpl):
+         # B70-IP-K5: on XPU the FA kernel's fp8-KV path is ~2.2x slower than
+         # its bf16 path for prefill chunks; dequantize the referenced fp8
+         # blocks into a bf16 scratch and run FA bf16 (decode and spec-verify
+-        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=0 turns it off.
++        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=1 turns it on (default off).
+         if (
+             current_platform.is_xpu()
+             and is_quantized_kv_cache(self.kv_cache_dtype)

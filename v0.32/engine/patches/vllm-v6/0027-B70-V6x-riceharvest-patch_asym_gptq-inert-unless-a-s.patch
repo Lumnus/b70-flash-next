@@ -1,7 +1,7 @@
 From 7c7c33f5ede43df2e7c57f56d8e6d5b06df52444 Mon Sep 17 00:00:00 2001
 From: riceharvest <myappleiddarimaan@gmail.com>
 Date: Sat, 31 Oct 2026 22:57:29 +0000
-Subject: [PATCH 27/51] B70-V6x: riceharvest patch_asym_gptq (inert unless a
+Subject: [PATCH 27/53] B70-V6x: riceharvest patch_asym_gptq (inert unless a
  sym=false GPTQ checkpoint loads, B70_ASYM_GPTQ marker)
 
 riceharvest/vllm b70/v0.32 43fb2ee310: load asymmetric GPTQ (sym=false,

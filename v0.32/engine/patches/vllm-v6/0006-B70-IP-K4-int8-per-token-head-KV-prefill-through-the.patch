@@ -1,7 +1,7 @@
 From 9982d0735cee47df2f0e8bdf158ec9bd8759f889 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 14:24:13 +0000
-Subject: [PATCH 06/51] B70-IP-K4: int8 per-token-head KV prefill through the
+Subject: [PATCH 06/53] B70-IP-K4: int8 per-token-head KV prefill through the
  XPU FA kernel
 
 Triton unified attention prefill on XPU is ~100x slower than the SYCL FA

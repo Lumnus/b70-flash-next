@@ -1,7 +1,7 @@
 From c98e4ae83bd15bd9a1e3f12dccfca55520aa4621 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 01:34:03 +0000
-Subject: [PATCH 33/51] B70-PLE-PRELOAD: preload the rank's INT8 PLE rows into
+Subject: [PATCH 33/53] B70-PLE-PRELOAD: preload the rank's INT8 PLE rows into
  the pinned NVMe row cache (B70_PLE_INT8_NVME_PRELOAD=1)
 
 Opt-in (default 0). At init, when the rank's cache capacity >= its owned rows,

@@ -1,7 +1,7 @@
 From 81019c5865774f5360c68175513e0734a54f210a Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 14:24:13 +0000
-Subject: [PATCH 07/51] B70-IP-K3/W1: CPU tests (unify multiple, opt-out, int8
+Subject: [PATCH 07/53] B70-IP-K3/W1: CPU tests (unify multiple, opt-out, int8
  quantizer, selection regexes)
 
 ---

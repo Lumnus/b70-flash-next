@@ -1,7 +1,7 @@
 From ecb838a93cb11203c635adff5ce2f795c11b7eca Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 13:52:01 +0000
-Subject: [PATCH 02/51] B70-IP-K2: per-token-head scale views are not filled
+Subject: [PATCH 02/53] B70-IP-K2: per-token-head scale views are not filled
  (backport of vllm#64141)
 
 In hybrid models the attention layers and the GDN layers view the same

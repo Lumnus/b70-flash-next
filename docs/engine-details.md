@@ -5,7 +5,7 @@ software versions, the build and the run commands; every switch is in [switches]
 
 ## The series
 
-The engine is fork tag `v0.32.0-b70.6`, exported as five directories that apply in order on vLLM v0.32.0 (`git am`, or
+The engine is fork tag `v0.32.0-b70.7`, exported as five directories that apply in order on vLLM v0.32.0 (`git am`, or
 `git apply` one after the other); `v0.32/engine/scripts/check-series.sh --all` fails if any of them differs from a fresh export of the
 fork. The fork's other tags mark where each layer ends:
 
@@ -15,7 +15,7 @@ fork. The fork's other tags mark where each layer ends:
 | [`patches/vllm-qsa/`](../v0.32/engine/patches/vllm-qsa/) | `v0.32.0-b70.4-dense..v0.32.0-b70.4-qsa` | 38: sparse attention ([Sparse attention](measurements/flash-next-earlier-builds.md#sparse-attention-qsa)) |
 | [`patches/vllm-hotcold/`](../v0.32/engine/patches/vllm-hotcold/) | `v0.32.0-b70.4-qsa..v0.32.0-b70.4` | 13: hot/cold expert offload ([below](#hotcold-expert-offload)) |
 | [`patches/vllm-models/`](../v0.32/engine/patches/vllm-models/) | `v0.32.0-b70.4..v0.32.0-b70.5` | 8: the 27B/35B layer and the backstep guard ([below](#the-models-layer)) |
-| [`patches/vllm-v6/`](../v0.32/engine/patches/vllm-v6/) | `v0.32.0-b70.5..v0.32.0-b70.6` | 51: INT8 execution and KV, in-graph PLE gather, kernel cuts, fast sampler ([below](#the-v6-layer)) |
+| [`patches/vllm-v6/`](../v0.32/engine/patches/vllm-v6/) | `v0.32.0-b70.5..v0.32.0-b70.7` | 53: INT8 execution and KV, in-graph PLE gather, kernel cuts, fast sampler ([below](#the-v6-layer)) |
 
 `v0.32/engine/tools/check-trunk-tree.sh` is the tree-level counterpart for maintainers: it applies the five directories to vanilla
 v0.32.0 and fails if the result differs from a given trunk (scrubbed with a rules file) anywhere; see the header of the
@@ -71,14 +71,14 @@ when the backstep is on), so a preset that sets none of them runs the b70.4 code
 
 ### The v6 layer
 
-[`patches/vllm-v6/`](../v0.32/engine/patches/vllm-v6/), 51 commits. Every lever is off unless a preset sets it, except the three KV defaults marked
+[`patches/vllm-v6/`](../v0.32/engine/patches/vllm-v6/), 53 commits. Every lever is off unless a preset sets it, except the three KV defaults marked
 below; [switches](switches.md) lists each key.
 
 | patches | what | switch |
 |---|---|---|
 | 0001–0004 | B70-IP-K1 to K3: per-token-head KV with pointer loads instead of tensor descriptors, no fill of the scale views (backport of vllm-project/vllm#64141), the KV page unify takes the integer block multiple, CPU tests | defaults on: `B70_PTH_TD_GUARD`, `B70_KV_UNIFY_MULTIPLE` |
 | 0005, 0007 | W1: BF16 dense linears as W8A8 int8 (RTN per channel, per-token activations; Triton up to 64 rows, oneDNN above), tests | `B70_DENSE_INT8=1` |
-| 0006, 0008 | K4, K5: INT8 KV prefill through the XPU FlashAttention kernel (dequantised to a bf16 scratch above 64 query rows) | `B70_PTH_FA_PREFILL` (on) |
+| 0006, 0008 | K4, K5: INT8 KV prefill through the XPU FlashAttention kernel (dequantised to a bf16 scratch above 64 query rows) | `B70_PTH_FA_PREFILL` (default off since 0053) |
 | 0009–0014 | K6 to K8: the QSA kernels read and write `int8_per_token_head` KV; native int8 Q.K and P.V DPAS; int8-dot attn2 faster than bf16 | `B70_QSA_I8DOT=1/2` |
 | 0015 | H1: lm_head as INT8 W8A8, native int8 DPAS | `B70_HEAD_INT8=1` |
 | 0016–0018 | W4A8 routed experts for the XPU int4 MoE: Triton form, measured kernel shape, then the native cutlass W4A8 grouped GEMM | `B70_MOE_W4A8=1/2` |
@@ -93,6 +93,8 @@ below; [switches](switches.md) lists each key.
 | 0042–0045 | the kernel cut: EP sentinel and rows-per-expert zero in one Triton kernel, in-place XCCL all-reduce at caller-owned sites, `hc_silu` folded into the HC down finish, CPU equivalence tests | `B70_MOE_KCUT`, `B70_AR_INPLACE`, `B70_HC_SILU_FUSE` |
 | 0046–0050 | glue for the whole-wheel kernels: fused small-M int8 dense, HC down on the W8A8 GEMM with deterministic split-K, W4A8 apply with the fused gemm1 epilogue, int8 activation quantisation folded into the producers (K2), per-(token, stream) HC scales | `B70_DENSE_INT8_FUSED`, `B70_HC_DOWN_INT8`, `B70_I8_PRODUCER_QUANT` (all off) |
 | 0051 | top-k-first temperature sampling and speculative verification | `B70_SAMPLER_FAST=1` |
+| 0052 | serving-side Han mask with a per-request automatic gate (b70.7) | `B70_CJK_MASK=1` |
+| 0053 | K4/K5 bf16 prefill scratch off by default: it halved prefill at 16 streams and cost KV (b70.7) | `B70_PTH_FA_PREFILL=1` turns it on |
 
 **Which upstream commit 0.1.16.2 is.** There is no GitHub tag for 0.1.16.2. The PyPI wheel's seven `.py` files match upstream
 byte for byte at `8b95ea6`, `6b30c9b` and `19c6ddc` and at nothing later; its paged-decode table has the rows that #566

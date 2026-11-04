@@ -1,7 +1,7 @@
 From dbee42a701cc2b5fe7cc1715b54ed505f8b6df7f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 18:06:59 +0000
-Subject: [PATCH 16/51] B70-IP-W4A8: W4A8 routed experts for the XPU int4 MoE
+Subject: [PATCH 16/53] B70-IP-W4A8: W4A8 routed experts for the XPU int4 MoE
  (B70_MOE_W4A8=1)
 
 int4 g128 weights read as XpuFusedMoe stores them (no copy, no repack), int8

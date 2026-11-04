@@ -5,14 +5,14 @@
 
 ## Presets
 
-| preset | cards · slots | attention | execution | drafter | PLE table | KV tier | files |
-|---|---|---|---|---|---|---|---|
-| D8-6 | 4 · 16 | dense FlashAttention | INT8 | W8A8 | host RAM | 128 GiB | [`.args`](preset-d8-6-4card.args) · [`.env`](preset-d8-6-4card.env) |
-| D16e-6 | 4 · 16 | dense FlashAttention | BF16 | BF16 | host RAM | 128 GiB | [`.args`](preset-d16e-6-4card.args) · [`.env`](preset-d16e-6-4card.env) |
-| S8-6 | 4 · 16 | sparse QSA | INT8 | W8A8 | host RAM | 128 GiB | [`.args`](preset-s8-6-4card.args) · [`.env`](preset-s8-6-4card.env) |
-| S16e-6 | 4 · 16 | sparse QSA | BF16 | BF16 | host RAM | 128 GiB | [`.args`](preset-s16e-6-4card.args) · [`.env`](preset-s16e-6-4card.env) |
-| D8-6 | 2 · 4 | dense FlashAttention | INT8 | W8A8 | NVMe | 32 GiB | [`.args`](preset-d8-6-2card.args) · [`.env`](preset-d8-6-2card.env) |
-| S8-6 | 2 · 4 | sparse QSA | INT8 | W8A8 | NVMe | 32 GiB | [`.args`](preset-s8-6-2card.args) · [`.env`](preset-s8-6-2card.env) |
+| preset | cards · slots | attention | execution | KV | drafter | PLE table | KV tier | files |
+|---|---|---|---|---|---|---|---|---|
+| D8-7 | 4 · 16 | dense FlashAttention | INT8 | INT8 | W8A8 | host RAM | 128 GiB | [`.args`](preset-d8-7-4card.args) · [`.env`](preset-d8-7-4card.env) |
+| D16e-7 | 4 · 16 | dense FlashAttention | BF16 | INT8 | BF16 | host RAM | 128 GiB | [`.args`](preset-d16e-7-4card.args) · [`.env`](preset-d16e-7-4card.env) |
+| S8-7 | 4 · 16 | sparse QSA | INT8 | INT8 | W8A8 | host RAM | 128 GiB | [`.args`](preset-s8-7-4card.args) · [`.env`](preset-s8-7-4card.env) |
+| S16e-7 | 4 · 16 | sparse QSA | BF16 | INT8 | BF16 | host RAM | 128 GiB | [`.args`](preset-s16e-7-4card.args) · [`.env`](preset-s16e-7-4card.env) |
+| D8-7 | 2 · 4 | dense FlashAttention | INT8 | INT8 | W8A8 | NVMe | 32 GiB | [`.args`](preset-d8-7-2card.args) · [`.env`](preset-d8-7-2card.env) |
+| S8-7 | 2 · 4 | sparse QSA | INT8 | INT8 | W8A8 | NVMe | 32 GiB | [`.args`](preset-s8-7-2card.args) · [`.env`](preset-s8-7-2card.env) |
 
 The 2-card presets run hot/cold expert offload: 145 of 256 experts per layer per rank live in host RAM.
 
@@ -30,37 +30,47 @@ Each preset is a list of switches on one tree. D, S, 8, 16 and the card count ar
 
 ## Numbers
 
-Measured on our host (AMD EPYC 7402, 256 GB, 4× B70). Total tok/s, thinking off, `ignore_eos`, 512 tokens, best of two runs. 4 cards at 16 slots, 2 cards at 4 slots on cards 0+3.
+Measured on our host (AMD EPYC 7402, 256 GB, 4× B70), each preset as shipped, with the mask on. Total tok/s, thinking off, `ignore_eos`, 512 tokens, best of two runs. 4 cards at 16 slots, 2 cards at 4 slots on cards 0+3.
 
 **Temperature 0.7**
 
-| | D8-6, 4 cards | D16e-6, 4 cards | S8-6, 4 cards | S16e-6, 4 cards | D8-6, 2 cards | S8-6, 2 cards |
+| | D8-7, 4 cards | D16e-7, 4 cards | S8-7, 4 cards | S16e-7, 4 cards | D8-7, 2 cards | S8-7, 2 cards |
 |---|---|---|---|---|---|---|
-| short prompt, 1 / 4 / 8 / 12 / 16 streams | 124 / 330 / 504 / 678 / 777 | 109 / 309 / 485 / 640 / 699 | 117 / 309 / 487 / 644 / 738 | 102 / 275 / 472 / 606 / 801 | 72 / 132 / — / — / — | 68 / 128 / — / — / — |
-| 2K prompt, 8 / 12 / 16 streams | 681 / 778 / 880 | 630 / 742 / 685 | 629 / 757 / 715 | 578 / 678 / 607 | — | — |
-| prefill while 16 streams load (2K prompt) | 6,868 | 3,207 | 3,356 | 2,892 | — | — |
+| short prompt, 1 / 4 / 8 / 12 / 16 streams | 120 / 333 / 514 / 667 / 769 | 112 / 299 / 474 / 625 / 682 | 115 / 320 / 498 / 650 / 741 | 105 / 284 / 465 / 600 / 739 | 69 / 136 / — / — / — | 69 / 133 / — / — / — |
+| 2K prompt, 8 / 12 / 16 streams | 664 / 795 / 855 | 631 / 747 / 770 | 617 / 726 / 784 | 574 / 654 / 607 | — | — |
+| 2K prompt, 2 / 4 streams | — | — | — | — | 172 / 170 | 167 / 181 |
+| prefill while 16 streams load (2K prompt) | 6,950 | 6,409 | 6,186 | 2,903 | — | — |
 
 **Temperature 0**
 
-| | D8-6, 4 cards | D16e-6, 4 cards | S8-6, 4 cards | S16e-6, 4 cards | D8-6, 2 cards | S8-6, 2 cards |
+| | D8-7, 4 cards | D16e-7, 4 cards | S8-7, 4 cards | S16e-7, 4 cards | D8-7, 2 cards | S8-7, 2 cards |
 |---|---|---|---|---|---|---|
-| code, 1 / 4 / 8 / 12 / 16 streams | 296 / 830 / 1,316 / 1,729 / 1,830 | 258 / 700 / 1,158 / 1,552 / 1,662 | 271 / 757 / 1,198 / 1,631 / 1,880 | 246 / 691 / 1,111 / 1,509 / 1,856 | 107 / 205 / — / — / — | 92 / 195 / — / — / — |
-| prose, 1 / 4 / 8 / 12 / 16 streams | 118 / 351 / 533 / 714 / 825 | — | 116 / 323 / 519 / 689 / 785 | — | — | — |
+| code, 1 / 4 / 8 / 12 / 16 streams | 302 / 811 / 1,270 / 1,698 / 1,941 | 252 / 704 / 1,131 / 1,502 / 1,661 | 266 / 755 / 1,208 / 1,546 / 1,817 | 243 / 668 / 1,081 / 1,442 / 1,749 | 100 / 230 / — / — / — | 96 / 181 / — / — / — |
+| prose, 1 / 4 / 8 / 12 / 16 streams | 119 / 334 / 518 / 681 / 769 | 115 / 291 / 485 / 638 / 699 | 124 / 315 / 498 / 660 / 752 | 102 / 282 / 461 / 610 / 762 | — | — |
 
 **Independent of temperature**
 
-| | D8-6, 4 cards | D16e-6, 4 cards | S8-6, 4 cards | S16e-6, 4 cards | D8-6, 2 cards | S8-6, 2 cards |
+| | D8-7, 4 cards | D16e-7, 4 cards | S8-7, 4 cards | S16e-7, 4 cards | D8-7, 2 cards | S8-7, 2 cards |
 |---|---|---|---|---|---|---|
-| prefill 32K / 128K, uncached, mean of two | 6,671 / 5,016 | 6,309 / 4,732 | 5,947 / 5,586 | 5,308 / 5,057 | 2,865 / 2,412 | 2,820 / 2,893 |
-| GPU KV tokens | 645,113 | 573,223 | 600,045 | 535,094 | 426,060 | 504,608 |
-| needle retrieval, 128K | 3/3 at 12 slots | 3/3 | 3/3 at 12 slots | 3/3 | 3/3 | 3/3, on cards 1+2 |
+| prefill 32K / 128K, uncached, mean of two | 6,772 / 5,004 | 6,366 / 4,726 | 6,000 / 5,583 | 5,395 / 5,050 | 2,860 / 2,418 | 2,834 / 2,892 |
+| GPU KV tokens | 678,259 | 606,145 | 631,240 | 566,177 | 474,109 | 559,191 |
+| burst · burst with prefix hits | 0/186 · 0/267 | 0/186 · 0/267 | 0/186 · 0/267 | 0/186 · 0/267 | 0/186 · 0/267 | 0/186 · 0/267 |
+| structured output · token compare | pass · pass | pass · pass | pass · pass | pass · fail, see 2 | pass · pass | pass · pass |
+| needle retrieval | 128K, 240K 6/6 | 128K, 240K 6/6 | 128K, 240K 6/6 | 128K, 240K 6/6 | 128K 3/3 | 128K 3/3 |
 
-1. **Validation at 12 slots.** D8-6 and D16e-6 had the full validation on this tree at 12 slots: burst 0/186, burst with prefix hits 0/267, structured output, token compare, needle to 240K, fidelity, quality. MMLU-300 / TruthfulQA-200 (thinking on, medium, temperature 0): D8-6 91.7 / 89.0, D16e-6 92.7 / 89.5; McNemar p 0.45 and 1.0. Agentic test 36/50 and 38/50, Fisher p 0.82.
-2. **Short passes.** The 2-card presets: the same gates on this tree, on cards 1+2 for S8-6, a speed read and a needle. The 4-card sparse presets: a boot, a speed read and a needle. Other combinations carry the same switches and were not run.
-3. **Chinese tokens on non-English prompts.** Replay of a Bulgarian-language session, thinking on, temperature 0.7, 80 samples, answers with Chinese characters: D8-6 17, S8-6 14, D16e-6 9, BF16 KV (D16-6) 15, D8-6 without a drafter 12. The gaps are small for this sample. The model's own answers in the original session already carried a few.
-4. **Fidelity.** Against D16e, INT8 execution moves token agreement (top-1 against a BF16 reference 86–88 % vs about 94 %). 8-bit KV against BF16 KV is at the repeat floor past 8K tokens, and visible below that, mostly on prose.
-5. **Card pairs.** On our host cards 0+3 prefill about 15 % faster than 1+2: S8-6 on cards 1+2 reads 2,404 / 2,505.
-6. Sparse against dense with earlier builds: [measurements](../../../docs/measurements/v0.32-qsa.md). Older presets and numbers: [earlier builds](../../../docs/measurements/flash-next-earlier-builds.md).
+1. **Quality and fidelity,** D8 and D16e only, on the same engine code with 12 slots. MMLU-300 / TruthfulQA-200 (thinking on, medium, temperature 0): D8 91.7 / 89.0, D16e 92.7 / 89.5; McNemar p 0.45 and 1.0. Agentic test 36/50 and 38/50, Fisher p 0.82. Against a BF16 reference, INT8 execution moves token agreement (top-1 86–88 % vs about 94 %). 8-bit KV against BF16 KV is at the repeat floor past 8K tokens, and visible below that, mostly on prose. The sparse and 2-card presets have no quality run on this release.
+2. **S16e-7 at 16 streams.** Its prefill halves under a 16-stream 2K load, and decode drops with it; the other three presets hold. Token compare: 1 stream 8/8 identical; at 8 streams one prompt shows a token run of 8 or more. Neither is explained yet.
+3. **Card pairs.** On our host cards 0+3 prefill about 15 % faster than 1+2.
+4. Sparse against dense with earlier builds: [measurements](../../../docs/measurements/v0.32-qsa.md). Older presets and numbers: [earlier builds](../../../docs/measurements/flash-next-earlier-builds.md).
+
+## Chinese characters on non-English prompts
+
+Qwen3.8-Flash-Next can emit Han characters into answers to non-English prompts, on every precision we run and more on long agentic contexts than on short prompts. `B70_CJK_MASK=1`, set in every preset, removes them where the target logits are computed, so speculative verification reads the masked logits too.
+
+1. **What it masks:** 55,659 of 248,320 token ids on this tokenizer (55,328 Han, 331 partial sequences). Kana stays. About 3,100 rare code points (Ext-A and compatibility ideographs) remain reachable through byte tokens.
+2. **When it applies:** on every request, unless a system or user turn contains Han. A Chinese prompt gets a Chinese answer. `cjk_mask` in the request (top level or `vllm_xargs`) overrides per request.
+3. **Measured,** 80 answers per replay of a long Bulgarian session: D16e 46 answers with Han to 0 on one session, 10 to 0 on another; D8 0 of 160 with the mask on. Throughput shows no difference beyond noise on D16e and D8. A Chinese test prompt on every preset here still answers in Chinese.
+4. **What it does not do:** it cures Han only. Latin words inside non-English answers come from the model, and INT8 execution mixes in more of them than BF16. On our 48-answer short-prompt set, Latin words per 1,000 Cyrillic words read 0.59 on D8-7 and 0.88 on S8-7 against 0.29 on D16e-7 and 0.58 on S16e-7, a handful of words each. With the gate on, a legitimate Chinese gloss in a non-Chinese conversation is masked too; send `cjk_mask: false` when you want those.
 
 ## Weights
 

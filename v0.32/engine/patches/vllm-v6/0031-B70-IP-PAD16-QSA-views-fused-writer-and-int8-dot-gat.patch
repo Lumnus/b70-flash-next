@@ -1,7 +1,7 @@
 From c6b9426bc2d45133d4ffa02e50b3d593584fd761 Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sat, 31 Oct 2026 23:52:48 +0000
-Subject: [PATCH 31/51] B70-IP-PAD16: QSA views, fused writer and int8-dot
+Subject: [PATCH 31/53] B70-IP-PAD16: QSA views, fused writer and int8-dot
  gathers (K6/K7/K8) follow the 16-B padded per-token-head slot
 
 1. qsa_pth_kv_views splits at the cache's half (content // 2) and validates it

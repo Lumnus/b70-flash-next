@@ -1,7 +1,7 @@
 From b23b3b80e04f3b3dfa18d015e7c4c6280fafa73f Mon Sep 17 00:00:00 2001
 From: Lumnus <lumnus.org@gmail.com>
 Date: Sun, 1 Nov 2026 01:57:09 +0000
-Subject: [PATCH 34/51] B70-PLE-RAM: native INT8 PLE table in pinned host RAM
+Subject: [PATCH 34/53] B70-PLE-RAM: native INT8 PLE table in pinned host RAM
  (B70_PLE_INT8=1, port of Lumnus 0008)
 
 PLE is either RAM native or on SSD. B70_PLE_INT8=1 (+ B70_PLE_INT8_PATH)
