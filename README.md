@@ -35,7 +35,7 @@ VENV=/opt/b70/venv v0.32/engine/serve.sh qwen38-flash-next preset-s8-6-2card
 
 1. [Engine page](v0.32/README.md): what the engine is, its patch series, build.
 2. [Model page](v0.32/models/qwen38-flash-next/meta.md): presets, numbers, how to compose other modes.
-3. [Qwen3.8-27B](v0.32/models/qwen38-27b/meta.md) and [Qwen3.6-35B-A3B](v0.32/models/qwen36-35b-a3b/meta.md) presets.
+3. [Qwen3.8-27B](v0.32/models/qwen38-27b/meta.md) and [Qwen3.6-35B-A3B](v0.32/models/qwen36-35b-a3b/meta.md) presets; the 1-card ones are booted on this release.
 4. [Switches](docs/switches.md) · [lessons learned](docs/lessons-learned.md) · [measurements](docs/measurements/README.md) · [kernels](docs/kernels.md) · [weights](docs/weights.md).
 5. [Changelog](CHANGELOG.md) · [provenance](PROVENANCE.md) · [upstream](docs/upstream.md) · [credits](docs/credits.md).
 6. The engine code: [github.com/Lumnus/vllm](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.6), kernels:

@@ -5,7 +5,7 @@ AutoRound checkpoint run as W4A8 (oneDNN int4 × int8 on XMX for GEMMs of 512 ro
 decoding (7 draft tokens) and a shortlist draft head. Two presets: one card (147,456-token context) and two cards (the full
 262,144).
 
-Last measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`, which remain the reference for these numbers. On the current whole-wheel kernels decode takes a different path (int4 GEMV, spec-decode changes, per [kernels](../../../docs/kernels.md)), and has not been re-measured.
+**On this release (tag `v0.32.0-b70.6`, whole-wheel kernels), 1-card preset, short pass:** decode 1 stream 61 prose / 133 code, 4 streams 177 / 392, prefill 1,931 at 32K and 968 at 131K, GPU KV 177,986 tokens (up from 150,054), burst 0/186, burst with prefix hits 0/267, structured output pass, needle 128K 3/3. Token compare: c=1 passes; at c=8 one of 8 prompts diverges at token 3 with a margin of 1.75 nats, past the gate's 1.0, with clean text. The preset adds `B70_SAMPLER_FAST=1`, `CCL_SYCL_ALLREDUCE_ARC=1` and `B70_PTH_FA_PREFILL=0`; with that scratch on, 147,456 tokens do not fit on one card. The table below and the 2-card preset were measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`; the 2-card preset is not re-measured on these kernels.
 
 | | |
 |---|---|

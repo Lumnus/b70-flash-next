@@ -21,6 +21,6 @@
 
 The final PLE and fidelity validation ran on the TP4 dense engines (D8-6, D16e-6). The TP2 and sparse variants carry the same levers; they had a short sanity pass.
 
-The Qwen3.8-27B and Qwen3.6-35B-A3B presets are unchanged; their numbers were measured on b70.5 and are not re-measured on these kernels.
+The 1-card Qwen3.8-27B and Qwen3.6-35B-A3B presets are booted on this release, numbers on their pages. Their 2-card presets are not re-measured on these kernels.
 
 Engine [`v0.32.0-b70.6`](https://github.com/Lumnus/vllm/tree/v0.32.0-b70.6), kernels [`b70/v0.1.16-b70.6`](https://github.com/Lumnus/vllm-xpu-kernels/tree/b70/v0.1.16-b70.6). [Changelog](CHANGELOG.md), [provenance](PROVENANCE.md), [switches](docs/switches.md).

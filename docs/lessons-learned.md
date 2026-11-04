@@ -35,8 +35,8 @@ this page is for changing them. Each model's numbers and gates are on its page i
    Sparse (QSA) wins where the context is long: on the b70.4 build prefill was 1.06× dense at 131K and 1.31× at 260K,
    agent-session replays 204.7 s against 230–235 s, long-context tasks 80/78 % against 72/72 % at 128K
    ([measurements](measurements/v0.32-qsa.md)). Dense is faster on short single streams. On two cards of this release,
-   D8-6 decodes 72 / 107 tok/s (prose / code, one stream) and S8-6 68 / 92, while S8-6 holds more GPU KV (503,866 against
-   426,060 tokens) and prefills 128K slightly faster (2,505 against 2,412 tok/s). Composing the other one is in
+   D8-6 decodes 72 / 107 tok/s (prose / code, one stream) and S8-6 68 / 92, while S8-6 holds more GPU KV (504,608 against
+   426,060 tokens) and prefills 128K faster (2,893 against 2,412 tok/s). Same cards for both: on our host cards 0+3 prefill about 15 % faster than 1+2. Composing the other one is in
    [the model page](../v0.32/models/qwen38-flash-next/meta.md#composing-other-modes).
 2. **Flash-Next: 4 or 2 cards.** 4 cards for speed. 2 cards free the other pair for a second model: 145 experts per layer
    per rank live in host RAM and are read over PCIe, so one stream decodes at about 0.6× the 4-card preset (72 against 124 tok/s on prose with D8-6). Turn on the

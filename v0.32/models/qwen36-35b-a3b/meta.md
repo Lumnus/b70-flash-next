@@ -5,7 +5,7 @@ from Intel's mixed INT4 AutoRound checkpoint: the linears of attention, GDN and 
 oneDNN, the routed experts as int4 W4A16 through the XPU grouped GEMM. DFlash speculative decoding with 7 draft tokens. Two
 presets: one card (196,608-token context) and two cards (the full 262,144, 16 slots).
 
-Last measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`, which remain the reference for these numbers. On the current whole-wheel kernels decode takes a different path (int4 GEMV, spec-decode changes, per [kernels](../../../docs/kernels.md)), and has not been re-measured.
+**On this release (tag `v0.32.0-b70.6`, whole-wheel kernels), 1-card preset, short pass:** decode 1 stream 124 prose / 307 code, 4 streams 303 / 740, prefill 7,246 at 32K and 4,044 at 131K, GPU KV 203,542 tokens, burst 0/186, burst with prefix hits 0/267, structured output pass, needle 128K 3/3. The preset adds `B70_SAMPLER_FAST=1` and `CCL_SYCL_ALLREDUCE_ARC=1`. The table below and the 2-card preset were measured on engine tag `v0.32.0-b70.5` with kernels `b70/v0.1.16`; the 2-card preset is not re-measured on these kernels.
 
 | | |
 |---|---|
