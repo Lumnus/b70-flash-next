@@ -71,4 +71,4 @@ The kit's INT8 table from NVMe on S16-q4e-8, 8 GiB row cache, native reader, DFl
 
 1. [zhaohb/vllm#1](https://github.com/zhaohb/vllm/pull/1): fixes.
 2. [zhaohb/vllm#2](https://github.com/zhaohb/vllm/pull/2): QSA shared-op fixes and `attn2`.
-3. PLE `--engram-config`: under test, no PR yet.
+3. [zhaohb/vllm#3](https://github.com/zhaohb/vllm/pull/3): PLE `--engram-config`, the three paths in the table above.
