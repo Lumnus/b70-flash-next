@@ -53,7 +53,9 @@ D16-Z2 at 8K, 1/2/3/8/12 streams: 100/152/137/126/124 tok/s total. The same MTP 
 
 Without `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1024,pinned_max_cached_size_mb:1024`, `cpu_offload` pins 128 GiB. The `disk_offload` gap is Python syscalls per row and run, so batching should remove it.
 
-The kit's PLE on S16-q4e-8: INT8 rows, 12.22 GiB per rank in 6 pinned slabs, in-graph gather 2.8-4.7 ms per chunk. The gather also passed a device test on real rows, 1,200 iterations in eager with bitwise-equal hash and gather. NVMe arms are next.
+The kit's PLE on S16-q4e-8: INT8 rows, 12.22 GiB per rank in 6 pinned slabs, in-graph gather 2.8-4.7 ms per chunk. The gather also passed a device test on real rows, 1,200 iterations in eager with bitwise-equal hash and gather. 
+
+The kit's INT8 table from NVMe on S16-q4e-8, 8 GiB row cache, native reader, DFlash K=7: prefill 5,600 at 8K, 5,550 at 42K, TTFT at 125K 24.7 s, decode 103, 3 streams at 8K total 207, PLE 4.3 ms per chunk, all gates pass. Within noise of INT8 in RAM, at 40 GiB less host RAM. These prompts reach a 1.000 hit rate once warm, so they don't stress the tier; a random-token stress run is next.
 
 ## Findings
 
