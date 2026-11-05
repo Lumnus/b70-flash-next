@@ -9,6 +9,7 @@ Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 G
 | S16-7, D16-7 | Released kit on vLLM 0.32, sparse and dense, DFlash |
 | S16-Z1, D16-Z1 | q4e branch at `6515212683` + #64925 + #64926 + strict fixes, kernels 0.1.17.1 |
 | S16-Z2 | q4e branch at `a8cdbee221` + zhaohb/vllm#1 + #2 + PLE row staging (not yet in a PR), kernels 0.1.17.1 |
+| D16-Z2 | Same tree as S16-Z2, dense |
 | S16-q4e-8 | The kit's engine merged onto the q4e branch, its own kernels on 0.1.16.3 + #658 |
 
 ## Main numbers (tok/s)
@@ -20,6 +21,22 @@ Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 G
 | Prefill, about 125K | 5,320 | 661 | about 2,100 | TTFT 42.3 s | TTFT 23.1 s | 4,760 | 2,580 | |
 | 3 streams at 8K, total | | 32 | 66 | 75 | 214 | | 64 | |
 | Speculative | DFlash | none | none | MTP K=3, 0.56 of 3 | DFlash K=7, 2.87 of 7 | DFlash | none | MTP K=3, 2.14 of 3 |
+
+## Best Z2 formula against the kit's engine on q4e (`cpu_offload` exact pin, FULL_AND_PIECEWISE)
+
+| | S16-Z2, MTP K=3 | D16-Z2, MTP K=3 | S16-q4e-8, DFlash K=7 |
+|---|---|---|---|
+| Prefill, 8K | 3,550 | 3,950 | 5,700 |
+| Prefill, 42K | 3,410 | 3,800 | 5,600 |
+| TTFT at 125K | 42.3 s | 39.3 s | 23.1 s |
+| Decode, prose | 44 | 71 | 106 |
+| 3 streams at 8K, total | 75 | 137 | 214 |
+| Acceptance | 0.56 of 3 | 2.12 of 3 | 2.87 of 7 |
+| PLE per chunk | 2.4 ms | 2.5 ms | 2.8-4.7 ms (INT8) |
+| Host memory used | 215 GiB | 181 GiB | 214 GiB |
+| Gates | RAM guard stop at 12 streams x 32K | all pass | all pass |
+
+D16-Z2 at 8K, 1/2/3/8/12 streams: 100/152/137/126/124 tok/s total. The same MTP layer gets 2.12 on dense and 0.56 on sparse in the same tree, so low acceptance comes from the draft on a sparse target.
 
 "S16-Z2 best" is `cpu_offload` with exact pinning, MTP K=3 and `attn2`, FULL_AND_PIECEWISE: boot 225 s, needle 4/4, tools pass, burst 0/150, 0 resets. Decode there is 85 at 8K and 65 at 32K. MTP acceptance on sparse is low and the cause is under test.
 
