@@ -38,6 +38,8 @@ Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 G
 
 D16-Z2 at 8K, 1/2/3/8/12 streams: 100/152/137/126/124 tok/s total. The same MTP layer gets 2.12 on dense and 0.56 on sparse in the same tree, so low acceptance comes from the draft on a sparse target.
 
+With a sparse MTP draft layer on S16-Z2 (`attn2` on the draft, the checkpoint's own `mtp...indexer` weights, chunk 4,096), acceptance goes from 0.56 to 2.07 of 3 at the same 31 ms step. Decode, prose 44 to 79, and at 16K to 125K from 70/33/32 to 80-85. Prefill 3,420 at 8K, about 3,400 at 42K, TTFT at 125K 42.6 s, host memory 186 GiB, needle 4/4, tools pass, burst 0/150, 0 resets. 3 streams still to run. Not yet in a PR.
+
 "S16-Z2 best" is `cpu_offload` with exact pinning, MTP K=3 and `attn2`, FULL_AND_PIECEWISE: boot 225 s, needle 4/4, tools pass, burst 0/150, 0 resets. Decode there is 85 at 8K and 65 at 32K.
 
 ## PLE paths on S16-Z2 (BF16 table, no speculation, all gates pass)
