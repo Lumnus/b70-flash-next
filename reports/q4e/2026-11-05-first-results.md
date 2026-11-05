@@ -55,11 +55,21 @@ Without `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1024,pinned_max_cached
 
 The kit's PLE on S16-q4e-8: INT8 rows, 12.22 GiB per rank in 6 pinned slabs, in-graph gather 2.8-4.7 ms per chunk. The gather also passed a device test on real rows, 1,200 iterations in eager with bitwise-equal hash and gather. 
 
-The kit's INT8 table from NVMe on S16-q4e-8, 8 GiB row cache, native reader, DFlash K=7: prefill 5,600 at 8K, 5,550 at 42K, TTFT at 125K 24.7 s, decode 103, 3 streams at 8K total 207, PLE 4.3 ms per chunk, all gates pass. Within noise of INT8 in RAM, at 40 GiB less host RAM. These prompts reach a 1.000 hit rate once warm, so they don't stress the tier; a random-token stress run is next.
+The kit's INT8 table from NVMe on S16-q4e-8, 8 GiB row cache, native reader, DFlash K=7: prefill 5,600 at 8K, 5,550 at 42K, TTFT at 125K 24.7 s, decode 103, 3 streams at 8K total 207, PLE 4.3 ms per chunk, all gates pass. Within noise of INT8 in RAM, at 40 GiB less host RAM. These prompts reach a 1.000 hit rate once warm, so they don't stress the tier.
+
+Random-token stress on the same NVMe path, 4 GiB row cache, every row new:
+
+| | Lookahead off | Lookahead on |
+|---|---|---|
+| 16K prompt, s | 3.33 | 2.90 |
+| 64K prompt, s | 13.78 | 11.84 |
+| Step bubble, p50 per 4,096 chunk, ms | 107 | 2.5 |
+
+With lookahead on the ordinary prompts stay within noise, since few rows are new: prefill 5,580 at 8K and 5,550 at 42K, TTFT at 125K 23.4 s, decode 103, 3 streams at 8K total 203, burst 0/150, about 170 GiB host memory.
 
 ## Findings
 
-0. **Dense prefill gap, per 4,096-token chunk, rank 0:** D16-Z2 852 ms, D16-7 539 ms. FA 71 vs 65, MoE 222 vs 203, GDN 109 vs 107, PLE 4.4 vs 4.9. The gap is hyper-connections, 409 ms (mix 331, combine 78, 136 of all-reduce) against about 159 ms by subtraction on the kit's fused path. Chunk size matters separately: stock 1,664 vs 4,096 took D16 prefill at 8K from 3,300 to 3,950.
+0. **Dense prefill gap, per 4,096-token chunk, rank 0:** D16-Z2 852 ms, D16-7 539 ms. FA 71 vs 65, MoE 222 vs 203, GDN 109 vs 107, PLE 4.4 vs 4.9. The gap is hyper-connections, 409 ms (mix 331, combine 78, 136 of all-reduce) against about 159 ms by subtraction on the kit's fused path. Chunk size matters separately: stock 1,664 vs 4,096 took D16 prefill at 8K from 3,300 to 3,950, and S16 from 3,340 to 3,550, both with MTP on at 4,096.
 
 1. **Stall under load:** an int32 GDN conv-state offset overflows at block 396 at this pool size, and the engine dies with `RPC call to sample_tokens timed out`. Dense hits it too, so it isn't specific to the branch. Kernels 0.1.17.1 ran two full 1-3 stream loads with 0 resets on the full KV pool. The fix is vllm-xpu-kernels#658; 0.1.17.1 carries other changes too, so #658 isn't isolated.
 2. **Sparse prefill:** the stock `qsa_sparse_paged_attention` kernel takes 1,545 ms per 1,664-token chunk, against 46 ms for dense FA. The `attn2` kernel takes 97 ms per 4,096-token chunk, about 39x per token.
