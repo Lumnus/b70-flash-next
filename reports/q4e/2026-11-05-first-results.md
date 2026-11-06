@@ -42,6 +42,24 @@ With a sparse MTP draft layer on S16-Z2 (`attn2` on the draft, the checkpoint's 
 
 "S16-Z2 best" is `cpu_offload` with exact pinning, MTP K=3 and `attn2`, FULL_AND_PIECEWISE: boot 225 s, needle 4/4, tools pass, burst 0/150, 0 resets. Decode there is 85 at 8K and 65 at 32K.
 
+## Fused hyper-connections (origin wu1ff), D16-Z2h
+
+The Z formula above plus fused hyper-connections, on the same branch. Not yet in a PR.
+
+| | D16-Z2 | D16-Z2h | D16-7 |
+|---|---|---|---|
+| Forward per 4,096 chunk, rank 0, ms | 852 | 561 | 539 |
+| Hyper-connections per chunk, ms | 409 | 130 | 132-159, by subtraction |
+| Prefill, 8K | 3,950 | 6,130 | 6,350 |
+| Prefill, 42K | 3,800 | 5,720 | 6,150 |
+| TTFT at 125K | 39.3 s | 28.4 s | 26.3 s |
+| Decode, prose | 71 | 96 | 106 |
+| 3 streams at 8K, total | 137 | 184 | 232 |
+| Acceptance, MTP K=3 | 2.12 of 3 | 2.15 of 3 | |
+| Step | 32-37 ms | 25.5-29.9 ms | |
+
+D16-7 runs DFlash K=7, so its decode rows aren't a like-for-like speculative comparison. D16-Z2h gates: needle 4/4, tools pass, burst 0/150, 12/12 throughput twice, 0 resets, temperature-0 one text on all three prompts. Host memory 187 GiB, KV 258,748 tokens. Streams at 8K, 1/2/3/8/12: 124/184/184/184/181 tok/s total; at 32K: 133/73/60/48/46.
+
 ## PLE paths on S16-Z2 (BF16 table, no speculation, all gates pass)
 
 | | mmap | `disk_offload` | `cpu_offload`, exact pin |
