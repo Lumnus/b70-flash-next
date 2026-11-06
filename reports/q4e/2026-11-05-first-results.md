@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next on zhaohb's q4e branch: test report
 
-Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 GB each), EPYC 7402. Stack on q4e: torch 2.15.0, Triton 3.9.0. Model: Intel W4A16 AutoRound. Same prompts and tools throughout. Single-run differences under about 10% are noise. Testing is ongoing.
+Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 GB each), EPYC 7402. Stack on q4e: torch 2.15.0, Triton 3.9.0, compute-runtime 26.35, IGC 2.41.5, both pinned on this host rather than from distro packages. Model: Intel W4A16 AutoRound. Same prompts and tools throughout. Single-run differences under about 10% are noise. Testing is ongoing.
 
 ## Engines
 
