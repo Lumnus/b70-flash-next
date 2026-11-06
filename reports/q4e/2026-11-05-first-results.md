@@ -44,7 +44,7 @@ With a sparse MTP draft layer on S16-Z2 (`attn2` on the draft, the checkpoint's 
 
 ## Fused hyper-connections (origin wu1ff), D16-Z2h
 
-The Z formula above plus fused hyper-connections, on the same branch. Not yet in a PR.
+The Z formula above plus fused hyper-connections, on the same branch. In [zhaohb/vllm#5](https://github.com/zhaohb/vllm/pull/5).
 
 | | D16-Z2 | D16-Z2h | D16-7 |
 |---|---|---|---|
@@ -59,6 +59,8 @@ The Z formula above plus fused hyper-connections, on the same branch. Not yet in
 | Step | 32-37 ms | 25.5-29.9 ms | |
 
 D16-7 runs DFlash K=7, so its decode rows aren't a like-for-like speculative comparison. D16-Z2h gates: needle 4/4, tools pass, burst 0/150, 12/12 throughput twice, 0 resets, temperature-0 one text on all three prompts. Host memory 187 GiB, KV 258,748 tokens. Streams at 8K, 1/2/3/8/12: 124/184/184/184/181 tok/s total; at 32K: 133/73/60/48/46.
+
+S16-Z2h, the same with sparse MTP, same gates pass: forward 677 ms per 4,096 chunk, hyper-connections 129, MoE 223, GDN 110, QSA kernel 94, indexer 97, PLE 4.5. Prefill 5,300 at 8K, 4,840 at 42K, TTFT at 125K 31.6 s, decode prose 102, code 159, at 16K/61K/125K 108/107/117, acceptance 2.11 of 3, step 23.6-23.9 ms. Streams at 8K, 1/2/3/8/12: 137/187/182/165/164 tok/s total; at 32K: 135/66/54/42/41. Host memory 190 GiB, KV 246,034 tokens. The next sparse cost is the indexer: 97 ms against 42 on S16-7, with `_prefill_logits` 81 against 10.
 
 ## PLE paths on S16-Z2 (BF16 table, no speculation, all gates pass)
 
@@ -103,3 +105,4 @@ With lookahead on the ordinary prompts stay within noise, since few rows are new
 2. [zhaohb/vllm#2](https://github.com/zhaohb/vllm/pull/2): QSA shared-op fixes and `attn2`.
 3. [zhaohb/vllm#3](https://github.com/zhaohb/vllm/pull/3): PLE `--engram-config`, the three paths in the table above.
 4. [zhaohb/vllm#4](https://github.com/zhaohb/vllm/pull/4): sparse MTP draft layer.
+5. [zhaohb/vllm#5](https://github.com/zhaohb/vllm/pull/5): fused hyper-connections, from wu1ff's work.
