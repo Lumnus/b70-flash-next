@@ -116,7 +116,8 @@ All arms: needle 4/4, tools pass, burst 0/150, 0 resets, one text at temperature
 2. **Sparse prefill:** the stock `qsa_sparse_paged_attention` kernel takes 1,545 ms per 1,664-token chunk, against 46 ms for dense FA. The `attn2` kernel takes 97 ms per 4,096-token chunk, about 39x per token.
 3. **Temperature 0:** the kit and S16-q4e-8 are bit-identical on 5-word and 30-word prompts. The Z arms jitter there without speculation, and are bit-identical with MTP on. Cause not found yet.
 4. **BF16 experts on kernels 0.1.17:** the layout rewrite moved into `XpuFusedMoe`, so a host-side transpose undoes it and BF16 layers die; fixed in zhaohb/vllm#1.
-5. **2 cards:** Intel W4A16 needs 73.3 GiB on the cards against 64 GiB, so 2 cards can't boot without expert offload. D16e on the q4e line with the hot/cold split behind `--cpu-offload-gb`: 111 hot, 145 cold, KV 343,037 tokens, needle 4/4, burst 0/150, decode 54-61, prefill about 2,700. Prefix caching shows 0 hits on this arm so far; under investigation.
+5. **2 cards:** Intel W4A16 needs 73.3 GiB on the cards against 64 GiB, so 2 cards can't boot without expert offload. D16e on the q4e line with the hot/cold split behind `--cpu-offload-gb`: 111 hot, 145 cold, KV 343,037 tokens, needle 4/4, burst 0/150, decode 54-61, prefill about 2,700. The 0 prefix hits came from the test: its prompt is shorter than one 3,136-token block, and an 8K repeat hits 6,272 tokens. D8-q4e-8 on 2 cards: decode prose 72, prefill 8K 2,670. D8-q4e-8 on 4 cards: prefill 7,200 at 8K and 6,540 at 42K, TTFT at 125K 24.8 s, decode prose 131 and code 271 with DFlash K=7, 3 streams at 8K total 215, KV 675,796 tokens, host memory 213 GiB. Gates pass on the 4-card arm; temperature 0 is one text at 5 and 30 words, 4 texts of 12 at 1,500.
+6. **MTP vs DFlash2:** see the [separate report](2026-11-06-mtp-vs-dflash.md).
 
 ## PRs
 
