@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next on zhaohb's q4e branch: test report
 
-**Vision is broken on the Z arms and every "gates pass" below excludes it:** the gates had no vision check, and at this head `xpu/model.py` builds the vision tower without `input_norm`, so it reads raw pixels and describes images wrongly. With `--no-mm-device-do-normalize` the same engine reads the test images correctly. A fix is on the way.
+**Vision is broken on the Z arms and every "gates pass" below excludes it:** the gates had no vision check, and at this head `xpu/model.py` builds the vision tower without `input_norm`, so it reads raw pixels and describes images wrongly. With `--no-mm-device-do-normalize` the same engine reads the test images correctly. Fixed by [zhaohb/vllm#6](https://github.com/zhaohb/vllm/pull/6), which reads the same images correctly on cards without the flag.
 
 Updated as results land; last update 2026-11-06. Hardware: 4 x Arc Pro B70 (32 GB each), EPYC 7402. Stack on q4e: torch 2.15.0, Triton 3.9.0, compute-runtime 26.35, IGC 2.41.5, both pinned on this host rather than from distro packages. Model: Intel W4A16 AutoRound. Same prompts and tools throughout. Single-run differences under about 10% are noise. Testing is ongoing.
 
