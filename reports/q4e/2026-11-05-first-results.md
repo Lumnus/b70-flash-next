@@ -89,6 +89,25 @@ Random-token stress on the same NVMe path, 4 GiB row cache, every row new:
 
 With lookahead on the ordinary prompts stay within noise, since few rows are new: prefill 5,580 at 8K and 5,550 at 42K, TTFT at 125K 23.4 s, decode 103, 3 streams at 8K total 203, burst 0/150, about 170 GiB host memory.
 
+## PLE tier on the Z line, S16-Z3 (branch stacked on zhaohb/vllm#3, no PR yet)
+
+S16-Z2h plus the row slabs, in-graph gather and NVMe tier from the kit, chosen through `--engram-config`. MTP K=3, chunk 4,096, FULL_AND_PIECEWISE. Single runs.
+
+| | Stock pinned BF16 (Z2h) | Slabs BF16 RAM | Slabs INT8 RAM | Tier BF16, 2 GiB cache | Tier INT8, 4 GiB cache |
+|---|---|---|---|---|---|
+| Host memory used, GiB | 190 | 182 | 141 | 104 | 99 |
+| Prefill, 8K | 5,300 | 5,270 | 5,290 | 5,220 | 5,230 |
+| Prefill, 42K | 4,840 | 4,850 | 4,850 | 4,815 | 4,820 |
+| TTFT at 125K, s | 31.6 | 31.6 | 31.4 | 31.6 | 31.6 |
+| Decode, prose | 102 | 95 | 97 | 94 | 96 |
+| Step, ms | 23.6-23.9 | 23.7-23.9 | 23.8-24 | 25.0-25.5 | 25.2-25.3 |
+| 3 streams at 8K, total | 182 | 182 | 182 | 176 | 181 |
+| PLE per 4,096 chunk, ms | 4.5 | 4.6 | 4.5 | 4.2 | 4.15 |
+| Acceptance, of 3 | 2.11 | 1.97 | 2.01 | 1.94 | 1.98 |
+| KV, tokens | 246,034 | 245,302 | 237,247 | 245,302 | 246,766 |
+
+All arms: needle 4/4, tools pass, burst 0/150, 0 resets, one text at temperature 0 on the 5, 30 and 1,500 word prompts. The slabs need neither `AllowUnrestrictedSize` nor `PYTORCH_ALLOC_CONF`: a one-card probe pinned 6 slabs at 12.22 GiB and 8 slabs at 23.84 GiB without them, and the BF16 arm ran without the alloc conf at about 95 GiB. The gather passed a device test, 1,200 rounds in eager and 1,200 in graph replay at 8 and 4,096 tokens, bitwise equal to the host path. The tier's host stage for BF16 is 4.0 ms per 4,096 chunk against 80 ms per 1,664 for stock `disk_offload`. The cold 8K prompt takes 1.84 s against 3.08 s, though most of that gap is the faster forward in this tree. Random-token stress on the INT8 tier, 4 GiB cache: lookahead on 3.23 s at 16K and 14.3 s at 64K, host step p50 2.4 ms and p99 106 ms; off 3.62 s and 16.2 s, p50 105 ms.
+
 ## Findings
 
 0. **Dense prefill gap, per 4,096-token chunk, rank 0:** D16-Z2 852 ms, D16-7 539 ms. FA 71 vs 65, MoE 222 vs 203, GDN 109 vs 107, PLE 4.4 vs 4.9. The gap is hyper-connections, 409 ms (mix 331, combine 78, 136 of all-reduce) against about 159 ms by subtraction on the kit's fused path. Chunk size matters separately: stock 1,664 vs 4,096 took D16 prefill at 8K from 3,300 to 3,950, and S16 from 3,340 to 3,550, both with MTP on at 4,096.
