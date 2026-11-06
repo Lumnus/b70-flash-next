@@ -93,7 +93,7 @@ Random-token stress on the same NVMe path, 4 GiB row cache, every row new:
 
 With lookahead on the ordinary prompts stay within noise, since few rows are new: prefill 5,580 at 8K and 5,550 at 42K, TTFT at 125K 23.4 s, decode 103, 3 streams at 8K total 203, burst 0/150, about 170 GiB host memory.
 
-## PLE tier on the Z line, S16-Z3 (branch stacked on zhaohb/vllm#3, no PR yet)
+## PLE tier on the Z line, S16-Z3 ([zhaohb/vllm#7](https://github.com/zhaohb/vllm/pull/7), stacked on #3)
 
 S16-Z2h plus the row slabs, in-graph gather and NVMe tier from the kit, chosen through `--engram-config`. MTP K=3, chunk 4,096, FULL_AND_PIECEWISE. Single runs.
 
@@ -130,3 +130,6 @@ All arms: needle 4/4, tools pass, burst 0/150, 0 resets, one text at temperature
 3. [zhaohb/vllm#3](https://github.com/zhaohb/vllm/pull/3): PLE `--engram-config`, the three paths in the table above.
 4. [zhaohb/vllm#4](https://github.com/zhaohb/vllm/pull/4): sparse MTP draft layer.
 5. [zhaohb/vllm#5](https://github.com/zhaohb/vllm/pull/5): fused hyper-connections, from wu1ff's work.
+6. [zhaohb/vllm#6](https://github.com/zhaohb/vllm/pull/6): vision tower input norm.
+7. [zhaohb/vllm#7](https://github.com/zhaohb/vllm/pull/7): PLE tier, stacked on #3.
+8. [zhaohb/vllm#8](https://github.com/zhaohb/vllm/pull/8): QSA prefill scorer launch for Xe2, stacked on #2.
