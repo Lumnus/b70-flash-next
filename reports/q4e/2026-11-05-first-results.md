@@ -1,6 +1,8 @@
 # Qwen3.8-Flash-Next on zhaohb's q4e branch: test report
 
-Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 GB each), EPYC 7402. Stack on q4e: torch 2.15.0, Triton 3.9.0, compute-runtime 26.35, IGC 2.41.5, both pinned on this host rather than from distro packages. Model: Intel W4A16 AutoRound. Same prompts and tools throughout. Single-run differences under about 10% are noise. Testing is ongoing.
+**Vision is broken on the Z arms and every "gates pass" below excludes it:** the gates had no vision check, and at this head `xpu/model.py` builds the vision tower without `input_norm`, so it reads raw pixels and describes images wrongly. With `--no-mm-device-do-normalize` the same engine reads the test images correctly. A fix is on the way.
+
+Updated as results land; last update 2026-11-06. Hardware: 4 x Arc Pro B70 (32 GB each), EPYC 7402. Stack on q4e: torch 2.15.0, Triton 3.9.0, compute-runtime 26.35, IGC 2.41.5, both pinned on this host rather than from distro packages. Model: Intel W4A16 AutoRound. Same prompts and tools throughout. Single-run differences under about 10% are noise. Testing is ongoing.
 
 ## Engines
 
@@ -8,9 +10,11 @@ Updated as results land; last update 2026-11-05. Hardware: 4 x Arc Pro B70 (32 G
 |---|---|
 | S16-7, D16-7 | Released kit on vLLM 0.32, sparse and dense, DFlash |
 | S16-Z1, D16-Z1 | q4e branch at `6515212683` + #64925 + #64926 + strict fixes, kernels 0.1.17.1 |
-| S16-Z2 | q4e branch at `a8cdbee221` + zhaohb/vllm#1 + #2 + PLE row staging (not yet in a PR), kernels 0.1.17.1 |
+| S16-Z2 | q4e branch at `a8cdbee221` + zhaohb/vllm#1 + #2 + #3, kernels 0.1.17.1 |
 | D16-Z2 | Same tree as S16-Z2, dense |
-| S16-q4e-8 | The kit's engine merged onto the q4e branch, its own kernels on 0.1.16.3 + #658 |
+| S16-Z2h, D16-Z2h | S16-Z2 and D16-Z2 + #4 + #5 |
+| S16-Z3 | S16-Z2h + the PLE tier branch, no PR yet |
+| S16-q4e-8, D16-q4e-8, D8-q4e-8, D16e-q4e-8 | The kit's engine merged onto an earlier head of the q4e branch (`6515212683`), its own kernels on 0.1.16.3 + #658 |
 
 ## Main numbers (tok/s)
 
@@ -110,13 +114,13 @@ All arms: needle 4/4, tools pass, burst 0/150, 0 resets, one text at temperature
 
 ## Findings
 
-0. **Dense prefill gap, per 4,096-token chunk, rank 0:** D16-Z2 852 ms, D16-7 539 ms. FA 71 vs 65, MoE 222 vs 203, GDN 109 vs 107, PLE 4.4 vs 4.9. The gap is hyper-connections, 409 ms (mix 331, combine 78, 136 of all-reduce) against about 159 ms by subtraction on the kit's fused path. Chunk size matters separately: stock 1,664 vs 4,096 took D16 prefill at 8K from 3,300 to 3,950, and S16 from 3,340 to 3,550, both with MTP on at 4,096.
+0. **Dense prefill gap, per 4,096-token chunk, rank 0:** D16-Z2 852 ms, D16-7 539 ms. FA 71 vs 65, MoE 222 vs 203, GDN 109 vs 107, PLE 4.4 vs 4.9. The gap is hyper-connections, 409 ms (mix 331, combine 78) against 132-159 ms by subtraction on the kit's fused path. The 136 ms of all-reduce sits in the other rows, not in hyper-connections. Chunk size matters separately: stock 1,664 vs 4,096 took D16 prefill at 8K from 3,300 to 3,950, and S16 from 3,340 to 3,550, both with MTP on at 4,096.
 
 1. **Stall under load:** an int32 GDN conv-state offset overflows at block 396 at this pool size, and the engine dies with `RPC call to sample_tokens timed out`. Dense hits it too, so it isn't specific to the branch. Kernels 0.1.17.1 ran two full 1-3 stream loads with 0 resets on the full KV pool. The fix is vllm-xpu-kernels#658; 0.1.17.1 carries other changes too, so #658 isn't isolated.
 2. **Sparse prefill:** the stock `qsa_sparse_paged_attention` kernel takes 1,545 ms per 1,664-token chunk, against 46 ms for dense FA. The `attn2` kernel takes 97 ms per 4,096-token chunk, about 39x per token.
 3. **Temperature 0:** the kit and S16-q4e-8 are bit-identical on 5-word and 30-word prompts. The Z arms jitter there without speculation, and are bit-identical with MTP on. Cause not found yet.
 4. **BF16 experts on kernels 0.1.17:** the layout rewrite moved into `XpuFusedMoe`, so a host-side transpose undoes it and BF16 layers die; fixed in zhaohb/vllm#1.
-5. **2 cards:** Intel W4A16 needs 73.3 GiB on the cards against 64 GiB, so 2 cards can't boot without expert offload. D16e on the q4e line with the hot/cold split behind `--cpu-offload-gb`: 111 hot, 145 cold, KV 343,037 tokens, needle 4/4, burst 0/150, decode 54-61, prefill about 2,700. The 0 prefix hits came from the test: its prompt is shorter than one 3,136-token block, and an 8K repeat hits 6,272 tokens. D8-q4e-8 on 2 cards: decode prose 72, prefill 8K 2,670. D8-q4e-8 on 4 cards: prefill 7,200 at 8K and 6,540 at 42K, TTFT at 125K 24.8 s, decode prose 131 and code 271 with DFlash K=7, 3 streams at 8K total 215, KV 675,796 tokens, host memory 213 GiB. Gates pass on the 4-card arm; temperature 0 is one text at 5 and 30 words, 4 texts of 12 at 1,500.
+5. **2 cards:** Intel W4A16 needs 73.3 GiB on the cards against 64 GiB, so 2 cards can't boot without expert offload. D16e on the q4e line with the hot/cold split set through environment switches (`B70_MOE_HOTCOLD`, `B70_MOE_COLD_EXPERTS`), not vLLM's own `--cpu-offload-gb`, which hasn't run on a card here: 111 hot, 145 cold, KV 343,037 tokens, needle 4/4, burst 0/150, decode 40-61, prefill about 2,700. The 0 prefix hits came from the test: its prompt is shorter than one 3,136-token block, and an 8K repeat hits 6,272 tokens. D8-q4e-8 on 2 cards: decode prose 50, 69, 72 from an empty state as the swap learns, prefill 8K 2,670, temperature 0 gives 4 to 5 texts at 30 and 1,500 words. D8-q4e-8 on 4 cards: prefill 7,200 at 8K and 6,540 at 42K, TTFT at 125K 24.8 s, decode prose 131 and code 271 with DFlash K=7, 3 streams at 8K total 215, KV 675,796 tokens, host memory 213 GiB. Gates pass on the 4-card arm; temperature 0 is one text at 5 and 30 words, 4 texts of 12 at 1,500.
 6. **MTP vs DFlash2:** see the [separate report](2026-11-06-mtp-vs-dflash.md).
 
 ## PRs
