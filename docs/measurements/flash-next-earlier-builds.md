@@ -269,8 +269,9 @@ are the defaults. The build passed a stress stage of repeated 131K prefills plus
 
 **What is in the add-on.** [`patches/vllm-qsa/`](../../v0.32/engine/patches/vllm-qsa/) is 38 patches, applied on top of
 [`patches/vllm/`](../../v0.32/engine/patches/vllm/) (fork tag `v0.32.0-b70.4-dense`); they end at fork tag `v0.32.0-b70.4-qsa`, and the
-hot/cold directory follows them ([The series](../engine-details.md#the-series)). The b70.2/b70.3 branch `b70/v0.32.0-qsa-release` carries the
-first 32 of them on the b70.1 base. `v0.32/engine/scripts/check-series.sh --qsa` fails if the directory differs from a fresh export. The
+hot/cold directory follows them ([The series](../engine-details.md#the-series)). The b70.2/b70.3 branch `b70/v0.32.0-qsa-release` (now kept as
+`archive/lumnus-vllm/b70/v0.32.0-qsa-release` in the private archive `lumnus/vllm-crusher`, not public) carries the first 32
+of them on the b70.1 base. `v0.32/engine/scripts/check-series.sh --qsa` fails if the directory differs from a fresh export. The
 first 32 patches are unchanged in content from b70.3; their headers (`From <sha>`, `[PATCH n/38]`) are regenerated because
 patch 0050 of the dense base now sits below them. Every patch is authored `Lumnus`; 0001 is the upstream
 vllm-project/vllm#60602 cherry-pick.

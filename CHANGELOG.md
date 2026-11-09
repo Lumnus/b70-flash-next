@@ -158,8 +158,9 @@ One release (no intermediate b70.4 builds were published).
 
 The dense series (`v0.32/patches/vllm/`, 49 patches, fork tag `v0.32.0-b70.1`) is unchanged.
 
-- **Sparse (QSA) code.** `v0.32/patches/vllm-qsa/` grows from 26 to 32 patches (0027–0032), authored `Lumnus`; fork branch
-  `b70/v0.32.0-qsa-release` (`be6a6e7d33`) on `Lumnus/vllm`; `v0.32/scripts/check-series.sh --qsa` checks it. The
+- **Sparse (QSA) code.** `v0.32/patches/vllm-qsa/` grows from 26 to 32 patches (0027–0032), authored `Lumnus`; fork commit
+  `be6a6e7d33`, kept as `archive/lumnus-vllm/b70/v0.32.0-qsa-release` in the private archive `lumnus/vllm-crusher` (not
+  public); `v0.32/scripts/check-series.sh --qsa` checks it. The
   deterministic top-k (`native_det`) repairs ties without a host synchronisation and without a full-width sort (0027), as a
   fused Triton select (0031, `B70_QSA_TOPK_SELECT_IMPL=triton`); the faster scorer launch configurations from the sweeps
   are the defaults on XPU (0029, `B70_QSA_SCORE_DEFAULTS=legacy` restores the old ones); top-k once per verify step and
@@ -205,7 +206,7 @@ Repository change shipped in this release:
 The sparse variant:
 
 - **Code.** `v0.32/patches/vllm-qsa/`: 26 patches on top of the dense series, authored `Lumnus` (0001 is the
-  vllm-project/vllm#60602 cherry-pick). Fork branch `b70/v0.32.0-qsa-release` (`4acd39891b`) on `Lumnus/vllm`.
+  vllm-project/vllm#60602 cherry-pick). Fork commit `4acd39891b`, kept as `archive/lumnus-vllm/b70/v0.32.0-qsa-release` in the private archive `lumnus/vllm-crusher` (not public).
   `v0.32/scripts/check-series.sh --qsa` checks the directory against it. QSA on XPU: block top-k, sparse GQA and
   side-cache kernels, fused prepare, `attn2` (a Triton sparse-attention kernel with no register spills on Xe2), a
   deterministic native top-k (`native_det`), a launch-override hook and sweep tools, 148 side-cache state-contract
@@ -319,7 +320,8 @@ and flags is the alternative; a multi-day stability run of it started on 2026-10
 
 **One branch, the model as a parameter.** Source: fork branch `b70/v0.30.0-stable`, tag `v0.30.0-b70.2` (35 commits on
 v0.30.0 `ced6857a`: 33 patch files + 3 test files). It consolidates the two working lines we tested on
-(`b70/v0.30.0-mtp0020` for AWQ, `b70/v0.30.0-intel` for Intel) into one, with one copy of each fix (B70-0030 on the AWQ
+(`b70/v0.30.0-mtp0020` for AWQ, `b70/v0.30.0-intel` for Intel; both now kept under `archive/lumnus-vllm/` in the private
+archive `lumnus/vllm-crusher`, not public) into one, with one copy of each fix (B70-0030 on the AWQ
 line was the same change as 0029b). The engine recipe takes the model as a parameter: `engines/s16-kv128-mtp3.env` +
 `engines/models/awq.env` or `engines/models/intel-autoround.env`. The release branch is not yet booted on a GPU; what
 differs from what AWQ ran is listed in docs/known-issues.md item 12.
@@ -327,8 +329,8 @@ differs from what AWQ ran is listed in docs/known-issues.md item 12.
 Compared with the working lines, the release branch has every commit rewritten with a neutral author and committer
 (`Lumnus`; wu1ff's and the upstream backport author's commits keep their authors), commit messages without lab
 references, the debug flag files under `/run/b70-probes/` instead of a lab path, and three code comments made neutral.
-The code is otherwise byte-identical. `b70/v0.30.0`, `b70/v0.30.0-intel` and `b70/v0.30.0-mtp0020` keep their history
-and are not updated any more.
+The code is otherwise byte-identical. `b70/v0.30.0` keeps its history and is not updated any more; `b70/v0.30.0-intel`
+and `b70/v0.30.0-mtp0020` are kept under `archive/lumnus-vllm/` in the private archive `lumnus/vllm-crusher`, not public.
 
 The series (0020–0032):
 
