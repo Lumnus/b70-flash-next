@@ -1,0 +1,143 @@
+From b6ed9fb55718a991482f190576c77eda359fd0ae Mon Sep 17 00:00:00 2001
+From: Kaloyan Naumov <knaumov@gmail.com>
+Date: Wed, 11 Nov 2026 18:27:12 +0000
+Subject: [PATCH 1/2] [XPU] Do not create the stream pool to check the capture
+ status
+
+at::xpu::currentStreamCaptureStatus() asked the current device's current
+stream for its state, and getCurrentXPUStream() creates the device's
+reserved pool (96 SYCL queues) on first use. The default generators are
+seeded during torch._C._xpu_init, and seeding checks the capture status,
+so every process that initializes XPU created the pool of device 0,
+including processes that select another device with
+torch.xpu.set_device(n) as their first call.
+
+Add c10::xpu::hasCurrentXPUStream(device) (the pool exists, or the thread
+set an external stream) and return Executing from
+currentStreamCaptureStatus() when it is false, as
+at::cuda::currentStreamCaptureStatus() does with hasPrimaryContext. A
+stream that was never created cannot be recording.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ aten/src/ATen/test/xpu_generator_test.cpp | 15 +++++++++++++++
+ aten/src/ATen/xpu/XPUGraphsUtils.h        |  8 +++++++-
+ c10/xpu/XPUStream.cpp                     | 15 +++++++++++++++
+ c10/xpu/XPUStream.h                       |  7 +++++++
+ 4 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/aten/src/ATen/test/xpu_generator_test.cpp b/aten/src/ATen/test/xpu_generator_test.cpp
+index 0b915c1..9f96c4f 100644
+--- a/aten/src/ATen/test/xpu_generator_test.cpp
++++ b/aten/src/ATen/test/xpu_generator_test.cpp
+@@ -4,6 +4,7 @@
+ #include <ATen/xpu/XPUContext.h>
+ #include <ATen/xpu/XPUGeneratorImpl.h>
+ #include <ATen/core/PhiloxRNGEngine.h>
++#include <c10/xpu/XPUStream.h>
+ 
+ #include <assert.h>
+ #include <thread>
+@@ -96,3 +97,17 @@ TEST(XpuGeneratorTest, testRNGForking) {
+   auto forked_value = at::randn({1000}, current_gen, at::kXPU);
+   ASSERT_EQ(target_value.sum().item<double>(), forked_value.sum().item<double>());
+ }
++
++TEST(XpuGeneratorTest, SeedingDoesNotCreateStreamPool) {
++  if (!at::xpu::is_available() || c10::xpu::hasCurrentXPUStream(0)) {
++    GTEST_SKIP();
++  }
++  // createXPUGenerator, not getDefaultXPUGenerator: the default generator is
++  // built under call_once, so an earlier test could have built it already and
++  // this test would pass without running the guarded checks.
++  auto gen = at::xpu::detail::createXPUGenerator(0);
++  gen.seed();
++  ASSERT_FALSE(c10::xpu::hasCurrentXPUStream(0));
++  c10::xpu::getCurrentXPUStream(0);
++  ASSERT_TRUE(c10::xpu::hasCurrentXPUStream(0));
++}
+diff --git a/aten/src/ATen/xpu/XPUGraphsUtils.h b/aten/src/ATen/xpu/XPUGraphsUtils.h
+index b18fe4e..de3658c 100644
+--- a/aten/src/ATen/xpu/XPUGraphsUtils.h
++++ b/aten/src/ATen/xpu/XPUGraphsUtils.h
+@@ -4,8 +4,14 @@
+ 
+ namespace at::xpu {
+ 
++// Use this version where you don't want to create the stream pool of the
++// current device if it does not exist yet. A stream that was never created
++// cannot be recording.
+ inline CaptureStatus currentStreamCaptureStatus() {
+-  return c10::xpu::currentStreamCaptureStatusMayInitCtx();
++  if (c10::xpu::hasCurrentXPUStream()) {
++    return c10::xpu::currentStreamCaptureStatusMayInitCtx();
++  }
++  return CaptureStatus::Executing;
+ }
+ 
+ inline void assertNotCapturing(const std::string& attempt) {
+diff --git a/c10/xpu/XPUStream.cpp b/c10/xpu/XPUStream.cpp
+index 0be8912..078701a 100644
+--- a/c10/xpu/XPUStream.cpp
++++ b/c10/xpu/XPUStream.cpp
+@@ -21,6 +21,9 @@ constexpr int kStreamTypeBits = 3;
+ // a queue is requested, the next queue in the pool to be returned in a
+ // round-robin fashion, see Note [Stream Management].
+ std::deque<c10::once_flag> device_flags;
++// Set once the reserved pool of a device exists, so that callers can ask
++// without creating it.
++std::deque<std::atomic<bool>> device_pool_ready;
+ std::vector<std::array<
+     std::array<std::unique_ptr<sycl::queue>, kStreamsPerPool>,
+     max_compile_time_stream_priorities>>
+@@ -127,6 +130,7 @@ inline StreamId makeStreamId(StreamIdType st, StreamIdIndex si) {
+ void initGlobalStreamState() {
+   num_gpus = c10::xpu::device_count();
+   device_flags.resize(num_gpus);
++  device_pool_ready.resize(num_gpus);
+   streams.resize(num_gpus);
+   priority_counters.resize(num_gpus);
+ }
+@@ -159,6 +163,7 @@ void initDeviceStreamState(DeviceIndex device) {
+     }
+     priority_counters[device][p] = 0;
+   }
++  device_pool_ready[device].store(true, std::memory_order_release);
+ }
+ 
+ void initXPUStreamsOnce() {
+@@ -347,6 +352,16 @@ XPUStream getCurrentXPUStream(DeviceIndex device) {
+   return XPUStreamForId(device, current_streams[device]);
+ }
+ 
++bool hasCurrentXPUStream(DeviceIndex device) {
++  initXPUStreamsOnce();
++  if (device == -1) {
++    device = c10::xpu::current_device();
++  }
++  check_device_index(device);
++  return device_pool_ready[device].load(std::memory_order_acquire) ||
++      streamIdType(current_streams[device]) == StreamIdType::EXT;
++}
++
+ // Note: The stream pools will be initialized if needed, at the first invocation
+ // to this function.
+ void setCurrentXPUStream(XPUStream stream) {
+diff --git a/c10/xpu/XPUStream.h b/c10/xpu/XPUStream.h
+index 396002e..2528078 100644
+--- a/c10/xpu/XPUStream.h
++++ b/c10/xpu/XPUStream.h
+@@ -191,6 +191,13 @@ getStreamFromExternal(sycl::queue* ext_queue, DeviceIndex device_index);
+  */
+ C10_XPU_API XPUStream getCurrentXPUStream(DeviceIndex device = -1);
+ 
++/**
++ * Whether `device` (default: the current device) already has a current
++ * stream: its reserved pool has been created, or the calling thread set an
++ * external stream. Unlike getCurrentXPUStream() this never creates the pool.
++ */
++C10_XPU_API bool hasCurrentXPUStream(DeviceIndex device = -1);
++
+ /**
+  * Set the current stream on the device of the passed in stream to be the passed
+  * in stream.
