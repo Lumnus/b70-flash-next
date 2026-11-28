@@ -54,7 +54,7 @@ One machine: 4× Arc Pro B70 on one host, tensor parallel 4 with expert parallel
 | prefill 131K, uncached (tok/s) | **5,860–5,865** | 5,003–5,006 (recorded) | +17 % |
 | KV on the cards (tokens, 262,144 context) | **992,043**; 1,003,974 at a later boot | 678,259 | +46 % |
 | quality: MMLU 300 / TruthfulQA-MC1 200 | 0.920 / 0.885 | — | no paired difference against Intel's W4A16 AutoRound build on the same engine (0.920 / 0.880) |
-| decode, 16 streams | not measured on this checkpoint | 766–769 prose, 1,903–1,941 code | see §4.2 for the BF16 variant |
+| 16 streams × 2K prompt: decode · prefill (tok/s) | **882** · **7,170** | 855 · 6,950 (recorded) | +3 % / +3 % |
 
 The checkpoints differ: b70.7 D8-7 runs Intel's W4A16 AutoRound weights with online INT8; l34 runs the calibrated x2 W4A8 weights.
 
